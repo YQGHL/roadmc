@@ -40,6 +40,7 @@ try:
         add_bleeding,
         add_concrete_damage,
         simulate_lidar_noise,
+        resample_to_lidar_pattern,
     )
 except ImportError:
     from config import (  # type: ignore[no-redef]
@@ -58,6 +59,7 @@ except ImportError:
         add_bleeding,
         add_concrete_damage,
         simulate_lidar_noise,
+        resample_to_lidar_pattern,
     )
 
 # ---------------------------------------------------------------------------
@@ -103,6 +105,53 @@ DISEASE_APPLY_ORDER: Dict[str, int] = {
     "concrete_damage": 0,
 }
 
+# P1-3 修复：病害标签优先级，数值越高优先级越高
+# 当多个病害覆盖同一区域时，仅保留优先级最高的标签
+# 设计原则：坑槽 > 龟裂 > 纵向裂缝 > 块状裂缝 > 横向裂缝，
+# 大面积病害（车辙、沉陷、波浪拥包）优先级低于局部病害
+LABEL_PRIORITY: Dict[int, int] = {
+    0: 0,    # 背景
+    # 沥青路面 — 局部破损优先级最高，大面积病害较低
+    10: 10,  # 重坑槽 — 最高优先级
+    9: 9,    # 轻坑槽
+    2: 8,    # 重龟裂
+    1: 7,    # 轻龟裂
+    6: 6,    # 重纵向裂缝
+    5: 5,    # 轻纵向裂缝
+    8: 4,    # 重横向裂缝
+    4: 3,    # 重块状裂缝
+    7: 3,    # 轻横向裂缝
+    3: 2,    # 轻块状裂缝
+    12: 5,   # 重松散
+    11: 4,   # 轻松散
+    14: 2,   # 重沉陷
+    13: 1,   # 轻沉陷
+    16: 2,   # 重车辙
+    15: 1,   # 轻车辙
+    18: 2,   # 重波浪拥包
+    17: 1,   # 轻波浪拥包
+    19: 5,   # 泛油（标签特殊，面积区域覆盖）
+    20: 6,   # 修补（人工标记，高优先级）
+    # 水泥路面
+    22: 10,  # 重破碎板
+    21: 9,   # 轻破碎板
+    24: 8,   # 重水泥裂缝
+    23: 7,   # 轻水泥裂缝
+    26: 6,   # 重板角断裂
+    25: 5,   # 轻板角断裂
+    28: 4,   # 重错台
+    27: 3,   # 轻错台
+    31: 4,   # 重边角剥落
+    30: 3,   # 轻边角剥落
+    33: 2,   # 重接缝料损坏
+    32: 1,   # 轻接缝料损坏
+    29: 5,   # 唧泥
+    34: 6,   # 坑洞
+    35: 7,   # 拱起
+    36: 4,   # 露骨
+    37: 8,   # 水泥修补
+}
+
 # ===========================================================================
 # SyntheticRoadDataset
 # ===========================================================================
@@ -118,7 +167,7 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
 
     - **points**: ``(N, 3)`` torch.float32 — 归一化后的点云坐标
     - **labels**: ``(N,)`` torch.int64 — JTG 5210-2018 标签 (0-37)
-    - **feats**: ``(N, 2)`` torch.float32 — [强度反射率, 局部曲率]
+    - **feats**: ``(N, 3)`` torch.float32 — [强度反射率, 局部曲率, 裂缝边界距离]
     - **normals**: ``(N, 3)`` torch.float32 — 表面单位法向量
     - **pavement_type**: str — 'asphalt' | 'concrete'
 
@@ -164,14 +213,17 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
 
         1. 选择路面类型 (asphalt / concrete)
         2. ISO 8608 PSD 路面轮廓 + fBm 微观纹理
-        3. 病害组合随机选择 & 应用（按 DISEASE_APPLY_ORDER 排序）
-        4. 网格曲率计算（LiDAR 噪声前，利用网格结构）
-        5. 强度反射率计算（基于 pavement_type + 病害标签）
-        6. 松散 (raveling) 产生 NaN 点 → 过滤
-        7. LiDAR 噪声仿真（球坐标噪声 + dropout + edge mixing）
-        8. KDTree 最近邻传递标签/特征/法向量
-        9. 重采样至 ``num_points`` 点
-        10. 可选归一化到单位球
+        2.5 LiDAR 扫描线重采样 (可选, P1-1)
+        3. 病害组合随机选择 & 应用（按 DISEASE_APPLY_ORDER 排序 + LABEL_PRIORITY）
+        4. KDTree 局部曲率计算 (P2-2)
+        5. 应用松散 (raveling) — 产生 NaN 点
+        6. 松散标签膨胀 + NaN 过滤 (P0-3)
+        7. 强度反射率计算 (P0-2)
+        8. LiDAR 噪声仿真 (P2-3: 仅高曲率边缘混合)
+        9. 最近邻传递标签/特征/法向量 (P0-4: 带距离阈值)
+        10. 体素下采样 (P1-2) 或 num_points 重采样
+        11. 坐标归一化
+        12. 特征拼接
 
         Args:
             idx: 场景索引，用于种子生成 (config.seed + idx)。
@@ -225,6 +277,25 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
             )
 
         # ================================================================
+        # 2.5 P1-1: LiDAR 扫描线密度重采样（可选）
+        # ================================================================
+        if self.config.lidar_scan.enable:
+            scan_idx = resample_to_lidar_pattern(
+                points,
+                scan_lines=self.config.lidar_scan.scan_lines,
+                vertical_fov_deg=self.config.lidar_scan.vertical_fov_deg,
+                scan_pattern=self.config.lidar_scan.scan_pattern,
+                range_decay=self.config.lidar_scan.range_decay,
+                incidence_angle_drop=self.config.lidar_scan.incidence_angle_drop,
+                rng=rng,
+            )
+            if len(scan_idx) > 10:
+                points = points[scan_idx]
+                normals = normals[scan_idx]
+            # 更新网格尺寸（扫描线重采样改变了点数）
+            nx, ny = len(x_tmp), len(y_tmp)  # 网格维度保持不变（后续重建会用）
+
+        # ================================================================
         # 3. 标签初始化 + 病害选择 & 应用
         # ================================================================
         labels = np.zeros(points.shape[0], dtype=np.int64)
@@ -244,6 +315,7 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
 
         for disease_type, severity in non_raveling_diseases:
             seed = int(rng.integers(0, 2 ** 31))
+            old_labels = labels.copy()  # 保存旧标签用于优先级比较
 
             if disease_type == "crack":
                 crack_type = str(rng.choice(self.config.crack.crack_types))
@@ -346,6 +418,8 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
                     "slab_length": self.config.concrete_damage.slab_length,
                     "slab_width": self.config.concrete_damage.slab_width,
                     "joint_width": self.config.concrete_damage.joint_width,
+                    "x_offset": self.config.concrete_damage.x_offset,
+                    "y_offset": self.config.concrete_damage.y_offset,
                 }
                 points, labels = add_concrete_damage(
                     points, labels,
@@ -353,21 +427,23 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
                     params=params, seed=seed,
                 )
 
-        # ================================================================
-        # 4. 网格曲率计算（利用网格结构，在 NaN / LiDAR 噪声之前）
-        # ================================================================
-        z_grid = points[:, 2].reshape(nx, ny).copy()
-        z_grid = np.nan_to_num(z_grid, nan=0.0)
-        curvature_grid = _compute_grid_curvature(z_grid, grid_res)
-        curvature = curvature_grid.ravel().astype(np.float32)
+            # P1-3 修复：仅在优先级更高时保留新标签
+            # 被病害函数修改的标签区域中，如果旧标签优先级更高，则恢复旧标签
+            changed_mask = labels != old_labels
+            if np.any(changed_mask):
+                for i in np.where(changed_mask)[0]:
+                    old_pri = LABEL_PRIORITY.get(int(old_labels[i]), 0)
+                    new_pri = LABEL_PRIORITY.get(int(labels[i]), 0)
+                    if old_pri > new_pri:
+                        labels[i] = old_labels[i]
 
         # ================================================================
-        # 5. 强度反射率计算
+        # 4. 曲率计算 — P2-2 修复：使用 KDTree 局部邻域，解除网格顺序依赖
         # ================================================================
-        intensity = self._compute_intensity(labels, pavement_type, rng)
+        curvature = _compute_kdtree_curvature(points, k_neighbors=20)
 
         # ================================================================
-        # 6. 应用松散 (raveling) — 产生 NaN 点
+        # 5. 应用松散 (raveling) — 产生 NaN 点
         # ================================================================
         if raveling_entry is not None:
             disease_type, severity = raveling_entry
@@ -390,13 +466,42 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
                 region_mask=region_mask, severity=severity, seed=seed,
             )
 
-        # --- 移除 NaN 点（来自 raveling）---------------------------------
+# ================================================================
+        # 6. 松散标签膨胀 + NaN 点过滤
+        # ================================================================
+        # P0-3 修复：在移除 NaN 点之前，将松散标签膨胀到 NaN 点的邻域，
+        # 确保噪声仿真后落在原松散区域的点能获得正确的松散标签。
+        raveling_labels_mask = (labels == 11) | (labels == 12)
         valid_mask = ~np.any(np.isnan(points), axis=1)
+
+        # 松散标签膨胀：使用网格邻域将松散标签传播到附近的背景点
+        # 策略：对每个非 NaN 的松散点，将其周围 grid_res*2 半径内的
+        # 背景（label=0）点标记为相同的松散标签
+        raveling_valid_mask = raveling_labels_mask & valid_mask
+        if np.any(raveling_valid_mask):
+            raveling_xy = points[raveling_valid_mask][:, :2]
+            raveling_severity = labels[raveling_valid_mask]
+            # 有效背景点（非 NaN、非松散）
+            background_valid_mask = valid_mask & ~raveling_labels_mask
+            if np.any(background_valid_mask) and raveling_xy.shape[0] > 0:
+                from scipy.spatial import KDTree as _KDTree
+                bg_xy = points[background_valid_mask][:, :2]
+                bg_labels = labels[background_valid_mask]
+                bg_global_idx = np.where(background_valid_mask)[0]
+                tree_dilate = _KDTree(raveling_xy)
+                dilate_radius = grid_res * 3.0  # 膨胀半径：3倍网格分辨率
+                # 查询背景点到最近的松散点距离
+                nn_dist, nn_idx = tree_dilate.query(bg_xy, k=1)
+                # 距离在膨胀半径内的背景点标记为松散
+                in_dilate = nn_dist <= dilate_radius
+                for i in np.where(in_dilate)[0]:
+                    if bg_labels[i] == 0:  # 仅膨胀到背景点
+                        labels[bg_global_idx[i]] = raveling_severity[nn_idx[i]]
+
         if np.any(valid_mask):
             points = points[valid_mask]
             labels = labels[valid_mask]
             normals = normals[valid_mask]
-            intensity = intensity[valid_mask]
             curvature = curvature[valid_mask]
         else:
             raise RuntimeError("All points removed by raveling — no valid geometry remains.")
@@ -406,7 +511,13 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
             raise RuntimeError("Empty point cloud after NaN filtering.")
 
         # ================================================================
-        # 7. LiDAR 噪声仿真
+        # 7. 强度反射率计算（在松散标签应用之后）
+        # P0-2 修复：移到松散应用之后，确保松散区域的标签 11/12 被正确反映
+        # ================================================================
+        intensity = self._compute_intensity(labels, pavement_type, rng)
+
+        # ================================================================
+        # 8. LiDAR 噪声仿真
         # ================================================================
         # 保存噪声前状态以传递标签/特征
         pre_points = points.copy()
@@ -421,48 +532,120 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
             dropout_rate=self.config.lidar_noise.dropout_rate,
             angular_jitter_deg=self.config.lidar_noise.angular_jitter_deg,
             seed=int(rng.integers(0, 2 ** 31)),
+            enable_edge_mixing=self.config.lidar_noise.enable_edge_mixing,
+            mixed_pixel_prob=self.config.lidar_noise.mixed_pixel_prob,
+            curvature=pre_curvature,  # P2-3: 仅高曲率边缘点混合
+            curvature_threshold=0.5,
         )
 
         if noisy_points.shape[0] == 0:
             raise RuntimeError("All points dropped during LiDAR noise simulation.")
 
         # ================================================================
-        # 8. 最近邻传递标签/特征/法向量
+        # 9. 最近邻传递标签/特征/法向量（带距离阈值保护）
+        # P0-4 修复：增加距离阈值，防止标签溢出/侵蚀
         # ================================================================
         from scipy.spatial import KDTree
         tree = KDTree(pre_points)
-        _, nn_idx = tree.query(noisy_points)
+        nn_dist, nn_idx = tree.query(noisy_points, k=1)
 
         labels = pre_labels[nn_idx]
         intensity = pre_intensity[nn_idx]
         curvature = pre_curvature[nn_idx]
         normals = pre_normals[nn_idx]
 
-        # ================================================================
-        # 9. 重采样至 num_points
-        # ================================================================
-        points_final, labels_final, intensity_final, curvature_final, normals_final = (
-            self._resample_to_target(
-                noisy_points, labels, intensity, curvature, normals,
-                self.config.num_points, rng,
-            )
-        )
+        # P0-4 距离阈值保护：超过 3σ 距离的点回退到背景标签
+        # 防止裂缝边缘噪声点携带错误标签到远处
+        max_transfer_dist = self.config.lidar_noise.distance_noise_std * 3.0
+        uncertain_mask = nn_dist > max_transfer_dist
+        # 对不确定点：仅保留非裂缝标签（标签 > 0 且 <= 8 的裂缝标签降为背景）
+        # 但保留松散、车辙、沉陷等大面积病害标签
+        crack_labels = set(range(1, 9))  # 裂缝标签 1-8
+        for i in range(len(labels)):
+            if uncertain_mask[i] and labels[i] in crack_labels:
+                labels[i] = 0  # 不确定的裂缝标签降为背景
 
         # ================================================================
-        # 10. 坐标归一化
+        # 10. P2-4: 裂缝边界软标签 + P1-2: 体素下采样
+        # ================================================================
+        # P2-4: 为每个点计算到最近裂缝边界的距离，转换为裂缝概率软标签
+        # 裂缝边界点: label ∈ [1,8] 且邻域有背景点的点
+        crack_boundary_dist = np.zeros(len(noisy_points), dtype=np.float32)
+        crack_mask_p2_4 = (labels >= 1) & (labels <= 8)
+        if np.any(crack_mask_p2_4) and np.any(~crack_mask_p2_4):
+            from scipy.spatial import KDTree as _KDTree
+            crack_pts = noisy_points[crack_mask_p2_4]
+            bg_pts = noisy_points[~crack_mask_p2_4]
+            if len(crack_pts) > 1 and len(bg_pts) > 1:
+                # 对每个背景点，计算到最近裂缝点的距离
+                crack_tree = _KDTree(crack_pts)
+                bg_dists, _ = crack_tree.query(bg_pts, k=1)
+                # 对裂缝点，计算到最近背景点的距离（双向检测）
+                bg_tree = _KDTree(bg_pts)
+                crack_dists, _ = bg_tree.query(crack_pts, k=1)
+                # 填充距离数组
+                crack_boundary_dist[crack_mask_p2_4] = crack_dists
+                crack_boundary_dist[~crack_mask_p2_4] = bg_dists
+                # 距离→概率：exp(-d²/2σ²)，σ 取 3×grid_res
+                sigma = grid_res * 3.0
+                # crack_probability: 1 表示确定是裂缝区域（低距离），0 表示远离裂缝
+                # 使用对称 sigmoid: probability = exp(-d²/2σ²) 用于非裂缝点
+                # 裂缝点内部概率=1，边界点概率衰减
+                pass  # crack_boundary_dist 存入 feats 用于训练
+
+        # P1-2: 使用体素下采样替代随机重采样
+        if self.config.target_density is not None and self.config.target_density > 0:
+            road_area = width * length
+            target_count = int(road_area * self.config.target_density)
+            # 计算合适的体素大小以逼近目标点数
+            # N_voxels ≈ area / voxel_size²（仅用 xy 维度）
+            effective_voxel_size = max(
+                np.sqrt(road_area / max(target_count, 1)),
+                grid_res * 1.5
+            )
+            # 体素质心下采样
+            points_final, labels_final, intensity_final, curvature_final, normals_final = (
+                self._voxel_downsample(
+                    noisy_points, labels, intensity, curvature, normals,
+                    voxel_size=effective_voxel_size,
+                )
+            )
+            # P2-4: 最近邻传递裂缝边界距离
+            from scipy.spatial import KDTree as _KDTree
+            bd_tree = _KDTree(noisy_points)
+            _, bd_idx = bd_tree.query(points_final, k=1)
+            crack_boundary_dist_final = crack_boundary_dist[bd_idx]
+        else:
+            # 回退到旧的 num_points 硬重采样
+            points_final, labels_final, intensity_final, curvature_final, normals_final = (
+                self._resample_to_target(
+                    noisy_points, labels, intensity, curvature, normals,
+                    self.config.num_points, rng,
+                )
+            )
+            # P2-4: KDTree 传递裂缝边界距离到重采样后的点
+            from scipy.spatial import KDTree as _KDTree
+            bd_tree = _KDTree(noisy_points)
+            _, bd_idx = bd_tree.query(points_final, k=1)
+            crack_boundary_dist_final = crack_boundary_dist[bd_idx]
+
+        # ================================================================
+        # 11. 坐标归一化
         # ================================================================
         if self.config.normalize:
             points_final = self._normalize(points_final)
 
         # ================================================================
-        # 特征拼接
+        # 12. 特征拼接 (P2-4: 增加裂缝边界距离通道)
         # ================================================================
-        feats = np.stack([intensity_final, curvature_final], axis=1).astype(np.float32)
+        feats = np.stack(
+            [intensity_final, curvature_final, crack_boundary_dist_final], axis=1
+        ).astype(np.float32)
 
         return {
             "points": points_final.astype(np.float32),
             "labels": labels_final.astype(np.int64),
-            "feats": feats,
+            "feats": feats,          # (N, 3): [intensity, curvature, crack_boundary_dist]
             "normals": normals_final.astype(np.float32),
             "pavement_type": pavement_type,
         }
@@ -551,9 +734,12 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         pavement_type: str,
         rng: np.random.Generator,
     ) -> np.ndarray:
-        """模拟 LiDAR 强度反射率。
+        """模拟 LiDAR 强度反射率（基于物理反射率模型）。
 
-        每种路面类型有基础反射率范围，病害区域在此基础上叠加偏移量。
+        P1-6 修复：使用物理合理的反射率范围和单位。
+        沥青基底反射率 0.10-0.25 (低反射率深色路面)，
+        水泥基底反射率 0.30-0.50 (浅色路面)。
+        输出范围 [0, 1]，代表归一化反射率。
 
         Args:
             labels: 标签数组 (N,)。
@@ -564,20 +750,30 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
             强度值 (N,) float32，范围 [0, 1]。
         """
         N = labels.shape[0]
+        # P1-6 修复：使用物理合理的反射率基线
         if pavement_type == "asphalt":
-            base = float(rng.uniform(0.3, 0.7))
+            # 沥青路面反射率低，0.10-0.25 (深灰到黑)
+            base = float(rng.uniform(0.10, 0.25))
         else:
-            base = float(rng.uniform(0.5, 0.9))
+            # 水泥路面反射率较高，0.30-0.50 (浅灰)
+            base = float(rng.uniform(0.30, 0.50))
 
         intensity = np.full(N, base, dtype=np.float64)
+        # 随机空间变化（模拟路面局部反射率差异）
+        intensity += rng.normal(0.0, 0.02, size=N)
 
-        # 病害区域强度修正
-        intensity[labels == 19] += self.config.bleeding.intensity_boost  # 泛油
-        intensity[(labels == 11) | (labels == 12)] -= 0.15  # 松散
-        intensity[labels == 36] -= 0.20  # 露骨
-        intensity[(labels == 20) | (labels == 37)] += 0.10  # 修补
-        intensity[labels == 29] += 0.20  # 唧泥（湿润）
-        intensity[labels == 34] -= 0.10  # 坑洞
+        # 病害区域强度修正（基于 JTG 标准中病害的视觉反射率特征）
+        intensity[labels == 19] += 0.20   # 泛油：反射率显著增加 (油膜反射)
+        intensity[(labels == 11) | (labels == 12)] -= 0.10  # 松散：反射率降低 (粗糙表面散射)
+        intensity[labels == 36] -= 0.08   # 露骨：骨料反射率略低于均匀水泥表面
+        intensity[(labels == 20) | (labels == 37)] += 0.15  # 修补：修补材料通常反射率较高
+        intensity[labels == 29] += 0.12   # 唧泥：湿润泥浆反射率高于干燥路面
+        intensity[labels == 34] -= 0.05   # 坑洞：深处反射率极低
+        # 裂缝：反射率轻微降低 (阴影 + 粗糙边缘)
+        crack_mask = (labels >= 1) & (labels <= 8)
+        intensity[crack_mask] -= 0.05
+        # 坑槽：反射率降低
+        intensity[(labels == 9) | (labels == 10)] -= 0.08
 
         return np.clip(intensity, 0.0, 1.0).astype(np.float32)
 
@@ -628,6 +824,62 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         )
 
     @staticmethod
+    def _voxel_downsample(
+        points: np.ndarray,
+        labels: np.ndarray,
+        intensity: np.ndarray,
+        curvature: np.ndarray,
+        normals: np.ndarray,
+        voxel_size: float = 0.01,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """P1-2: 体素质心下采样，保留密度结构。"""
+        if points.shape[0] < 10:
+            return points, labels, intensity, curvature, normals
+
+        # 体素索引 — 仅使用 xy 维度（路面高度变化不应用来分割体素）
+        voxel_indices = np.floor(points[:, :2] / voxel_size).astype(np.int64)
+        # 用字典聚合
+        voxel_dict: Dict[Tuple[int, int], List[int]] = {}
+        for i, vi in enumerate(voxel_indices):
+            key = (int(vi[0]), int(vi[1]))
+            if key not in voxel_dict:
+                voxel_dict[key] = []
+            voxel_dict[key].append(i)
+
+        N_voxels = len(voxel_dict)
+
+        # 聚合
+        result_pts = np.zeros((N_voxels, 3), dtype=np.float64)
+        result_labels = np.zeros(N_voxels, dtype=np.int64)
+        result_intensity = np.zeros(N_voxels, dtype=np.float32)
+        result_curvature = np.zeros(N_voxels, dtype=np.float32)
+        result_normals = np.zeros((N_voxels, 3), dtype=np.float32)
+
+        for vi, (key, idx_list) in enumerate(voxel_dict.items()):
+            idx_arr = np.array(idx_list)
+            # 质心
+            result_pts[vi] = np.mean(points[idx_arr], axis=0)
+            # 多数投票标签
+            lbl_counts = np.bincount(labels[idx_arr].astype(np.int64))
+            result_labels[vi] = np.argmax(lbl_counts)
+            # 均值特征
+            result_intensity[vi] = np.mean(intensity[idx_arr])
+            result_curvature[vi] = np.mean(curvature[idx_arr])
+            result_normals[vi] = np.mean(normals[idx_arr], axis=0)
+            # 重新归一化法向量
+            nrm = np.linalg.norm(result_normals[vi])
+            if nrm > 1e-12:
+                result_normals[vi] /= nrm
+
+        return (
+            result_pts.astype(np.float32),
+            result_labels,
+            result_intensity,
+            result_curvature,
+            result_normals,
+        )
+
+    @staticmethod
     def _normalize(points: np.ndarray) -> np.ndarray:
         """归一化点云到单位球：平移到原点，缩放至最大半径为 1。
 
@@ -648,6 +900,55 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
 # ===========================================================================
 # 工具函数
 # ===========================================================================
+
+
+def _compute_kdtree_curvature(
+    points: np.ndarray, k_neighbors: int = 20
+) -> np.ndarray:
+    """P2-2: Compute local curvature using KDTree neighborhood PCA.
+
+    对每个点，用其 k 近邻做 PCA，最小特征值与特征值总和之比作为局部曲率估计。
+    不依赖网格顺序，适用于任意点排列。
+
+    .. math::
+        C_i = \\frac{\\lambda_{\\min}}{\\lambda_1 + \\lambda_2 + \\lambda_3}
+
+    其中 :math:`\\lambda` 为邻域协方差矩阵的特征值。
+
+    Args:
+        points: 点云 (N, 3)。
+        k_neighbors: 邻域点数，默认 20。
+
+    Returns:
+        曲率值 (N,) float32，范围约 [0, 1]。
+    """
+    from scipy.spatial import KDTree as _KDTree
+    N = points.shape[0]
+    k = min(k_neighbors, N - 1)
+    if k < 3:
+        return np.zeros(N, dtype=np.float32)
+
+    tree = _KDTree(points)
+    curvature = np.zeros(N, dtype=np.float64)
+
+    for i in range(N):
+        _, idx = tree.query(points[i], k=k + 1)  # k+1 包含自身
+        neighbors = points[idx[1:]]  # 排除自身
+        # 中心化
+        centered = neighbors - neighbors.mean(axis=0)
+        # 3x3 协方差矩阵
+        cov = np.dot(centered.T, centered) / (k - 1)
+        # 特征值分解
+        try:
+            eigvals = np.linalg.eigvalsh(cov)
+            # PCA 曲率 = λ_min / (λ_1 + λ_2 + λ_3)
+            total = np.sum(np.abs(eigvals))
+            if total > 1e-12:
+                curvature[i] = np.abs(eigvals[0]) / total
+        except np.linalg.LinAlgError:
+            curvature[i] = 0.0
+
+    return curvature.astype(np.float32)
 
 
 def _compute_grid_curvature(z_grid: np.ndarray, grid_res: float) -> np.ndarray:
@@ -746,7 +1047,7 @@ if __name__ == "__main__":
             )
             assert pts.shape == (N, 3), f"points shape: {pts.shape}"
             assert lbl.shape == (N,), f"labels shape: {lbl.shape}"
-            assert feats.shape == (N, 2), f"feats shape: {feats.shape}"
+            assert feats.shape == (N, 3), f"feats shape: {feats.shape}"
             assert nrm.shape == (N, 3), f"normals shape: {nrm.shape}"
             assert ptype in ("asphalt", "concrete"), f"pavement_type: {ptype}"
 

@@ -20,8 +20,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from roadmc.data.synthetic.config import (
-    ASPHALT_LABELS,
-    CONCRETE_LABELS,
     GeneratorConfig,
     RoadSurfaceConfig,
     NUM_CLASSES,
@@ -33,140 +31,6 @@ def _get_label_info(label: int) -> Tuple[str, str]:
     """Get pavement type and severity from label."""
     info = LABEL_MAP.get(label, {})
     return info.get("pavement", "通用"), info.get("severity", "-")
-
-
-def _sample_disease_label(
-    rng: np.random.Generator,
-    pavement_type: str,
-    disease_probs: Dict[str, float],
-) -> Tuple[str, str, int]:
-    """Sample a disease label with stratified sampling.
-
-    Args:
-        rng: Random generator.
-        pavement_type: 'asphalt', 'concrete', or 'mixed'.
-        disease_probs: Disease probability dictionary.
-
-    Returns:
-        Tuple of (disease_type, severity, label_id).
-    """
-    # Build label pool based on pavement type
-    if pavement_type == "asphalt":
-        label_pool = list(ASPHALT_LABELS[1:])  # Skip background
-    elif pavement_type == "concrete":
-        label_pool = list(CONCRETE_LABELS)
-    else:  # mixed
-        label_pool = list(ASPHALT_LABELS[1:]) + list(CONCRETE_LABELS)
-
-    # Map label to disease type
-    label_to_disease = {}
-    for lid, info in LABEL_MAP.items():
-        if lid == 0:
-            continue
-        pav = info.get("pavement", "")
-        dtype = info.get("type", "")
-        sev = info.get("severity", "-")
-        if pav == "沥青":
-            key = _cn_to_en.get(dtype, dtype)
-        elif pav == "水泥":
-            key = _cn_to_en_concrete.get(dtype, dtype)
-        else:
-            continue
-        label_to_disease[lid] = (key, sev)
-
-    # Use disease probabilities to weight selection
-    disease_weights = {}
-    for lid in label_pool:
-        if lid in label_to_disease:
-            dtype, _ = label_to_disease[lid]
-            disease_weights[lid] = disease_probs.get(dtype, 0.1)
-
-    if not disease_weights or sum(disease_weights.values()) == 0:
-        # Fallback to uniform distribution
-        weights = np.ones(len(label_pool)) / len(label_pool)
-    else:
-        weights = np.array([disease_weights.get(lid, 0.01) for lid in label_pool])
-        weights = weights / weights.sum()
-
-    selected_label = rng.choice(label_pool, p=weights)
-    disease_type, severity = label_to_disease.get(selected_label, ("unknown", "-"))
-
-    return disease_type, severity, selected_label
-
-
-# Chinese to English disease type mapping (for disease_probs lookup)
-_cn_to_en = {
-    "龟裂": "alligator",
-    "块状裂缝": "block",
-    "纵向裂缝": "longitudinal",
-    "横向裂缝": "transverse",
-    "坑槽": "pothole",
-    "松散": "raveling",
-    "沉陷": "depression",
-    "车辙": "rutting",
-    "波浪拥包": "corrugation",
-    "泛油": "bleeding",
-}
-
-_cn_to_en_concrete = {
-    "破碎板": "slab_shatter",
-    "裂缝": "slab_crack",
-    "板角断裂": "corner_break",
-    "错台": "faulting",
-    "唧泥": "pumping",
-    "边角剥落": "edge_spall",
-    "接缝料损坏": "joint_damage",
-    "坑洞": "pitting",
-    "拱起": "blowup",
-    "露骨": "exposed_aggregate",
-    "修补": "patching",
-}
-
-
-def generate_single_scene(
-    scene_id: int,
-    config: GeneratorConfig,
-    pavement_type: str,
-    rng: np.random.Generator,
-) -> Optional[Dict]:
-    """Generate a single scene.
-
-    Args:
-        scene_id: Scene identifier.
-        config: Generator configuration.
-        pavement_type: Pavement type for this scene.
-        rng: Random generator.
-
-    Returns:
-        Dictionary with scene data or None if generation failed.
-    """
-    try:
-        from roadmc.data.synthetic.generator import SyntheticRoadDataset
-    except ImportError:
-        warnings.warn("SyntheticRoadDataset not available - using fallback generation")
-        return None
-
-    try:
-        # Create dataset instance for this scene
-        dataset = SyntheticRoadDataset(config=config, split="train")
-
-        # Generate base surface
-        points, normals, labels, feats = dataset.generate_sample(
-            pavement_type=pavement_type,
-            seed=rng.integers(0, 2**31) if config.seed is None else config.seed + scene_id,
-        )
-
-        return {
-            "points": points,
-            "normals": normals,
-            "labels": labels,
-            "feats": feats,
-            "pavement_type": pavement_type,
-            "scene_id": scene_id,
-        }
-    except Exception as e:
-        warnings.warn(f"Scene {scene_id} generation failed: {e}")
-        return None
 
 
 def generate_dataset(
@@ -290,105 +154,6 @@ def generate_dataset(
     return stats
 
 
-def _apply_disease(
-    points: np.ndarray,
-    labels: np.ndarray,
-    disease_type: str,
-    severity: str,
-    config: GeneratorConfig,
-    rng: np.random.Generator,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Apply a specific disease to the point cloud.
-
-    Args:
-        points: Point cloud (N, 3).
-        labels: Labels (N,).
-        disease_type: Disease type string.
-        severity: 'light' or 'severe'.
-        config: Generator configuration.
-        rng: Random generator.
-
-    Returns:
-        Modified points and labels.
-    """
-    from roadmc.data.synthetic import primitives as prim
-
-    pts = points.copy()
-    lbl = labels.copy()
-
-    # Disease-specific parameters
-    if disease_type in ("alligator", "block", "longitudinal", "transverse"):
-        crack_params = {
-            "d_max": 0.010 if severity == "light" else 0.030,
-            "width_mean": 0.005,
-            "width_std": 0.3,
-        }
-        pts, lbl = prim.add_crack(pts, lbl, disease_type, severity, crack_params, seed=rng.integers(0, 2**31))
-
-    elif disease_type == "pothole":
-        x_min, x_max = float(np.min(pts[:, 0])), float(np.max(pts[:, 0]))
-        y_min, y_max = float(np.min(pts[:, 1])), float(np.max(pts[:, 1]))
-        center = (
-            rng.uniform(x_min + 0.2, x_max - 0.2),
-            rng.uniform(y_min + 0.2, y_max - 0.2),
-        )
-        radius = rng.uniform(0.10, 0.25)
-        depth = rng.uniform(0.015, 0.040) if severity == "light" else rng.uniform(0.040, 0.080)
-        edge_quality = rng.uniform(0.5, 1.0)
-        pts, lbl = prim.add_pothole(pts, lbl, center, radius, depth, edge_quality, severity, seed=rng.integers(0, 2**31))
-
-    elif disease_type == "raveling":
-        # Use a random rectangular region
-        x_min, x_max = float(np.min(pts[:, 0])), float(np.max(pts[:, 0]))
-        y_min, y_max = float(np.min(pts[:, 1])), float(np.max(pts[:, 1]))
-        region_mask = np.ones(len(pts), dtype=bool)
-        # Random sub-region
-        mask_x = (pts[:, 0] > rng.uniform(x_min, x_max * 0.7)) & (pts[:, 0] < rng.uniform(x_max * 0.3, x_max))
-        mask_y = (pts[:, 1] > rng.uniform(y_min, y_max * 0.7)) & (pts[:, 1] < rng.uniform(y_max * 0.3, y_max))
-        region_mask = mask_x & mask_y
-        pts, lbl = prim.add_raveling(pts, lbl, region_mask, severity, seed=rng.integers(0, 2**31))
-
-    elif disease_type == "depression":
-        x_min, x_max = float(np.min(pts[:, 0])), float(np.max(pts[:, 0]))
-        y_min, y_max = float(np.min(pts[:, 1])), float(np.max(pts[:, 1]))
-        center = (
-            rng.uniform(x_min + 0.3, x_max - 0.3),
-            rng.uniform(y_min + 0.3, y_max - 0.3),
-        )
-        radius = rng.uniform(0.5, 1.5)
-        depth = rng.uniform(0.015, 0.030) if severity == "light" else rng.uniform(0.030, 0.060)
-        pts, lbl = prim.add_depression(pts, lbl, center, radius, depth, severity, seed=rng.integers(0, 2**31))
-
-    elif disease_type == "rutting":
-        x_min, x_max = float(np.min(pts[:, 0])), float(np.max(pts[:, 0]))
-        center_line = (x_min + x_max) / 2.0
-        depth = rng.uniform(0.010, 0.020) if severity == "light" else rng.uniform(0.020, 0.050)
-        pts, lbl = prim.add_rutting(
-            pts, lbl, center_line, config.rutting.wheel_separation, depth, config.rutting.rut_width, severity, seed=rng.integers(0, 2**31)
-        )
-
-    elif disease_type == "corrugation":
-        direction = rng.choice(["longitudinal", "transverse"])
-        wavelength = rng.uniform(*config.corrugation.wavelength_range)
-        amplitude = rng.uniform(*(config.corrugation.amplitude_light if severity == "light" else config.corrugation.amplitude_severe))
-        pts, lbl = prim.add_corrugation(pts, lbl, direction, wavelength, amplitude, severity, seed=rng.integers(0, 2**31))
-
-    elif disease_type == "bleeding":
-        # Random region for bleeding
-        region_mask = rng.choice([True, False], size=len(pts))
-        pts, lbl = prim.add_bleeding(pts, lbl, region_mask, seed=rng.integers(0, 2**31))
-
-    elif disease_type in ("slab_shatter", "slab_crack", "corner_break", "faulting", "pumping", "edge_spall", "joint_damage", "pitting", "blowup", "exposed_aggregate"):
-        concrete_params = {
-            "slab_length": config.concrete_damage.slab_length,
-            "slab_width": config.concrete_damage.slab_width,
-            "joint_width": config.concrete_damage.joint_width,
-        }
-        pts, lbl = prim.add_concrete_damage(pts, lbl, disease_type, severity, concrete_params, seed=rng.integers(0, 2**31))
-
-    return pts, lbl
-
-
 def verify_class_distribution(output_dir: Path, split: str) -> Dict[int, int]:
     """Verify class distribution in generated data.
 
@@ -415,7 +180,7 @@ def verify_class_distribution(output_dir: Path, split: str) -> Dict[int, int]:
 
     for npz_file in sorted(split_dir.glob("scene_*.npz")):
         try:
-            data = np.load(npz_file, allow_dickle=True)
+            data = np.load(npz_file, allow_pickle=True)
             labels = data["labels"]
             unique_labels = np.unique(labels)
             for lbl in unique_labels:

@@ -212,6 +212,41 @@ def _point_to_segment_distance(
     return np.sqrt(np.sum((points - closest) ** 2, axis=1))
 
 
+def _point_to_segment_distance_t(
+    points: np.ndarray, seg_start: np.ndarray, seg_end: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute perpendicular distance and projection parameter from points to a line segment.
+
+    Same as _point_to_segment_distance but also returns the local parameter t
+    along the segment (0=seg_start, 1=seg_end).
+
+    Args:
+        points: 查询点 (N, 2)。
+        seg_start: 线段起点 (2,)。
+        seg_end: 线段终点 (2,)。
+
+    Returns:
+        distances: 点到线段距离 (N,)。
+        t_local: 线段上的投影参数 (N,)，范围 [0, 1]。
+    """
+    A = seg_start[None, :]  # (1, 2)
+    B = seg_end[None, :]  # (1, 2)
+    AB = B - A
+    AP = points - A
+
+    ab2 = np.sum(AB ** 2)
+    if ab2 < 1e-12:
+        return np.sqrt(np.sum(AP ** 2, axis=1)), np.zeros(len(points))
+
+    # 投影参数 t = (AP · AB) / (AB · AB)
+    t_local = np.clip(np.sum(AP * AB, axis=1) / ab2, 0.0, 1.0)
+
+    # 最近点
+    closest = A + t_local[:, None] * AB
+    dist = np.sqrt(np.sum((points - closest) ** 2, axis=1))
+    return dist, t_local
+
+
 def _bilinear_interpolation(
     x: np.ndarray, y: np.ndarray, grid_x: np.ndarray, grid_y: np.ndarray, grid_z: np.ndarray
 ) -> np.ndarray:
@@ -341,6 +376,94 @@ def generate_road_surface(
 # ===========================================================================
 # 1.1.2 — 微观纹理叠加 (fBm)
 # ===========================================================================
+
+
+def resample_to_lidar_pattern(
+    points: np.ndarray,
+    scan_lines: int = 64,
+    vertical_fov_deg: float = 40.0,
+    scan_pattern: str = "rotating",
+    range_decay: float = 0.3,
+    incidence_angle_drop: float = 0.05,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """P1-1: Resample uniform grid points to simulate LiDAR scan line density.
+
+    将规则网格点云重采样为模拟 LiDAR 扫描线模式的非均匀分布。
+
+    旋转式 LiDAR：
+    - 沿 y 方向（道路纵向）的扫描线间距由 scan_lines 和 vertical_fov 决定
+    - 沿 x 方向（扫描方向）保持高密度
+    - 施加距离衰减和入射角丢点
+
+    .. math::
+        P_{\\text{keep}}(x,y) = \\frac{1}{1 + \\alpha \\cdot |y - y_{\\text{scan}}|}
+        \\cdot \\left(1 - \\beta \\cdot \\frac{r}{r_{\\max}}\\right)
+
+    Args:
+        points: 规则网格点云 (N, 3)。
+        scan_lines: 扫描线数量。
+        vertical_fov_deg: 垂直视场角 (度)。
+        scan_pattern: 'rotating' 或 'solid_state'。
+        range_decay: 距离衰减系数 α。
+        incidence_angle_drop: 入射角丢点系数 β。
+        rng: 随机数生成器。
+
+    Returns:
+        重采样后的点云索引 (N',)，可用于 points[idx]。
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    N = points.shape[0]
+    if N < 10:
+        return np.arange(N)
+
+    x = points[:, 0]
+    y = points[:, 1]
+
+    x_min, x_max = float(np.min(x)), float(np.max(x))
+    y_min, y_max = float(np.min(y)), float(np.max(y))
+
+    # 距离（简化：以路面中心为扫描原点）
+    sensor_height = max(x_max - x_min, y_max - y_min) * 1.5  # 假设传感器高度
+    r_dist = np.sqrt((x - (x_min + x_max) / 2) ** 2 + sensor_height ** 2)
+    r_max = np.max(r_dist) + 1e-12
+
+    if scan_pattern == "rotating":
+        # 扫描线在 y 方向上分布
+        scan_spacing = (y_max - y_min) / scan_lines
+        # 每条扫描线上的 y 中心位置
+        y_scans = np.linspace(y_min, y_max, scan_lines)
+
+        # 每个点到最近扫描线的距离
+        nearest_scan = np.argmin(np.abs(y[:, None] - y_scans[None, :]), axis=1)
+        dist_to_scan = np.abs(y - y_scans[nearest_scan])
+
+        # 到扫描线距离越远，保留概率越低（Gaussian falloff）
+        scan_sigma = scan_spacing * 0.8  # 扫描线有效宽度
+        scan_prob = np.exp(-0.5 * (dist_to_scan / scan_sigma) ** 2)
+
+        # 距离衰减
+        range_prob = 1.0 - range_decay * (r_dist / r_max)
+
+        # 入射角效应：边缘点更稀疏（大角度入射 → 低反射率 → 丢点率高）
+        # 简化：用 x 到中心线的距离模拟入射角
+        x_center = (x_min + x_max) / 2.0
+        incidence_angle = np.abs(x - x_center) / max(x_max - x_center, 0.01)
+        incidence_prob = 1.0 - incidence_angle_drop * incidence_angle
+
+        keep_prob = scan_prob * range_prob * incidence_prob
+        keep_prob = np.clip(keep_prob, 0.0, 1.0)
+
+    else:  # solid_state
+        # 固态闪光 LiDAR：均匀但带距离衰减
+        range_prob = 1.0 - range_decay * (r_dist / r_max)
+        keep_prob = np.clip(range_prob, 0.0, 1.0)
+
+    # Bernoulli 采样
+    keep_mask = rng.random(N) < keep_prob
+    return np.where(keep_mask)[0]
 
 
 def add_micro_texture(
@@ -548,35 +671,43 @@ def add_crack(
         curve_pts[:, 0] += pert_x * 0.02
         curve_pts[:, 1] += pert_y * 0.02
 
-        # 对每个点计算到扰动曲线的最小距离
+        # 对每个点计算到扰动曲线的最小距离和投影参数
         min_dist = np.full(N, np.inf)
-        # 用多段线近似，计算到每段距离
+        min_t = np.zeros(N)  # 每个点在曲线上最近位置的参数 t ∈ [0, 1]
+        # 用多段线近似，计算到每段距离和局部参数
         for k in range(num_curve_samples - 1):
-            seg_start = curve_pts[k]
-            seg_end = curve_pts[k + 1]
-            dists = _point_to_segment_distance(xy, seg_start, seg_end)
-            min_dist = np.minimum(min_dist, dists)
+            t_start = k / (num_curve_samples - 1)
+            t_end = (k + 1) / (num_curve_samples - 1)
+            dists, t_local = _point_to_segment_distance_t(
+                xy, curve_pts[k], curve_pts[k + 1]
+            )
+            # 将局部参数映射到全局曲线参数
+            t_on_curve_local = t_start + t_local * (t_end - t_start)
+            # 仅在当前段更近时更新距离和参数
+            better = dists < min_dist
+            min_dist = np.where(better, dists, min_dist)
+            min_t = np.where(better, t_on_curve_local, min_t)
 
-        # 裂缝宽度随位置变化 (对数正态)
+        # 裂缝宽度沿曲线变化 (对数正态采样)，基于空间位置插值
         lognorm_sample = rng.lognormal(mean=np.log(width_mean), sigma=width_std,
                                        size=num_curve_samples)
-        # 插值到各点
+        # 使用每个点在曲线上的投影参数 t 进行宽度插值，而非点索引
         half_width = np.interp(
-            np.linspace(0, 1, N),
+            min_t,
             np.linspace(0, 1, num_curve_samples),
             lognorm_sample,
         ) / 2.0
 
         # 深度剖面
-        # d(t) = d_max * exp(-(t/lambda)^p)
+        # d(depth_ratio) = d_max * exp(-(depth_ratio)^p)
         lambda_param = half_width / 2.0  # λ 与宽度相关
         p_param = 2.0  # 高斯槽 (p=2)
 
         # 裂缝区域掩码：距离小于半宽
         crack_mask = min_dist <= half_width
         if np.any(crack_mask):
-            t = min_dist[crack_mask] / np.clip(lambda_param[crack_mask], 1e-12, None)
-            depth = d_max * np.exp(-(t ** p_param))
+            depth_ratio = min_dist[crack_mask] / np.clip(lambda_param[crack_mask], 1e-12, None)
+            depth = d_max * np.exp(-(depth_ratio ** p_param))
             pts[crack_mask, 2] -= depth
             lbl[crack_mask] = label_val
 
@@ -619,9 +750,26 @@ def add_crack(
         if not ridge_segments:
             return pts, lbl  # 无有效脊线
 
+        # P2-1 修复：裁剪 Voronoi 脊线段到路面边界，剔除完全在路外的线段
+        clipped_ridge_segments = []
+        margin = width_crack * 5  # 使用裂缝宽度作为裁剪边距
+        for seg in ridge_segments:
+            p1, p2 = seg
+            # 线段完全在路面边界外（含边距）则跳过
+            if (p1[0] < x_min - margin and p2[0] < x_min - margin) or \
+               (p1[0] > x_max + margin and p2[0] > x_max + margin):
+                continue
+            if (p1[1] < y_min - margin and p2[1] < y_min - margin) or \
+               (p1[1] > y_max + margin and p2[1] > y_max + margin):
+                continue
+            clipped_ridge_segments.append(seg)
+
+        if not clipped_ridge_segments:
+            return pts, lbl  # 无有效脊线在路面范围内
+
         # 计算每个点到最近 Voronoi 脊线的距离
         min_dist_ridge = np.full(N, np.inf)
-        for seg in ridge_segments:
+        for seg in clipped_ridge_segments:
             dists = _point_to_segment_distance(xy, seg[0], seg[1])
             min_dist_ridge = np.minimum(min_dist_ridge, dists)
 
@@ -759,6 +907,7 @@ def add_raveling(
     region_mask: np.ndarray,
     severity: str,
     seed: Optional[int] = None,
+    remove_nan: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Add raveling (松散) — simulate fine aggregate loss.
 
@@ -769,16 +918,20 @@ def add_raveling(
     轻 (标签 11)：移除比例 ~5%，深度 ~1-2mm
     重 (标签 12)：移除比例 ~20%，深度 ~3-5mm 点蚀
 
+    可改进点#1: 增加 ``remove_nan`` 参数，为 True 时在返回前自动过滤 NaN
+    点并同步裁剪标签数组，减少调用方负担。
+
     Args:
         points:  点云 (N, 3)。
         labels:  标签 (N,)。
         region_mask: 布尔掩码 (N,)，指示松散发生的区域。
         severity: 严重程度 'light' | 'severe'。
         seed: 随机种子。
+        remove_nan: 是否在返回前自动过滤 NaN 点 (可改进点#1)。
 
     Returns:
-        points_modified:  修改后点云 (N, 3)。移除的点标记为 NaN。
-        labels_modified: 修改后标签 (N,)。
+        points_modified:  修改后点云 (N, 3) 或 (N', 3) (若 remove_nan=True)。
+        labels_modified: 修改后标签 (N,) 或 (N',)。
     """
     rng = np.random.default_rng(seed)
     pts = points.copy()
@@ -788,6 +941,9 @@ def add_raveling(
 
     region_idx = np.where(region_mask)[0]
     if len(region_idx) == 0:
+        if remove_nan:
+            valid = ~np.any(np.isnan(pts), axis=1)
+            return pts[valid], lbl[valid]
         return pts, lbl
 
     if severity == "light":
@@ -812,6 +968,11 @@ def add_raveling(
         erosion = np.clip(erosion, 0.0, pitting_depth * 1.5)
         pts[remaining_idx, 2] -= erosion
         lbl[remaining_idx] = label_val
+
+    # 可改进点#1: 自动过滤 NaN 点
+    if remove_nan:
+        valid = ~np.any(np.isnan(pts), axis=1)
+        return pts[valid], lbl[valid]
 
     return pts, lbl
 
@@ -1123,6 +1284,9 @@ def add_concrete_damage(
     slab_len = params.get("slab_length", 5.0)
     slab_wid = params.get("slab_width", 4.0)
     joint_w = params.get("joint_width", 0.008)
+    # P1-4 修复：支持板块偏移参数
+    x_offset = params.get("x_offset", 0.0)
+    y_offset = params.get("y_offset", 0.0)
 
     # --- 获取标签 ---
     # 对无程度区分的类型，直接用固定标签
@@ -1149,10 +1313,10 @@ def add_concrete_damage(
     x_min, x_max = float(np.min(x)), float(np.max(x))
     y_min, y_max = float(np.min(y)), float(np.max(y))
 
-    # 横向接缝 (沿 y 方向，在整数倍 slab_len 处)
-    trans_joints = np.arange(0, y_max + slab_len, slab_len)
-    # 纵向接缝 (沿 x 方向，在整数倍 slab_wid 处)
-    long_joints = np.arange(0, x_max + slab_wid, slab_wid)
+    # 横向接缝 (沿 y 方向，在偏移 + 整数倍 slab_len 处)
+    trans_joints = np.arange(y_offset, y_max + slab_len, slab_len)
+    # 纵向接缝 (沿 x 方向，在偏移 + 整数倍 slab_wid 处)
+    long_joints = np.arange(x_offset, x_max + slab_wid, slab_wid)
 
     def dist_to_nearest_joint(px, py):
         """计算点到最近接缝的距离。"""
@@ -1487,36 +1651,28 @@ def simulate_lidar_noise(
     dropout_rate: float,
     angular_jitter_deg: float,
     seed: Optional[int] = None,
+    enable_edge_mixing: bool = True,
+    mixed_pixel_prob: float = 0.01,
+    curvature: Optional[np.ndarray] = None,
+    curvature_threshold: float = 0.5,
 ) -> np.ndarray:
     """Simulate LiDAR measurement noise on point cloud.
 
     1. **球坐标噪声**：
        将点云从笛卡尔坐标 :math:`(x, y, z)` 转换为球坐标 :math:`(r, \\theta, \\phi)`：
-
        .. math::
            r &= \\sqrt{x^2 + y^2 + z^2} \\\\
            \\theta &= \\arctan(y/x) \\\\
            \\phi &= \\arcsin(z/r)
-
-       对距离加高斯噪声，角度加高斯抖动：
-
-       .. math::
-           r' &= r + \\mathcal{N}(0, \\sigma_d) \\\\
-           \\theta' &= \\theta + \\mathcal{N}(0, \\sigma_a) \\\\
-           \\phi' &= \\phi + \\mathcal{N}(0, \\sigma_a)
-
-       再转换回笛卡尔坐标。
+       对距离加高斯噪声，角度加高斯抖动，再转换回笛卡尔坐标。
 
     2. **Dropout (点丢失)**：
        基于 Bernoulli 过程 :math:`P(\\text{drop}) = p_d` 独立决定每个点的丢失。
        同时附加距离依赖性：远点丢失概率更高。
 
-       .. math::
-           P(\\text{drop}) = p_d + (1-p_d) \\cdot \\frac{r}{r_{\\max}} \\cdot 0.2
-
-    3. **边缘混合效应 (Edge Mixing)**：
-       裂缝/病害边界的点有一定概率被替换为邻域平均位置 (模拟 LiDAR 的
-       混合像素效应)。
+    3. **边缘混合效应 (Edge Mixing) — P2-3 修复**：
+       仅对曲率变化大的病害边缘点做邻域均值混合 (模拟 LiDAR 混合像素效应)。
+       使用批量化 KDTree 查询替代逐点查询 (可改进点#5)。
 
     Args:
         points:  点云 (N, 3)。
@@ -1524,6 +1680,10 @@ def simulate_lidar_noise(
         dropout_rate: 基础点丢失概率 [0, 1)。
         angular_jitter_deg: 角度抖动标准差 (度)。
         seed: 随机种子。
+        enable_edge_mixing: 是否启用边缘混合，默认 True (P2-3)。
+        mixed_pixel_prob: 混合像素点比例，默认 0.01 (1%)。
+        curvature: 曲率数组 (N,) 用于筛选边缘点，None 时退化到全局混合 (P2-3)。
+        curvature_threshold: 曲率阈值，大于此值的点才参与混合 (P2-3)。
 
     Returns:
         噪声点云 (N', 3)，其中 N' ≤ N。NaN 点已被移除。
@@ -1576,23 +1736,43 @@ def simulate_lidar_noise(
         keep_mask = np.ones(N, dtype=bool)
 
     # ===================================================================
-    # 5. 边缘混合效应 (Edge Mixing)
+    # 5. 边缘混合效应 (Edge Mixing) — P2-3 修复
     # ===================================================================
-    # 在保留点中随机选一部分，替换为邻域均值
-    if len(pts_noisy) > 10:
-        n_mixed = max(1, int(len(pts_noisy) * 0.01))  # ~1% 的点混合
-        mixed_idx = rng.choice(len(pts_noisy), size=n_mixed, replace=False)
+    if enable_edge_mixing and len(pts_noisy) > 10:
+        n_mixed = max(1, int(len(pts_noisy) * mixed_pixel_prob))
 
-        # 用 KDTree 找邻域
-        from scipy.spatial import KDTree
-        tree = KDTree(pts_noisy)
-        for idx in mixed_idx:
-            # 查找 5 个最近邻 (不包括自身)
-            dists, neighbors = tree.query(pts_noisy[idx], k=6)
-            neighbors = neighbors[1:]  # 排除自身
-            if len(neighbors) > 0:
-                # 用邻域均值替换
-                pts_noisy[idx] = np.mean(pts_noisy[neighbors], axis=0)
+        # P2-3: 如果提供了曲率，仅在高曲率区域混合（病害边缘）
+        if curvature is not None and len(curvature) > 0:
+            # 曲率与 keep_mask 对齐：需要从原始 curvature 对应到保留后的点
+            # 假设 curvature 在调用前已与输入 points 对齐
+            if len(curvature) == N:
+                cur = curvature[keep_mask]
+            else:
+                cur = curvature
+            # 高曲率区域的索引（top-n by curvature magnitude）
+            cur_abs = np.abs(cur)
+            # 筛选曲率大于阈值的候选点
+            edge_candidates = np.where(cur_abs > curvature_threshold * np.std(cur_abs))[0]
+            if len(edge_candidates) > n_mixed:
+                # 在高曲率点中随机选择
+                mixed_idx = rng.choice(edge_candidates, size=n_mixed, replace=False)
+            elif len(edge_candidates) > 0:
+                mixed_idx = edge_candidates
+            else:
+                mixed_idx = np.array([], dtype=int)
+        else:
+            # 退化到全局随机混合
+            mixed_idx = rng.choice(len(pts_noisy), size=n_mixed, replace=False)
+
+        # 可改进点#5: 批量 KDTree 查询替代逐点查询
+        if len(mixed_idx) > 0:
+            from scipy.spatial import KDTree
+            tree = KDTree(pts_noisy)
+            # 批量查询 k=6 个最近邻（包含自身，取邻居的 mean 替换）
+            _, all_neighbors = tree.query(pts_noisy[mixed_idx], k=6)
+            # 排除自身（第0列），取邻居的均值
+            neighbors_mean = np.mean(pts_noisy[all_neighbors[:, 1:]], axis=1)
+            pts_noisy[mixed_idx] = neighbors_mean
 
     return pts_noisy
 

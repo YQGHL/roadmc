@@ -74,7 +74,7 @@ LABEL_MAP: Dict[int, Dict[str, str]] = {
     33: {"type": "接缝料损坏", "severity": "重", "pavement": "水泥"},
     34: {"type": "坑洞",       "severity": "-",  "pavement": "水泥"},
     35: {"type": "拱起",       "severity": "-",  "pavement": "水泥"},
-    36: {"type": "��骨",       "severity": "-",  "pavement": "水泥"},
+    36: {"type": "露骨",       "severity": "-",  "pavement": "水泥"},
     37: {"type": "修补",       "severity": "-",  "pavement": "水泥"},
 }
 
@@ -241,11 +241,15 @@ class ConcreteDamageConfig:
         slab_length: 水泥板块长度 (米)，默认 5m。
         slab_width: 水泥板块宽度 (米)，默认 4m。
         joint_width: 接缝宽度 (米)，默认 8mm。
+        x_offset: 板块铺设 x 方向偏移 (米)，默认 0。
+        y_offset: 板块铺设 y 方向偏移 (米)，默认 0。
     """
 
     slab_length: float = 5.0
     slab_width: float = 4.0
     joint_width: float = 0.008
+    x_offset: float = 0.0
+    y_offset: float = 0.0
 
 
 @dataclass
@@ -257,12 +261,35 @@ class LidarNoiseConfig:
         dropout_rate: 点丢失比例。
         angular_jitter_deg: 角度抖动标准差 (度)。
         mixed_pixel_prob: 混合像素效应概率。
+        enable_edge_mixing: 是否启用边缘混合效应，默认 True。
     """
 
     distance_noise_std: float = 0.01
     dropout_rate: float = 0.03
     angular_jitter_deg: float = 0.01
     mixed_pixel_prob: float = 0.02
+    enable_edge_mixing: bool = True
+
+
+@dataclass
+class LiDARScanConfig:
+    """LiDAR 扫描几何配置 — 模拟真实扫描线密度分布 (P1-1).
+
+    Attributes:
+        enable: 是否启用扫描线模式。False 时使用规则网格。
+        scan_pattern: 扫描模式 — 'rotating' (旋转式) 或 'solid_state' (固态闪光)。
+        scan_lines: 扫描线数量 (旋转式) 或激光器通道数 (固态)。
+        vertical_fov_deg: 垂直视场角 (度)，默认 40°。
+        range_decay: 距离衰减系数，远处密度降低倍率。
+        incidence_angle_drop: 入射角相关的丢点概率基数。
+    """
+
+    enable: bool = False
+    scan_pattern: Literal["rotating", "solid_state"] = "rotating"
+    scan_lines: int = 64
+    vertical_fov_deg: float = 40.0
+    range_decay: float = 0.3
+    incidence_angle_drop: float = 0.05
 
 
 @dataclass
@@ -313,8 +340,11 @@ class GeneratorConfig:
         bleeding: 泛油配置。
         concrete_damage: 水泥损坏配置。
         lidar_noise: LiDAR 噪声配置。
+        lidar_scan: LiDAR 扫描几何配置 (P1-1)。
         seed: 全局随机种子，默认 None (非确定性)。
-        num_points: 每场景目标点数，默认 65536。
+        num_points: 每场景目标点数 (旧参数)，默认 65536。
+        target_density: 目标点密度 (点/㎡)，None 时使用 num_points (P1-2)。
+        point_count_tolerance: 点数波动容忍度 (±比例)，默认 0.2 (P1-2)。
         normalize: 是否坐标归一化到单位球，默认 True。
     """
 
@@ -330,8 +360,11 @@ class GeneratorConfig:
     bleeding: BleedingConfig = field(default_factory=BleedingConfig)
     concrete_damage: ConcreteDamageConfig = field(default_factory=ConcreteDamageConfig)
     lidar_noise: LidarNoiseConfig = field(default_factory=LidarNoiseConfig)
+    lidar_scan: LiDARScanConfig = field(default_factory=LiDARScanConfig)
     seed: Optional[int] = None
     num_points: int = 65536
+    target_density: Optional[float] = None  # P1-2: 点/㎡
+    point_count_tolerance: float = 0.20  # P1-2: ±20%
     normalize: bool = True
 
 
