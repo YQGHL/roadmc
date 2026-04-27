@@ -127,6 +127,8 @@ $$y = x + H \cdot r \in \mathbb{R}^{B \times C}$$
 
 `deploy()` freezes $H$ for inference.
 
+> 📄 **mHC paper**: [arXiv:2512.24880](https://arxiv.org/abs/2512.24880) — Manifold Hyper-Connection
+
 ### Transformer Block
 
 ```python

@@ -131,6 +131,8 @@ $$y = x + H \cdot r \in \mathbb{R}^{B \times C}$$
 
 `deploy()` 可将 $H$ 冻结为静态矩阵，推理时跳过 Sinkhorn 迭代。
 
+> 📄 **mHC 论文**: [arXiv:2512.24880](https://arxiv.org/abs/2512.24880)
+
 ### Transformer Block
 
 采用**前归一化 (pre-LN)** 残差结构：
