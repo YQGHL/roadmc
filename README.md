@@ -15,7 +15,7 @@
 
 > [**English**](README.en.md)
 
-_物理保真度 · 数学严谨性 · 工程精度_
+_物理保真度 · 数学严谨性 · 工程精度 · 管线完整_
 
 </div>
 
@@ -27,6 +27,9 @@ _物理保真度 · 数学严谨性 · 工程精度_
 - [系统架构](#-系统架构)
 - [阶段一：物理仿真数据生成](#-阶段一物理仿真数据生成)
 - [阶段二：深度网络模型](#-阶段二深度网络模型)
+- [阶段三：GAN 域适应](#-阶段三gan-域适应)
+- [阶段四：数据加载](#-阶段四数据加载)
+- [阶段五：训练与评估](#-阶段五训练与评估)
 - [快速开始](#-快速开始)
 - [数据格式](#-数据格式)
 - [可视化](#-可视化)
@@ -50,30 +53,11 @@ RoadMC 是一个**物理仿真驱动、数学约束增强**的路面点云病害
 
 ## 🏗 系统架构
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                      RoadMC System                               │
-├───────────────────────┬──────────────────────────────────────────┤
-│   Phase 1 · Data Gen  │   Phase 2 · Core Network                 │
-│                       │                                          │
-│  ┌─────────────────┐  │  Swin3D: Stage0 → Stage1 → Stage2 → St3  │
-│  │ Config          │  │           d=2      d=2      d=6     d=2  │
-│  └────────┬────────┘  │           C=96    C=192    C=384   C=768 │
-│           │           │                  ↓ Segmentation Head     │
-│  ┌────────▼────────┐  │            (B, N, 38) logits             │
-│  │ Primitives (13) │  │                                          │
-│  └────────┬────────┘  │  Each Transformer Block:                 │
-│           │           │    x = LN → WindowAttn → +x              │
-│  ┌────────▼────────┐  │      → LN → FFN → +x_attn                │
-│  │ Generator       │  │      → MHC(x_ffn, x_attn)                │
-│  └─────────────────┘  │               ← mHC mixing               │
-│                       │                                          │
-│  13 physics functions │                                          │
-│  38 JTG labels        │                                          │
-├───────────────────────┴──────────────────────────────────────────┤
-│  Legend: C=channels  d=depth  B=batch  N=points                  │
-└──────────────────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="docs/architecture.png" alt="RoadMC 系统架构图" width="95%"/>
+  <br>
+  <em>图：RoadMC 完整系统架构（Phase 1-5） — 数据生成 → 网络模型 → GAN 域适应 → 训练评估</em>
+</p>
 
 ---
 
@@ -162,6 +146,63 @@ $$\mathcal{L} = \lambda_1 \cdot \text{FocalLoss}(\gamma=2,\alpha) + \lambda_2 \c
 
 ---
 
+## 🎨 阶段三：GAN 域适应
+
+### 生成器 (`models/gan/generator.py`)
+DGCNN 风格迁移编码器-解码器架构：
+- **EdgeConv**: `torch.cdist` 构建 k-NN 图，MLP 聚合边特征
+- **编码器**: 3× EdgeConv (6→64→128→256, k=16)
+- **解码器**: 3× Linear (256→128→64→6)，输出坐标残差 + 法向调整
+- **参数量**: 125,574
+
+### 判别器 (`models/gan/discriminator.py`)
+PointNet 风格 WGAN-GP 判别器：
+- 逐点 MLP → 最大池化 → 全局 MLP → (B,1) 逻辑值（无 sigmoid）
+- 无 BatchNorm（WGAN-GP 要求）
+- **参数量**: 83,009
+
+### 损失函数
+$$\mathcal{L}_{\text{GAN}} = \mathcal{L}_{\text{WGAN-GP}} + \lambda_{\text{CD}} \cdot \text{ChamferDist} + \lambda_{\text{NC}} \cdot (1 - \cos(\mathbf{n}_{\text{pred}}, \mathbf{n}_{\text{ref}}))$$
+
+---
+
+## 📦 阶段四：数据加载
+
+### DataLoader (`data/dataloader.py`)
+- `SyntheticPointCloudDataset` — 加载 `.npz` 文件，支持 `max_points` 下采样
+- `RoadMCDataModule` — Lightning DataModule，支持 train/val/test
+- `collate_pointcloud_batch` — 自动 padding + `valid_mask`（填充标签为 -1，忽略损失计算）
+- 数据增强：Z 轴旋转 + 平移 + 缩放
+
+### 真实数据 (`data/real/dataset.py`)
+- `RealRoadDataset` — 加载 `.ply`/`.npy` 格式的真实点云
+- JTG 5210-2018 标签映射接口
+- 坐标归一化
+
+---
+
+## 🚀 阶段五：训练与评估
+
+### 训练 (`train.py`)
+三种模式：
+| 模式 | 命令 | 说明 |
+|:----:|------|------|
+| `baseline` | `python train.py baseline` | 纯合成数据训练分割模型 |
+| `gan_enhanced` | `python train.py gan_enhanced` | GAN 预训练 → 风格迁移混合训练 |
+| `end2end` | `python train.py end2end` | GAN + 分割交替优化 |
+
+### 评估 (`evaluate.py`)
+- 每类 IoU / 召回率 / 精确率（38 个 JTG 标签）
+- 按沥青路面 [1-20] / 水泥路面 [21-37] 分组统计
+- JSON 报告输出 + 终端格式化表格
+
+### MHC 谱分析 (`models/mhc/spectral_analysis.py`)
+- 验证双随机矩阵的谱范数 ≤ 1
+- 模拟 60 层级联传播的能量比
+- SVD 特征值分解
+
+---
+
 ## 🚀 快速开始
 
 ### 环境配置
@@ -176,7 +217,7 @@ pip install numpy scipy torch matplotlib pytorch-lightning torchmetrics
 # 阶段一 — 数据管线
 python roadmc/data/synthetic/config.py           # ✓ 配置检查
 python roadmc/data/synthetic/primitives.py       # ✓ 13 个物理基元
-python roadmc/data/synthetic/generator.py        # ✓ 场景生成
+python roadmc/data/synthetic/generator.py        # ✓ 场景生成 (5/5)
 
 # 阶段二 — 网络模型
 python roadmc/models/mhc/mhc.py                 # ✓ mHC 超连接
@@ -184,8 +225,22 @@ python roadmc/models/attention/window_attention.py  # ✓ 3D 注意力
 python -m roadmc.models.backbone.swin3d          # ✓ Swin3D 骨干
 python roadmc/models/model_pl.py                 # ✓ Lightning 封装
 
+# 阶段三 — GAN
+python roadmc/models/gan/generator.py           # ✓ 风格迁移生成器
+python roadmc/models/gan/discriminator.py       # ✓ WGAN-GP 判别器
+
+# 阶段四 — 数据加载
+python roadmc/data/dataloader.py                # ✓ DataLoader
+python roadmc/data/real/dataset.py              # ✓ 真实数据集
+
+# 阶段五 — 训练管线
+python -c "from roadmc.train import *"          # ✓ 训练导入
+
+# 光谱分析
+python roadmc/models/mhc/spectral_analysis.py   # ✓ MHC 谱分析
+
 # 可视化
-python roadmc/test/test_visualize.py             # 输出 13 张 PNG
+python roadmc/test/test_visualize.py            # 输出 13 张 PNG
 ```
 
 ### 批量生成合成数据
@@ -231,26 +286,45 @@ labels = data["labels"]   # (N,) int32
 | `*_features.png` | 强度/曲率/裂缝距离特征通道 |
 | `label_statistics.png` | 标签分布统计 |
 
+<p align="center">
+  <img src="docs/asphalt_multi_disease_2d_overlay.png" alt="2D 病害叠加图" width="45%"/>
+  <img src="docs/label_statistics.png" alt="标签统计" width="45%"/>
+  <br>
+  <em>左：病害种类标签着色俯视图  右：各类标签分布统计</em>
+</p>
+
 ---
 
 ## 📁 项目结构
 
 ```
 roadmc/
-├── data/synthetic/
-│   ├── config.py               # 数据类配置 (~500 行)
-│   ├── primitives.py           # 13 个物理基元 (~2020 行)
-│   └── generator.py            # 合成数据集 (~1100 行)
+├── data/
+│   ├── synthetic/
+│   │   ├── config.py               # 数据类配置 (~500 行)
+│   │   ├── primitives.py           # 13 个物理基元 (~2020 行)
+│   │   └── generator.py            # 合成数据集 (~1100 行)
+│   └── real/
+│       └── dataset.py              # 真实点云加载 (阶段四)
 ├── models/
-│   ├── mhc/mhc.py              # mHC 超连接 + Sinkhorn-Knopp
-│   ├── attention/              # 3D 窗口注意力 + 可变形
-│   ├── backbone/swin3d.py      # 4 阶段 Swin3D Transformer
-│   └── model_pl.py             # PyTorch Lightning 封装
+│   ├── mhc/mhc.py                  # mHC 超连接 + Sinkhorn-Knopp
+│   ├── attention/                  # 3D 窗口注意力 + 可变形
+│   ├── backbone/swin3d.py          # 4 阶段 Swin3D Transformer
+│   ├── gan/
+│   │   ├── generator.py            # StyleTransferGen (阶段三)
+│   │   └── discriminator.py        # WGANDiscriminator (阶段三)
+│   └── model_pl.py                 # PyTorch Lightning 封装
 ├── scripts/
-│   └── generate_synthetic.py   # CLI 批量生成
-└── test/
-    ├── test_visualize.py       # 可视化
-    └── output/                 # 生成图片
+│   └── generate_synthetic.py       # CLI 批量生成
+├── test/
+│   ├── test_visualize.py           # 可视化 (13 张图)
+│   └── output/                     # 生成图片
+├── train.py                        # 训练入口 (阶段五)
+├── evaluate.py                     # 评估入口 (阶段五)
+├── README.md                       # 本文档
+├── LICENSE                         # MIT License
+├── .gitignore
+└── pyproject.toml
 ```
 
 ---
