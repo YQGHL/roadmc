@@ -427,15 +427,21 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
                     params=params, seed=seed,
                 )
 
-            # P1-3 修复：仅在优先级更高时保留新标签
-            # 被病害函数修改的标签区域中，如果旧标签优先级更高，则恢复旧标签
+            # P1-3 修复 + Q3 向量化：仅在优先级更高时保留新标签
+            # 使用 numpy 查找表替代 Python 逐点 for 循环
             changed_mask = labels != old_labels
             if np.any(changed_mask):
-                for i in np.where(changed_mask)[0]:
-                    old_pri = LABEL_PRIORITY.get(int(old_labels[i]), 0)
-                    new_pri = LABEL_PRIORITY.get(int(labels[i]), 0)
-                    if old_pri > new_pri:
-                        labels[i] = old_labels[i]
+                # 预构建优先级查找表
+                max_label = max(LABEL_PRIORITY.keys()) + 1
+                priority_lut = np.zeros(max_label, dtype=np.int32)
+                for k, v in LABEL_PRIORITY.items():
+                    priority_lut[k] = v
+                # 向量化比较
+                old_prio = priority_lut[old_labels[changed_mask]]
+                new_prio = priority_lut[labels[changed_mask]]
+                restore = old_prio > new_prio
+                changed_indices = np.where(changed_mask)[0]
+                labels[changed_indices[restore]] = old_labels[changed_indices[restore]]
 
         # ================================================================
         # 4. 曲率计算 — P2-2 修复：使用 KDTree 局部邻域，解除网格顺序依赖
@@ -560,10 +566,9 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         uncertain_mask = nn_dist > max_transfer_dist
         # 对不确定点：仅保留非裂缝标签（标签 > 0 且 <= 8 的裂缝标签降为背景）
         # 但保留松散、车辙、沉陷等大面积病害标签
-        crack_labels = set(range(1, 9))  # 裂缝标签 1-8
-        for i in range(len(labels)):
-            if uncertain_mask[i] and labels[i] in crack_labels:
-                labels[i] = 0  # 不确定的裂缝标签降为背景
+        crack_mask = (labels >= 1) & (labels <= 8)  # Q1: 布尔掩码替代 set + for
+        restore_mask = uncertain_mask & crack_mask
+        labels[restore_mask] = 0  # 不确定的裂缝标签降为背景
 
         # ================================================================
         # 10. P2-4: 裂缝边界软标签 + P1-2: 体素下采样

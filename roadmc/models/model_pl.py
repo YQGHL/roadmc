@@ -32,18 +32,27 @@ class FocalLoss(nn.Module):
         else:
             self.alpha = None
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Compute focal loss.
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor,
+                valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Compute focal loss with optional ignore_index masking.
 
         Args:
             logits: (B, N, C) raw scores.
-            targets: (B, N) integer labels in [0, C-1].
+            targets: (B, N) integer labels in [0, C-1]. -1 values are ignored.
+            valid_mask: optional (B, N) bool mask. True = valid.
 
         Returns:
             Scalar focal loss.
         """
+        # Filter out ignore_index=1 entries
+        if valid_mask is not None:
+            logits = logits[valid_mask]
+            targets = targets[valid_mask]
+            if targets.numel() == 0:
+                return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        
         # softmax to get probabilities
-        probs = F.softmax(logits, dim=-1)  # (B, N, C)
+        probs = F.softmax(logits, dim=-1)  # (BxN, C) after masking
 
         # gather p_t = p[target_class] for each point
         # targets: (B, N) → (B, N, 1) for gather
@@ -81,18 +90,27 @@ class DiceLoss(nn.Module):
         super().__init__()
         self.smooth = smooth
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Compute dice loss (vectorized, L2 fix).
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor,
+                valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Compute dice loss (vectorized, L2 fix), with optional ignore_index masking.
 
         Args:
             logits: (B, N, C) raw scores.
-            targets: (B, N) integer labels in [0, C-1].
+            targets: (B, N) integer labels in [0, C-1]. -1 values are ignored.
+            valid_mask: optional (B, N) bool mask. True = valid.
 
         Returns:
             Scalar dice loss.
         """
+        # Filter out ignore_index=-1 entries
+        if valid_mask is not None:
+            logits = logits[valid_mask]
+            targets = targets[valid_mask]
+            if targets.numel() == 0:
+                return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        
         num_classes = logits.shape[-1]
-        probs = F.softmax(logits, dim=-1)  # (B, N, C)
+        probs = F.softmax(logits, dim=-1)  # (M, C) after masking
 
         # one-hot encode targets
         targets_one_hot = F.one_hot(targets, num_classes).float()  # (B, N, C)
@@ -212,20 +230,37 @@ class EdgeLoss(nn.Module):
         targets: torch.Tensor,
         coords: torch.Tensor,
         crack_boundary_dist: Optional[torch.Tensor] = None,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute edge loss.
+        """Compute edge loss, with optional valid_mask to exclude padded points.
 
         Args:
             logits: (B, N, C) raw scores.
             targets: (B, N) integer labels.
             coords: (B, N, 3) point coordinates.
-            crack_boundary_dist: optional (B, N) or (N,) from feats[:,:,2].
+            crack_boundary_dist: optional (B, N) from feats[:,:,2].
+            valid_mask: optional (B, N) bool mask, True = valid.
 
         Returns:
             Scalar edge loss (0 if no crack data).
         """
         B = logits.shape[0]
-        preds = logits.argmax(dim=-1)  # (B, N)
+
+        # Filter out invalid (padded) entries
+        if valid_mask is not None:
+            logits_list = [logits[b][valid_mask[b]] for b in range(B)]
+            targets_list = [targets[b][valid_mask[b]] for b in range(B)]
+            coords_list = [coords[b][valid_mask[b]] for b in range(B)]
+            if crack_boundary_dist is not None:
+                cbd_list = [crack_boundary_dist[b][valid_mask[b]] for b in range(B)]
+        else:
+            logits_list = [logits[b] for b in range(B)]
+            targets_list = [targets[b] for b in range(B)]
+            coords_list = [coords[b] for b in range(B)]
+            if crack_boundary_dist is not None:
+                cbd_list = [crack_boundary_dist[b] for b in range(B)]
+
+        preds_list = [l.argmax(dim=-1) for l in logits_list]
 
         total_loss = 0.0
         count = 0
@@ -233,13 +268,13 @@ class EdgeLoss(nn.Module):
         for b in range(B):
             # Determine which points are near cracks
             if crack_boundary_dist is not None:
-                cbd = crack_boundary_dist[b]  # (N,)
+                cbd = cbd_list[b] if valid_mask is not None else crack_boundary_dist[b]
                 near_crack = cbd < self.threshold
                 if not near_crack.any():
                     continue
-                mask_coords = coords[b, near_crack]  # (K, 3)
-                mask_preds = preds[b, near_crack].float()  # (K,)
-                mask_targets = targets[b, near_crack].float()  # (K,)
+                mask_coords = coords_list[b][near_crack]
+                mask_preds = preds_list[b][near_crack].float()
+                mask_targets = targets_list[b][near_crack].float()
             else:
                 # No crack info — skip this batch item
                 continue
@@ -335,19 +370,27 @@ class RoadMCSegModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         """Training step.
 
+        Accepts both dict batches (from DataLoader) and tuple batches (from self-test).
+
         Args:
-            batch: tuple of (coords, feats, labels).
+            batch: dict with keys 'coords','feats','labels','valid_mask' or tuple.
             batch_idx: int.
 
         Returns:
             Loss tensor.
         """
-        coords, feats, labels = batch
+        if isinstance(batch, dict):
+            coords, feats, labels = batch["coords"], batch["feats"], batch["labels"]
+            valid_mask = batch.get("valid_mask")
+        else:
+            coords, feats, labels = batch
+            valid_mask = None
+
         logits = self(coords, feats)
 
-        fl = self.focal_loss(logits, labels)
-        dl = self.dice_loss(logits, labels)
-        el = self.edge_loss(logits, labels, coords, feats[:, :, self.crack_dist_feat_idx])
+        fl = self.focal_loss(logits, labels, valid_mask)
+        dl = self.dice_loss(logits, labels, valid_mask)
+        el = self.edge_loss(logits, labels, coords, feats[:, :, self.crack_dist_feat_idx], valid_mask)
 
         loss = self.lambda_focal * fl + self.lambda_dice * dl + self.lambda_edge * el
 
@@ -358,25 +401,33 @@ class RoadMCSegModel(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation step with mIoU computation."""
-        coords, feats, labels = batch
+        """Validation step with mIoU computation.
+
+        Accepts both dict batches (from DataLoader) and tuple batches (from self-test).
+        """
+        if isinstance(batch, dict):
+            coords, feats, labels = batch["coords"], batch["feats"], batch["labels"]
+            valid_mask = batch.get("valid_mask")
+        else:
+            coords, feats, labels = batch
+            valid_mask = None
+
         logits = self(coords, feats)
 
-        fl = self.focal_loss(logits, labels)
-        dl = self.dice_loss(logits, labels)
-        el = self.edge_loss(logits, labels, coords, feats[:, :, self.crack_dist_feat_idx])
+        fl = self.focal_loss(logits, labels, valid_mask)
+        dl = self.dice_loss(logits, labels, valid_mask)
+        el = self.edge_loss(logits, labels, coords, feats[:, :, self.crack_dist_feat_idx], valid_mask)
 
         loss = self.lambda_focal * fl + self.lambda_dice * dl + self.lambda_edge * el
 
         preds = logits.argmax(dim=-1)
         miou, per_class_iou, per_class_recall, per_class_precision = self.compute_miou(
-            preds, labels, self.num_classes
+            preds, labels, self.num_classes, valid_mask
         )
 
         self.log("val_loss", loss, prog_bar=True)
         self.log("val_mIoU", miou, prog_bar=True)
-        # M5: log per-class metrics (only non-background classes)
-        for c in range(1, min(self.num_classes, 10)):  # log first 9 non-bg for readability
+        for c in range(1, min(self.num_classes, 10)):
             if per_class_iou[c] > 0 or per_class_recall[c] > 0:
                 self.log(f"val_IoU_{c}", per_class_iou[c])
                 self.log(f"val_recall_{c}", per_class_recall[c])
@@ -395,20 +446,37 @@ class RoadMCSegModel(pl.LightningModule):
 
     @staticmethod
     def compute_miou(
-        preds: torch.Tensor, targets: torch.Tensor, num_classes: int
+        preds: torch.Tensor, targets: torch.Tensor, num_classes: int,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute macro mean IoU + per-class IoU, recall, precision.
 
         Args:
             preds: (B, N) predicted labels.
-            targets: (B, N) ground truth labels.
+            targets: (B, N) ground truth labels. -1 entries ignored.
             num_classes: C.
+            valid_mask: optional (B, N) bool, True=valid.
 
         Returns:
             Tuple of (mIoU, per_class_IoU, per_class_recall, per_class_precision).
         """
-        preds_flat = preds.reshape(-1)
-        targets_flat = targets.reshape(-1)
+        # Filter out invalid (padded) entries
+        if valid_mask is not None:
+            preds_flat = preds[valid_mask]
+            targets_flat = targets[valid_mask]
+        else:
+            # Also filter -1 labels even without valid_mask
+            valid_entries = targets >= 0
+            preds_flat = preds[valid_entries]
+            targets_flat = targets[valid_entries]
+
+        if targets_flat.numel() == 0:
+            return (
+                torch.tensor(0.0, device=preds.device),
+                torch.zeros(num_classes, device=preds.device),
+                torch.zeros(num_classes, device=preds.device),
+                torch.zeros(num_classes, device=preds.device),
+            )
 
         ious = []
         recalls = []

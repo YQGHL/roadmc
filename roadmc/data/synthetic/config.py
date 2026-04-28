@@ -101,6 +101,14 @@ class RoadSurfaceConfig:
     pavement_type: Literal["asphalt", "concrete"] = "asphalt"
     roughness_class: Literal["A", "B", "C", "D", "E"] = "A"
 
+    def __post_init__(self) -> None:
+        if self.width <= 0:
+            raise ValueError(f"width must be > 0, got {self.width}")
+        if self.length <= 0:
+            raise ValueError(f"length must be > 0, got {self.length}")
+        if self.grid_res <= 0:
+            raise ValueError(f"grid_res must be > 0, got {self.grid_res}")
+
 
 @dataclass
 class MicroTextureConfig:
@@ -270,6 +278,12 @@ class LidarNoiseConfig:
     mixed_pixel_prob: float = 0.02
     enable_edge_mixing: bool = True
 
+    def __post_init__(self) -> None:
+        if self.distance_noise_std < 0:
+            raise ValueError(f"distance_noise_std must be ≥ 0, got {self.distance_noise_std}")
+        if not 0.0 <= self.dropout_rate <= 1.0:
+            raise ValueError(f"dropout_rate must be in [0,1], got {self.dropout_rate}")
+
 
 @dataclass
 class LiDARScanConfig:
@@ -319,6 +333,15 @@ class DiseaseConfig:
     })
     severity_ratio: float = 0.6
     max_diseases_per_scene: int = 3
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.severity_ratio <= 1.0:
+            raise ValueError(f"severity_ratio must be in [0,1], got {self.severity_ratio}")
+        if self.max_diseases_per_scene < 1:
+            raise ValueError(f"max_diseases_per_scene must be ≥ 1, got {self.max_diseases_per_scene}")
+        for k, v in self.disease_probs.items():
+            if not 0.0 <= v <= 1.0:
+                raise ValueError(f"disease_probs['{k}'] = {v} not in [0,1]")
 
 
 @dataclass

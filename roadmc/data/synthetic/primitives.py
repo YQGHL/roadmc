@@ -544,6 +544,45 @@ def add_micro_texture(
 # ===========================================================================
 
 
+def _generate_alligator_seeds(
+    x_min: float, x_max: float,
+    y_min: float, y_max: float,
+    num_seeds: int,
+    inhibition_radius: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """M2: Matern-II-type Poisson point process with inhibition radius.
+
+    Generates crack nucleation seeds with a minimum spacing constraint,
+    preventing unnaturally overlapping Voronoi cells that occur with
+    uniform random placement.
+
+    Args:
+        x_min, x_max: x range.
+        y_min, y_max: y range.
+        num_seeds: target number of seeds (Poisson mean).
+        inhibition_radius: minimum distance between any two seeds.
+        rng: random number generator.
+
+    Returns:
+        (N, 2) array of seed coordinates.
+    """
+    actual = rng.poisson(num_seeds)
+    actual = max(actual, 3)
+    seeds = []
+    max_attempts = actual * 10
+    attempts = 0
+    while len(seeds) < actual and attempts < max_attempts:
+        candidate = np.array([
+            rng.uniform(x_min, x_max),
+            rng.uniform(y_min, y_max),
+        ])
+        if all(np.linalg.norm(candidate - s) > inhibition_radius for s in seeds):
+            seeds.append(candidate)
+        attempts += 1
+    return np.array(seeds) if seeds else np.array([[x_min, y_min]])
+
+
 def add_crack(
     points: np.ndarray,
     labels: np.ndarray,
@@ -730,10 +769,11 @@ def add_crack(
 
         num_seeds = max(int(area / (block_size ** 2)), 4)
 
-        # Poisson 点过程生成种子点
-        seeds = rng.uniform(0, 1, (num_seeds, 2))
-        seeds[:, 0] = seeds[:, 0] * (x_max - x_min) + x_min
-        seeds[:, 1] = seeds[:, 1] * (y_max - y_min) + y_min
+        # M2: Matern-II 带抑制半径的泊松点过程 (替代 rng.uniform 撒点)
+        inhibition_radius = block_size * 0.15
+        seeds = _generate_alligator_seeds(
+            x_min, x_max, y_min, y_max, num_seeds, inhibition_radius, rng
+        )
 
         # Voronoi 图
         vor = spatial.Voronoi(seeds)
@@ -892,6 +932,78 @@ def add_pothole(
                 z_pit = -pit_d * (1.0 - r_norm_pit ** 2.0) ** 0.5
                 pts[in_pit, 2] += z_pit
                 lbl[in_pit] = label_val
+
+    return pts, lbl
+
+
+# ===========================================================================
+# M3: Lévy 极值剥落 — 重尾分布模拟裂缝/坑槽边缘的深层剥落
+# ===========================================================================
+
+
+def add_edge_spalling_heavy_tail(
+    points: np.ndarray,
+    labels: np.ndarray,
+    edge_mask: np.ndarray,
+    depth_base: float = 0.005,
+    hurst: float = 0.7,
+    trigger_prob: float = 0.05,
+    label_val: int = 0,
+    seed: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """M3: Add heavy-tailed edge spalling via Lévy α-stable jumps.
+
+    Unlike the standard fBm micro-texture where Lévy's heavy tail
+    is diluted by central limit theorem across 8 octaves, this function
+    applies the α-stable distribution directly to a small subset of
+    edge points, producing realistic deep spall craters.
+
+    .. math::
+        \\Delta z \\sim \\text{LévyStable}(\\alpha, 0, d_{\\text{base}}, 0)
+
+    where :math:`\\alpha = 2 \\cdot H` controls tail heaviness
+    (lower → heavier tail → deeper individual spalls).
+
+    Only ``trigger_prob`` fraction of edge points are affected,
+    producing the characteristic "pitting" pattern of severe spalling.
+
+    Args:
+        points: Point cloud (N, 3).
+        labels: Labels (N,).
+        edge_mask: Boolean mask (N,) indicating crack/pothole edges.
+        depth_base: Base spalling depth scale (m).
+        hurst: Hurst exponent, alpha = 2*H. Lower = heavier tail.
+        trigger_prob: Fraction of edge points to spall.
+        label_val: Label to assign to spalled points (0 = keep original).
+        seed: Random seed.
+
+    Returns:
+        Modified (points, labels).
+    """
+    rng = np.random.default_rng(seed)
+    pts = points.copy()
+    lbl = labels.copy()
+
+    edge_idx = np.where(edge_mask)[0]
+    if len(edge_idx) == 0:
+        return pts, lbl
+
+    n_trigger = max(1, int(len(edge_idx) * trigger_prob))
+    triggered = rng.choice(edge_idx, size=n_trigger, replace=False)
+
+    # Lévy α-stable: alpha = 2*H, heavy tail produces extreme spalls
+    alpha = max(0.5, min(1.9, 2.0 * hurst))
+    jump = stats.levy_stable.rvs(
+        alpha=alpha, beta=0, loc=0,
+        scale=depth_base, size=n_trigger,
+        random_state=rng,
+    )
+    jump = np.abs(jump)           # only downward (erosion)
+    jump = np.clip(jump, 0.0, depth_base * 5.0)  # limit extreme outliers
+
+    pts[triggered, 2] -= jump
+    if label_val > 0:
+        lbl[triggered] = label_val
 
     return pts, lbl
 

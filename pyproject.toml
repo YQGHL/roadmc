@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "roadmc"
+version = "0.2.0"
+description = "Physics-Simulation-Driven Road Surface Point Cloud Disease Detection"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "torch>=2.1",
+    "pytorch-lightning>=2.0",
+    "torchmetrics>=1.0",
+    "matplotlib>=3.7",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+lint.select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+lint.ignore = ["E501", "N802", "N803", "N806"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+warn_return_any = false
+warn_unused_ignores = true
+ignore_missing_imports = true
+disallow_untyped_defs = false
+allow_redefinition = true
+
+[tool.pytest.ini_options]
+testpaths = ["roadmc"]
+python_files = ["test_*.py"]

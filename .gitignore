@@ -1,25 +1,31 @@
-# ============================================
-# RoadMC - .gitignore
-# ============================================
-
-# Python cache
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
 
-# RoadMC: exclude specific files/folders from push
-roadmc/HANDOFF_阶段一.md
-roadmc/test/
+# Virtual environment
+.venv/
+venv/
 
 # IDE
 .idea/
 .vscode/
+*.swp
+*.swo
 
-# Other project files (outside roadmc)
-*.pdf
-mHC.pdf
-test.md
-方法.md
-方法2.md
-项目规划.md
+# Data files
+*.npz
+*.ply
+*.pcd
+*.bin
+
+# Output
+roadmc/test/output/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
