@@ -244,10 +244,9 @@ def train_end2end(args):
                 d_loss = -disc(ri).mean() + disc(fi).mean() + lambda_gp * gp
                 d_loss.backward(); d_opt.step()
 
-            # Generator
+            # Generator (no torch.no_grad — gradients must flow through disc to gen)
             g_opt.zero_grad()
-            with torch.no_grad():
-                fi = gen(coords, normals.detach())
+            fi = gen(coords, normals.detach())
             g_loss = -disc(fi).mean()
             g_loss.backward(); g_opt.step()
 
