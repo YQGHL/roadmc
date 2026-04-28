@@ -118,11 +118,13 @@ def train_gan_enhanced(args):
 
                 del real_input, fake_input, real_validity, fake_validity, gp
 
-            # Generator update
+            # Generator update (NOTE: no torch.no_grad — gradients must flow through disc to gen)
             g_opt.zero_grad()
-            with torch.no_grad():
-                fake_input = gen(coords, normals.detach())
-            g_loss = -disc(fake_input).mean()
+            fake_input = gen(coords, normals.detach())
+            g_loss_adv = -disc(fake_input).mean()
+            g_loss_chamfer = torch.cdist(fake_input[:,:,:3], coords).min(dim=2)[0].mean() * 10.0
+            g_loss_normal = (1.0 - (fake_input[:,:,3:6] * normals).sum(dim=-1)).mean()
+            g_loss = g_loss_adv + g_loss_chamfer + g_loss_normal
             g_loss.backward()
             g_opt.step()
             g_loss_total += g_loss.item()
@@ -133,6 +135,51 @@ def train_gan_enhanced(args):
                   f"G_loss={g_loss_total/n_batches:.4f}")
 
     print("[GAN] Pre-training complete.")
+
+    # Add Chamfer distance + normal consistency losses (complement WGAN-GP adversarial)
+    def chamfer_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Chamfer distance: sum of nearest-neighbor distances between two point sets."""
+        dist = torch.cdist(pred, target)  # (B, N, N)
+        return dist.min(dim=2)[0].mean() + dist.min(dim=1)[0].mean()
+
+    def normal_consistency(normals_pred: torch.Tensor, normals_ref: torch.Tensor) -> torch.Tensor:
+        """Cosine similarity between predicted and reference normals."""
+        cos_sim = (normals_pred * normals_ref).sum(dim=-1)
+        return (1.0 - cos_sim).mean()
+
+    # Mixed training: GAN-styled synthetic data for segmentation
+    print("[GAN] Mixed training: segmentation on GAN-styled data...")
+    seg_model = RoadMCSegModel(
+        in_channels=3, num_classes=38,
+        embed_dim=args.embed_dim,
+        depths=tuple(args.depths),
+        num_heads=tuple(args.num_heads),
+        lr=args.lr, weight_decay=args.weight_decay,
+    ).to(device)
+    seg_opt = torch.optim.AdamW(seg_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    gen.eval()
+    for epoch in range(args.max_epochs):
+        for batch in datamodule.train_dataloader():
+            coords = batch["coords"].to(device)
+            normals = batch["normals"].to(device)
+            labels = batch["labels"].to(device)
+
+            seg_opt.zero_grad()
+            with torch.no_grad():
+                styled = gen(coords, normals.detach())
+            sc = coords + styled[:, :, :3]
+            logits = seg_model(sc, batch["feats"].to(device))
+            seg_loss = seg_model.lambda_focal * seg_model.focal_loss(logits, labels) \
+                     + seg_model.lambda_dice * seg_model.dice_loss(logits, labels)
+            seg_loss.backward()
+            torch.nn.utils.clip_grad_norm_(seg_model.parameters(), 1.0)
+            seg_opt.step()
+
+        if (epoch + 1) % 5 == 0:
+            print(f"  [GAN+Seg] Epoch {epoch+1}/{args.max_epochs}")
+
+    print("[GAN] Mixed training complete.")
 
 
 def train_end2end(args):
