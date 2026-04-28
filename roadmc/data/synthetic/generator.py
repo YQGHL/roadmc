@@ -1008,12 +1008,15 @@ if __name__ == "__main__":
     print("=" * 72)
 
     # 小尺寸测试配置（加快测试速度）
-    from .config import GeneratorConfig, RoadSurfaceConfig, DiseaseConfig
+    try:
+        from .config import GeneratorConfig, RoadSurfaceConfig, DiseaseConfig
+    except ImportError:
+        from config import GeneratorConfig, RoadSurfaceConfig, DiseaseConfig
 
     cfg = GeneratorConfig(
         road=RoadSurfaceConfig(
-            width=0.5,
-            length=0.5,
+            width=2.0,
+            length=2.0,
             grid_res=0.02,
         ),
         disease=DiseaseConfig(
