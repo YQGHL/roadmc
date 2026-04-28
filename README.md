@@ -56,7 +56,7 @@ RoadMC 是一个**物理仿真驱动、数学约束增强**的路面点云病害
 <p align="center">
   <img src="docs/architecture.png" alt="RoadMC 系统架构图" width="95%"/>
   <br>
-  <em>图：RoadMC 完整系统架构（Phase 1-5） — 数据生成 → 网络模型 → GAN 域适应 → 训练评估</em>
+  <em>图：RoadMC 完整系统架构（阶段 1-5）— 数据生成 → 数据加载 → 核心网络(Swin3D+mHC) → GAN域适应 → 训练评估</em>
 </p>
 
 ---

@@ -56,7 +56,7 @@ RoadMC is a **physics-simulation-driven**, **mathematically constrained** road s
 <p align="center">
   <img src="docs/architecture.png" alt="RoadMC System Architecture" width="95%"/>
   <br>
-  <em>Fig: Complete system architecture (Phase 1-5) — Data → Network → GAN → Training</em>
+  <em>Fig: RoadMC system architecture (Phase 1-5) — Data Generation → Data Loading → Core Network (Swin3D+mHC) → GAN Adaptation → Training/Evaluation</em>
 </p>
 
 ---

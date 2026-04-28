@@ -29,3 +29,21 @@ roadmc/test/output/
 # OS
 .DS_Store
 Thumbs.db
+
+# Planning documents (not source code)
+HANDOFF_交接文档_阶段一.md
+修复报告_阶段一.md
+修复报告_阶段一_完整版.md
+待实现清单.md
+项目交接文档.md
+方法.md
+方法2.md
+项目规划.md
+test.md
+README.en.md
+
+# PDF reference papers
+*.pdf
+
+# Sisyphus internal tracking
+.sisyphus/
