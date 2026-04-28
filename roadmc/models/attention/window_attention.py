@@ -134,7 +134,7 @@ class WindowAttention3D(nn.Module):
         x: torch.Tensor,
         shift: bool = False,
     ) -> torch.Tensor:
-        """Forward pass.
+        """Forward pass with per-window attention to avoid O(N²) memory.
 
         Args:
             coords: (B, N, 3) point coordinates.
@@ -146,44 +146,54 @@ class WindowAttention3D(nn.Module):
         """
         B, N, C = x.shape
         H, D = self.num_heads, self.head_dim
+        device = x.device
 
         # 1. Project Q, K, V
         qkv = self.qkv(x)  # (B, N, 3*C)
         q, k, v = qkv.chunk(3, dim=-1)  # each (B, N, C)
 
         # 2. Reshape to multi-head: (B, H, N, D)
-        q = q.view(B, N, H, D).transpose(1, 2)
+        q = q.view(B, N, H, D).transpose(1, 2)  # (B, H, N, D)
         k = k.view(B, N, H, D).transpose(1, 2)
         v = v.view(B, N, H, D).transpose(1, 2)
 
         # 3. Partition into windows
         window_id, _num_windows = _window_partition(
             coords, self.window_size, shift=shift
-        )
+        )  # (B, N)
 
-        # 4. Compute attention scores
+        # 4. Per-window attention (avoids O(N²) full attention matrix)
         scale = D ** -0.5
-        attn = (q @ k.transpose(-2, -1)) * scale  # (B, H, N, N)
+        out = torch.zeros(B, N, C, device=device, dtype=x.dtype)
 
-        # 5. Compute 3D relative position bias
-        # Pairwise coordinate offsets: (B, N, N, 3)
-        offsets = coords.unsqueeze(2) - coords.unsqueeze(1)  # (B, N, N, 3)
-        rel_pos_bias = self.pos_mlp(offsets)  # (B, N, N, H)
-        rel_pos_bias = rel_pos_bias.permute(0, 3, 1, 2)  # (B, H, N, N)
-        attn = attn + rel_pos_bias
+        for b in range(B):
+            # Get unique windows for this batch item
+            unique_windows = window_id[b].unique()
+            for wid in unique_windows:
+                mask = window_id[b] == wid
+                idx = mask.nonzero(as_tuple=True)[0]  # (W,)
+                W = len(idx)
+                if W == 0:
+                    continue
 
-        # 6. Mask out cross-window attention
-        # window_id: (B, N) → same_window: (B, 1, N, N)
-        same_window = window_id.unsqueeze(2) == window_id.unsqueeze(1)  # (B, N, N)
-        same_window = same_window.unsqueeze(1)  # (B, 1, N, N)
-        attn = attn.masked_fill(~same_window, -1e4)
+                # Extract Q, K, V for this window: (1, H, W, D)
+                q_w = q[b:b+1, :, idx, :]
+                k_w = k[b:b+1, :, idx, :]
+                v_w = v[b:b+1, :, idx, :]
 
-        # 7. Softmax and attend
-        attn = self.softmax(attn)
+                # Attention within window: (1, H, W, W)
+                attn_w = (q_w @ k_w.transpose(-2, -1)) * scale
 
-        # 8. Weighted sum
-        out = attn @ v  # (B, H, N, D)
-        out = out.transpose(1, 2).reshape(B, N, C)  # (B, N, C)
+                # Relative position bias within window: (1, W, W, 3) → (1, H, W, W)
+                coords_w = coords[b:b+1, idx, :]
+                offsets_w = coords_w.unsqueeze(2) - coords_w.unsqueeze(1)
+                rel_bias = self.pos_mlp(offsets_w).permute(0, 3, 1, 2)
+                attn_w = attn_w + rel_bias
+
+                attn_w = self.softmax(attn_w)
+                out_w = attn_w @ v_w  # (1, H, W, D)
+                out_w = out_w.transpose(1, 2).reshape(1, W, C)
+                out[b, idx, :] = out_w.squeeze(0)
 
         # 9. Project output
         out = self.proj(out)
