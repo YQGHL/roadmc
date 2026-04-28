@@ -43,6 +43,14 @@ try:
         resample_to_lidar_pattern,
     )
 except ImportError:
+    # Fallback for standalone / -m execution
+    import sys as _sys
+    from pathlib import Path as _Path
+    _root = str(_Path(__file__).resolve().parents[2])  # project root
+    _parent = str(_Path(__file__).resolve().parent)     # synthetic/ dir
+    for _p in (_root, _parent):
+        if _p not in _sys.path:
+            _sys.path.insert(0, _p)
     from config import (  # type: ignore[no-redef]
         NUM_CLASSES,
         GeneratorConfig,
@@ -1000,7 +1008,7 @@ if __name__ == "__main__":
     print("=" * 72)
 
     # 小尺寸测试配置（加快测试速度）
-    from config import GeneratorConfig, RoadSurfaceConfig, DiseaseConfig
+    from .config import GeneratorConfig, RoadSurfaceConfig, DiseaseConfig
 
     cfg = GeneratorConfig(
         road=RoadSurfaceConfig(

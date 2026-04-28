@@ -231,10 +231,18 @@ if __name__ == '__main__':
         ds = SyntheticRoadDataset(cfg, dataset_size=2)
 
         os.makedirs(os.path.join(tmpdir, "train"), exist_ok=True)
+        os.makedirs(os.path.join(tmpdir, "val"), exist_ok=True)
         for i in range(2):
             scene = ds.generate_scene(i)
             np.savez_compressed(
                 os.path.join(tmpdir, f"train/scene_{i:04d}.npz"),
+                **scene,
+            )
+        # Generate at least one val scene
+        for i in range(2):
+            scene = ds.generate_scene(i + 10)
+            np.savez_compressed(
+                os.path.join(tmpdir, f"val/scene_{i:04d}.npz"),
                 **scene,
             )
 

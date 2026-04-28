@@ -134,33 +134,92 @@ def train_gan_enhanced(args):
 
     print("[GAN] Pre-training complete.")
 
-    # 3. Create segmentation model
+
+def train_end2end(args):
+    """End-to-end: alternating GAN + segmentation training.
+
+    Alternates between:
+    1. GAN discriminator steps (improve realism detection)
+    2. GAN generator steps (produce more realistic stylized data)
+    3. Segmentation training on stylized data
+    
+    The segmentation model is trained on the fly as the GAN improves,
+    creating a co-adaptation loop.
+    """
+    from roadmc.data.dataloader import RoadMCDataModule
+    from roadmc.models.gan.discriminator import WGANDiscriminator
+    from roadmc.models.gan.generator import StyleTransferGen
+    from roadmc.models.model_pl import RoadMCSegModel
+    from pytorch_lightning import Trainer
+    from pytorch_lightning.callbacks import ModelCheckpoint
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    gen = StyleTransferGen().to(device)
+    disc = WGANDiscriminator(in_channels=6).to(device)
     seg_model = RoadMCSegModel(
-        in_channels=3,
-        num_classes=38,
+        in_channels=3, num_classes=38,
         embed_dim=args.embed_dim,
         depths=tuple(args.depths),
         num_heads=tuple(args.num_heads),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+        lr=args.lr, weight_decay=args.weight_decay,
+    ).to(device)
+
+    g_opt = torch.optim.Adam(gen.parameters(), lr=1e-4, betas=(0.5, 0.9))
+    d_opt = torch.optim.Adam(disc.parameters(), lr=1e-4, betas=(0.5, 0.9))
+    seg_opt = torch.optim.AdamW(seg_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     datamodule = RoadMCDataModule(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
-        max_points=args.max_points,
+        max_points=min(args.max_points, 8192),
         num_workers=args.num_workers,
     )
+    datamodule.setup("fit")
 
-    trainer = pl.Trainer(
-        max_epochs=args.max_epochs,
-        accelerator="auto",
-        devices=1,
-        callbacks=[
-            ModelCheckpoint(monitor="val_mIoU", mode="max", filename="gan_enhanced-{epoch}-{val_mIoU:.3f}"),
-        ],
-    )
-    trainer.fit(seg_model, datamodule=datamodule)
+    print(f"[E2E] Starting end-to-end training for {args.max_epochs} epochs...")
+    gen.train(); disc.train(); seg_model.train()
+    n_critic = 3; lambda_gp = 10.0
+
+    for epoch in range(args.max_epochs):
+        for batch in datamodule.train_dataloader():
+            coords = batch["coords"].to(device)
+            normals = batch["normals"].to(device)
+            labels = batch["labels"].to(device)
+
+            # Discriminator
+            for _ in range(n_critic):
+                d_opt.zero_grad()
+                ri = torch.cat([coords, normals], dim=-1)
+                with torch.no_grad():
+                    fi = gen(coords, normals.detach())
+                gp = _gradient_penalty(disc, ri, fi, device)
+                d_loss = -disc(ri).mean() + disc(fi).mean() + lambda_gp * gp
+                d_loss.backward(); d_opt.step()
+
+            # Generator
+            g_opt.zero_grad()
+            with torch.no_grad():
+                fi = gen(coords, normals.detach())
+            g_loss = -disc(fi).mean()
+            g_loss.backward(); g_opt.step()
+
+            # Segmentation on GAN-styled data
+            seg_opt.zero_grad()
+            with torch.no_grad():
+                styled = gen(coords, normals.detach())
+            sc = coords + styled[:, :, :3]
+            logits = seg_model(sc, batch["feats"].to(device))
+            seg_loss = seg_model.lambda_focal * seg_model.focal_loss(logits, labels) \
+                     + seg_model.lambda_dice * seg_model.dice_loss(logits, labels)
+            seg_loss.backward()
+            torch.nn.utils.clip_grad_norm_(seg_model.parameters(), 1.0)
+            seg_opt.step()
+
+        if (epoch + 1) % 5 == 0:
+            print(f"  [E2E] Epoch {epoch+1}/{args.max_epochs}")
+
+    print("[E2E] End-to-end training complete.")
 
 
 def _gradient_penalty(
@@ -211,7 +270,7 @@ def main():
     elif args.mode == "gan_enhanced":
         train_gan_enhanced(args)
     elif args.mode == "end2end":
-        train_gan_enhanced(args)  # same as gan_enhanced for now; end2end needs alternating optimizers
+        train_end2end(args)
 
 
 if __name__ == "__main__":
