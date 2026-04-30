@@ -70,9 +70,7 @@ except ImportError:
         resample_to_lidar_pattern,
     )
 
-# ---------------------------------------------------------------------------
 # 常量
-# ---------------------------------------------------------------------------
 
 CONCRETE_DAMAGE_TYPES: List[str] = [
     "slab_shatter",
@@ -192,9 +190,7 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         self.config = config
         self.dataset_size = dataset_size
 
-    # ------------------------------------------------------------------
     # 标准 Dataset 接口
-    # ------------------------------------------------------------------
 
     def __len__(self) -> int:
         return self.dataset_size
@@ -210,9 +206,7 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
             "pavement_type": scene["pavement_type"],
         }
 
-    # ------------------------------------------------------------------
     # 核心场景生成
-    # ------------------------------------------------------------------
 
     def generate_scene(self, idx: int) -> Dict:
         """生成一个完整的合成道路场景。
@@ -520,7 +514,6 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         else:
             raise RuntimeError("All points removed by raveling — no valid geometry remains.")
 
-        # 确保非空
         if points.shape[0] == 0:
             raise RuntimeError("Empty point cloud after NaN filtering.")
 
@@ -604,8 +597,6 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
                 # crack_probability: 1 表示确定是裂缝区域（低距离），0 表示远离裂缝
                 # 使用对称 sigmoid: probability = exp(-d²/2σ²) 用于非裂缝点
                 # 裂缝点内部概率=1，边界点概率衰减
-                pass  # crack_boundary_dist 存入 feats 用于训练
-
         # P1-2: 使用体素下采样替代随机重采样
         if self.config.target_density is not None and self.config.target_density > 0:
             road_area = width * length
@@ -663,9 +654,7 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
             "pavement_type": pavement_type,
         }
 
-    # ------------------------------------------------------------------
     # 辅助方法
-    # ------------------------------------------------------------------
 
     def _select_pavement_type(self, rng: np.random.Generator) -> str:
         """根据配置的病害概率选择最合适的路面类型。
@@ -910,9 +899,7 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         return centered
 
 
-# ===========================================================================
 # 工具函数
-# ===========================================================================
 
 
 def _compute_kdtree_curvature(
@@ -996,9 +983,7 @@ def _compute_grid_curvature(z_grid: np.ndarray, grid_res: float) -> np.ndarray:
     return curvature
 
 
-# ===========================================================================
 # 自检脚本
-# ===========================================================================
 
 if __name__ == "__main__":
     """自检：生成 5 个场景并验证输出。"""

@@ -167,7 +167,6 @@ class WindowAttention3D(nn.Module):
         out = torch.zeros(B, N, C, device=device, dtype=x.dtype)
 
         for b in range(B):
-            # Get unique windows for this batch item
             unique_windows = window_id[b].unique()
             for wid in unique_windows:
                 mask = window_id[b] == wid
@@ -195,7 +194,6 @@ class WindowAttention3D(nn.Module):
                 out_w = out_w.transpose(1, 2).reshape(1, W, C)
                 out[b, idx, :] = out_w.squeeze(0)
 
-        # 9. Project output
         out = self.proj(out)
 
         return out
@@ -267,7 +265,6 @@ class DeformableWindowAttention3D(nn.Module):
         B, N, C = x.shape
         H, D, K = self.num_heads, self.head_dim, self.num_sample_points
 
-        # QKV projection
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
 
@@ -275,7 +272,6 @@ class DeformableWindowAttention3D(nn.Module):
         k = k.view(B, N, H, D).transpose(1, 2)  # (B, H, N, D)
         v = v.view(B, N, H, D).transpose(1, 2)  # (B, H, N, D)
 
-        # Predict 3D offsets for each query
         offsets = self.offset_net(x)  # (B, N, 3*K)
         offsets = offsets.view(B, N, K, 3)  # (B, N, K, 3)
 
@@ -322,7 +318,6 @@ class DeformableWindowAttention3D(nn.Module):
         rel_pos_bias = rel_pos_bias.permute(0, 3, 1, 2)  # (B, H, N, K)
         attn = attn + rel_pos_bias
 
-        # Softmax over K sampled positions
         attn = self.softmax(attn)  # (B, H, N, K)
 
         # Weighted sum over sampled values
@@ -330,7 +325,6 @@ class DeformableWindowAttention3D(nn.Module):
         out = (attn.unsqueeze(-1) * sampled_v).sum(dim=3)  # (B, H, N, D)
         out = out.transpose(1, 2).reshape(B, N, C)
 
-        # Project output
         out = self.proj(out)
         return out
 
@@ -402,7 +396,6 @@ class ShiftedWindowTransformerBlock(nn.Module):
 
         # 3. MHC: learned channel mixing on residual
         if self.mhc is not None and self.use_mhc:
-            # Flatten (B, N, C) → (B*N, C) for MHC
             x_flat = x_ffn.reshape(-1, C)
             r_flat = x_attn.reshape(-1, C)
             x_out = self.mhc(x_flat, r_flat).reshape(B, N, C)

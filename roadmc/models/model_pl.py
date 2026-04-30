@@ -44,14 +44,12 @@ class FocalLoss(nn.Module):
         Returns:
             Scalar focal loss.
         """
-        # Filter out ignore_index=1 entries
         if valid_mask is not None:
             logits = logits[valid_mask]
             targets = targets[valid_mask]
             if targets.numel() == 0:
                 return torch.tensor(0.0, device=logits.device, requires_grad=True)
         
-        # softmax to get probabilities
         probs = F.softmax(logits, dim=-1)  # (BxN, C) after masking
 
         # gather p_t = p[target_class] for each point
@@ -59,17 +57,14 @@ class FocalLoss(nn.Module):
         targets_expanded = targets.unsqueeze(-1)  # (B, N, 1)
         p_t = probs.gather(dim=-1, index=targets_expanded).squeeze(-1)  # (B, N)
 
-        # focal weight: (1 - p_t)^gamma
         focal_weight = (1.0 - p_t) ** self.gamma  # (B, N)
 
-        # cross-entropy: -log(p_t)
         ce_loss = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]),
             targets.reshape(-1),
             reduction="none",
         ).reshape(targets.shape)  # (B, N)
 
-        # apply alpha weights per class
         if self.alpha is not None:
             alpha_weights = self.alpha.to(logits.device)[targets]  # (B, N)
             focal_loss = alpha_weights * focal_weight * ce_loss
@@ -102,7 +97,6 @@ class DiceLoss(nn.Module):
         Returns:
             Scalar dice loss.
         """
-        # Filter out ignore_index=-1 entries
         if valid_mask is not None:
             logits = logits[valid_mask]
             targets = targets[valid_mask]
@@ -112,7 +106,6 @@ class DiceLoss(nn.Module):
         num_classes = logits.shape[-1]
         probs = F.softmax(logits, dim=-1)  # (M, C) after masking
 
-        # one-hot encode targets
         targets_one_hot = F.one_hot(targets, num_classes).float()  # (B, N, C)
 
         # L2 fix: vectorized per-class dice (no Python loop)
@@ -246,7 +239,6 @@ class EdgeLoss(nn.Module):
         """
         B = logits.shape[0]
 
-        # Filter out invalid (padded) entries
         if valid_mask is not None:
             logits_list = [logits[b][valid_mask[b]] for b in range(B)]
             targets_list = [targets[b][valid_mask[b]] for b in range(B)]
@@ -276,18 +268,14 @@ class EdgeLoss(nn.Module):
                 mask_preds = preds_list[b][near_crack].float()
                 mask_targets = targets_list[b][near_crack].float()
             else:
-                # No crack info — skip this batch item
                 continue
 
-            # Scatter to BEV grids
             pred_grid = self._scatter_to_bev(mask_preds, mask_coords)
             target_grid = self._scatter_to_bev(mask_targets, mask_coords)
 
-            # Sobel edge detection
             pred_edge = self._sobel_edge(pred_grid)
             target_edge = self._sobel_edge(target_grid)
 
-            # L1 loss on edge magnitudes
             total_loss = total_loss + F.l1_loss(pred_edge, target_edge)
             count += 1
 
@@ -460,7 +448,6 @@ class RoadMCSegModel(pl.LightningModule):
         Returns:
             Tuple of (mIoU, per_class_IoU, per_class_recall, per_class_precision).
         """
-        # Filter out invalid (padded) entries
         if valid_mask is not None:
             preds_flat = preds[valid_mask]
             targets_flat = targets[valid_mask]

@@ -1081,7 +1081,6 @@ def add_raveling(
         pts[remaining_idx, 2] -= erosion
         lbl[remaining_idx] = label_val
 
-    # 可改进点#1: 自动过滤 NaN 点
     if remove_nan:
         valid = ~np.any(np.isnan(pts), axis=1)
         return pts[valid], lbl[valid]
@@ -1474,8 +1473,7 @@ def add_concrete_damage(
 
             vor = spatial.Voronoi(seeds)
             # 对每个点，找最近的种子 (所属碎片)
-            from scipy.spatial import KDTree
-            tree = KDTree(seeds)
+            tree = spatial.KDTree(seeds)
             _, frag_idx = tree.query(np.column_stack([slab_x, slab_y]))
 
             # 每块碎片随机垂直位移
@@ -1876,10 +1874,8 @@ def simulate_lidar_noise(
             # 退化到全局随机混合
             mixed_idx = rng.choice(len(pts_noisy), size=n_mixed, replace=False)
 
-        # 可改进点#5: 批量 KDTree 查询替代逐点查询
         if len(mixed_idx) > 0:
-            from scipy.spatial import KDTree
-            tree = KDTree(pts_noisy)
+            tree = spatial.KDTree(pts_noisy)
             # 批量查询 k=6 个最近邻（包含自身，取邻居的 mean 替换）
             _, all_neighbors = tree.query(pts_noisy[mixed_idx], k=6)
             # 排除自身（第0列），取邻居的均值

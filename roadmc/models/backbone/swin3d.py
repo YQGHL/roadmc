@@ -173,7 +173,6 @@ class Swin3D(nn.Module):
         channels = [embed_dim * (2 ** i) for i in range(4)]
 
         # ── Patch Embedding ──────────────────────────────────────────
-        # Concat 3D coordinates + input features → embed_dim
         self.patch_embed = nn.Sequential(
             nn.Linear(in_channels + 3, embed_dim),
             nn.LayerNorm(embed_dim),
@@ -220,25 +219,20 @@ class Swin3D(nn.Module):
         Returns:
             (B, N, num_classes) per-point logits.
         """
-        # Patch embedding: concat coords + feats, project
         x = torch.cat([coords, feats], dim=-1)   # (B, N, 3 + in_channels)
         x = self.patch_embed(x)                   # (B, N, C0)
 
-        # Hierarchical feature extraction
         skip_features: List[torch.Tensor] = []
         for stage in self.stages:
             x, skip = stage(coords, x)
             skip_features.append(skip)
 
-        # FCN decoder with skip connections
         logits = self.decode(skip_features, coords)
 
         return logits
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Self-test
-# ═══════════════════════════════════════════════════════════════════════
+# Self-test
 if __name__ == "__main__":
     torch.manual_seed(42)
     device = torch.device("cpu")

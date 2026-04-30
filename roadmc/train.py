@@ -99,7 +99,6 @@ def train_gan_enhanced(args):
             coords = batch["coords"].to(device)
             normals = batch["normals"].to(device)
 
-            # Discriminator updates
             for _ in range(n_critic):
                 d_opt.zero_grad()
                 real_input = torch.cat([coords, normals], dim=-1)  # (B, N, 6)
@@ -109,7 +108,6 @@ def train_gan_enhanced(args):
                 real_validity = disc(real_input)
                 fake_validity = disc(fake_input)
 
-                # WGAN-GP loss
                 gp = _gradient_penalty(disc, real_input, fake_input, device)
                 d_loss = -real_validity.mean() + fake_validity.mean() + lambda_gp * gp
                 d_loss.backward()
@@ -147,7 +145,6 @@ def train_gan_enhanced(args):
         cos_sim = (normals_pred * normals_ref).sum(dim=-1)
         return (1.0 - cos_sim).mean()
 
-    # Mixed training: GAN-styled synthetic data for segmentation
     print("[GAN] Mixed training: segmentation on GAN-styled data...")
     seg_model = RoadMCSegModel(
         in_channels=3, num_classes=38,
@@ -234,7 +231,6 @@ def train_end2end(args):
             normals = batch["normals"].to(device)
             labels = batch["labels"].to(device)
 
-            # Discriminator
             for _ in range(n_critic):
                 d_opt.zero_grad()
                 ri = torch.cat([coords, normals], dim=-1)
@@ -250,7 +246,6 @@ def train_end2end(args):
             g_loss = -disc(fi).mean()
             g_loss.backward(); g_opt.step()
 
-            # Segmentation on GAN-styled data
             seg_opt.zero_grad()
             with torch.no_grad():
                 styled = gen(coords, normals.detach())

@@ -1,279 +1,189 @@
 <div align="center">
 
-# 🛣️ RoadMC
+# RoadMC
 
-**Physics-Simulation-Driven Road Surface Point Cloud Disease Detection**
+**Physics-Simulation-Driven Pavement Point Cloud Defect Detection**
 
-*Strictly Conforming to JTG 5210—2018 Highway Performance Assessment Standard*
+*JTG 5210—2018 | 38-class semantic segmentation*
 
 [![Python](https://img.shields.io/badge/Python-3.12-blue?style=flat-square&logo=python)](https://python.org)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.11-ee4c2c?style=flat-square&logo=pytorch)](https://pytorch.org)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 [![JTG 5210](https://img.shields.io/badge/Standard-JTG%205210--2018-orange?style=flat-square)]()
 
-<br>
-
-> [**中文版 (Chinese)**](README.md)
-
-_Physical Fidelity · Mathematical Rigor · Engineering Precision · Full Pipeline_
+> [**中文**](README.md)
 
 </div>
 
 ---
 
-## 📋 Table of Contents
+## System Architecture
 
-- [Overview](#-overview)
-- [Architecture](#-architecture)
-- [Phase 1: Synthetic Data Generation](#-phase-1-synthetic-data-generation)
-- [Phase 2: Network Model](#-phase-2-network-model)
-- [Phase 3: GAN Domain Adaptation](#-phase-3-gan-domain-adaptation)
-- [Phase 4: Data Loading](#-phase-4-data-loading)
-- [Phase 5: Training & Evaluation](#-phase-5-training--evaluation)
-- [Getting Started](#-getting-started)
-- [Data Format](#-data-format)
-- [Visualization](#-visualization)
-- [Project Structure](#-project-structure)
-- [License & Citation](#-license--citation)
-
----
-
-## 🌄 Overview
-
-RoadMC is a **physics-simulation-driven**, **mathematically constrained** road surface point cloud disease detection system. It generates high-fidelity synthetic training data through physically accurate road surface modeling and employs a **Swin3D Transformer** architecture enhanced with **Manifold Hyper-Connection (mHC)** for semantic segmentation.
-
-**Key Features:**
-
-- **Physical Fidelity:** ISO 8608 PSD road surface synthesis with 11 mechanically accurate disease models
-- **Mathematical Rigor:** Sinkhorn-Knopp doubly-stochastic mixing, Sobel edge loss, PCA curvature
-- **Standard Compliance:** Full **JTG 5210—2018** compliance, 38 disease labels across asphalt and concrete
-- **Complete Pipeline:** From data generation through model training to evaluation
-
----
-
-## 🏗 Architecture
+### Data Pipeline
 
 <p align="center">
-  <img src="docs/architecture.png" alt="RoadMC System Architecture" width="95%"/>
-  <br>
-  <em>Fig: RoadMC system architecture (Phase 1-5) — Data Generation → Data Loading → Core Network (Swin3D+mHC) → GAN Adaptation → Training/Evaluation</em>
+  <img src="docs/data_pipeline.png" alt="RoadMC Data Pipeline" width="95%"/>
+</p>
+
+### Model Pipeline
+
+<p align="center">
+  <img src="docs/model_pipeline.png" alt="RoadMC Model Pipeline" width="95%"/>
 </p>
 
 ---
 
-## 🔬 Phase 1: Synthetic Data Generation
+## Pipeline Overview
 
-### Pipeline
-
-| Step | Component | Model |
-|:----:|-----------|-------|
-| ① | Pavement selection | Probability-driven (asphalt/concrete) |
-| ② | Surface generation | **ISO 8608 PSD** + inverse FFT |
-| ③ | LiDAR scan resampling | Gaussian scan line + range decay |
-| ④ | Micro-texture | **fBm** fractional Brownian motion |
-| ⑤ | Disease application | 11 models with label priority |
-| ⑥ | Curvature | PCA eigenvalue ratio |
-| ⑦ | LiDAR noise | Spherical noise + Bernoulli dropout |
-| ⑧ | Label transfer | KDTree + 3σ threshold |
-| ⑨ | Downsampling | 2D voxel averaging |
-| ⑩ | Normalization | Unit sphere scaling |
-
-### Disease Models
-
-| Disease | Model | Labels |
-|---------|-------|:------:|
-| Crack (4 types) | Bézier + Perlin + Voronoi | 1–8 |
-| Pothole | Superellipsoid | 9–10 |
-| Raveling | Stochastic removal | 11–12 |
-| Depression | Gaussian subsidence | 13–14 |
-| Rutting | Dual Gaussian tracks | 15–16 |
-| Corrugation | Sinusoidal | 17–18 |
-| Bleeding | Label only | 19 |
-| Concrete (10 types) | Voronoi shattering, faulting, etc. | 21–37 |
-
-### Code Review
-
-| Priority | Items | Status |
-|:--------:|:-----:|:------:|
-| 🔴 P0 | 4 critical fixes | ✅ |
-| 🟠 P1 | 6 important fixes | ✅ |
-| 🟡 P2 | 4 suggested fixes | ✅ |
+| Phase | Key Component | Output |
+|:-----:|---------------|--------|
+| 1 — Data Generation | ISO 8608 PSD, fBm, 11 defect primitives | Synthetic `.npz` point clouds (38 classes) |
+| 2 — Network Model | Swin3D Transformer + mHC (Sinkhorn-Knopp) | Per-point segmentation logits |
+| 3 — GAN Adaptation | DGCNN generator + PointNet WGAN-GP discriminator | Style-transferred point clouds |
+| 4 — Data Loading | PyTorch Lightning DataModule + padding collate | Batched (B, N, 3+C) tensors |
+| 5 — Training & Evaluation | FocalLoss + DiceLoss + EdgeLoss, AdamW + CosineLR | Per-class IoU / Recall / Precision |
 
 ---
 
-## 🧠 Phase 2: Network Model
+## Quick Start
 
-### Manifold Hyper-Connection
-
-$$M = \text{softplus}(W_1)\,\text{softplus}(W_2)^\top,\quad H = \text{SinkhornKnopp}(M/\tau)$$
-
-$$y = x + H \cdot r \in \mathbb{R}^{B \times C}$$
-
-`deploy()` freezes $H$ for inference.
-
-> 📄 **mHC paper**: [arXiv:2512.24880](https://arxiv.org/abs/2512.24880) — Manifold Hyper-Connection
-
-### Transformer Block
-
-```python
-x_norm = LN(x)
-x_attn = WindowAttention(x_norm) + x          # pre-LN
-x_ffn = LN(x_attn)
-x_ffn = FFN(x_ffn) + x_attn                  # pre-LN
-x_out = MHC(x_ffn, x_attn)                   # mHC mixing
-```
-
-### Swin3D Backbone
-
-| Stage | C | Depth | Heads |
-|:-----:|:-:|:-----:|:-----:|
-| 0 | 96 | 2 | 3 |
-| 1 | 192 | 2 | 6 |
-| 2 | 384 | 6 | 12 |
-| 3 | 768 | 2 | 24 |
-
-**Params**: 3.5M (tiny) / 31.2M (full) | **Output**: $(B,N,38)$
-
-### Loss
-
-$$\mathcal{L} = \lambda_1 \text{FocalLoss} + \lambda_2 \text{DiceLoss} + \lambda_3 \mathcal{L}_{\text{edge}}$$
-
----
-
-## 🎨 Phase 3: GAN Domain Adaptation
-
-**Generator** (`models/gan/generator.py`): DGCNN EdgeConv encoder-decoder (125K params)  
-**Discriminator** (`models/gan/discriminator.py`): PointNet WGAN-GP critic (83K params)  
-**Loss**: WGAN-GP + Chamfer distance + normal consistency
-
----
-
-## 📦 Phase 4: Data Loading
-
-**Synthetic**: `SyntheticPointCloudDataset` + `RoadMCDataModule` (Lightning) with augmentation  
-**Real**: `RealRoadDataset` (.ply/.npy, JTG label mapping)  
-**Collation**: Auto-padding with `valid_mask` (-1 labels ignored in loss)
-
----
-
-## 🚀 Phase 5: Training & Evaluation
-
-| Mode | Command | Description |
-|:----:|---------|-------------|
-| `baseline` | `python roadmc/train.py baseline` | Synthetic only |
-| `gan_enhanced` | `python roadmc/train.py gan_enhanced` | GAN → mixed |
-| `end2end` | `python roadmc/train.py end2end` | Alternating |
-
-**Evaluation**: `python roadmc/evaluate.py --checkpoint <path>` — per-class IoU/recall/precision, grouped report, JSON output.
-
----
-
-## 🚀 Getting Started
+### Environment
 
 ```bash
-# Install
-pip install numpy scipy torch matplotlib pytorch-lightning torchmetrics
+uv sync                  # Python >= 3.11, installs all dependencies
+```
 
-# Phase 1 tests
-python roadmc/data/synthetic/config.py
-python roadmc/data/synthetic/primitives.py
-python roadmc/data/synthetic/generator.py
+### Self-Verification
 
-# Phase 2 tests
-python roadmc/models/mhc/mhc.py
-python roadmc/models/attention/window_attention.py
-python -m roadmc.models.backbone.swin3d
-python roadmc/models/model_pl.py
+Each module contains an `if __name__ == "__main__"` block with assert-based tests.
 
-# Phase 3 tests
-python roadmc/models/gan/generator.py
-python roadmc/models/gan/discriminator.py
+```bash
+python roadmc/models/mhc/mhc.py                  # mHC hyperconnection
+python roadmc/data/synthetic/generator.py         # Scene generation pipeline
+python roadmc/models/model_pl.py                  # LightningModule wrapper
 
-# Phase 4 tests
-python roadmc/data/dataloader.py
-python roadmc/data/real/dataset.py
+python roadmc/data/synthetic/config.py            # GeneratorConfig validation
+python roadmc/data/synthetic/primitives.py        # 11 physical primitives
+python roadmc/models/attention/window_attention.py # 3D window attention
+python roadmc/models/backbone/swin3d.py           # Swin3D backbone
+python roadmc/models/gan/generator.py             # StyleTransferGen
+python roadmc/models/gan/discriminator.py         # WGANDiscriminator
+python roadmc/data/dataloader.py                  # DataLoader + DataModule
+python roadmc/models/mhc/spectral_analysis.py     # Sinkhorn-Knopp spectral analysis
+python roadmc/test/test_visualize.py              # 13 diagnostic PNG images
+```
 
-# Phase 5 / utilities
-python roadmc/models/mhc/spectral_analysis.py
+### Generate Synthetic Data
 
-# Visualization
-python roadmc/test/test_visualize.py
-
-# Batch generation
-python -m roadmc.scripts.generate_synthetic
+```bash
+python -m roadmc.scripts.generate_synthetic \
+    --train-count 2000 --val-count 500 \
+    --grid-res 0.01 --roughness B
 ```
 
 ---
 
-## 📦 Data Format
+## Data Format
+
+### Synthetic Point Cloud (`.npz`)
 
 | Field | Shape | Type | Description |
 |-------|-------|------|-------------|
-| `points` | $(N,3)$ | `float32` | $(x,y,z)$ coordinates |
-| `labels` | $(N,)$ | `int32` | JTG labels $[0,37]$ |
-| `feats` | $(N,3)$ | `float32` | intensity, curvature, crack distance |
-| `normals` | $(N,3)$ | `float32` | Unit normals |
+| `points` | (N, 3) | `float32` | 3D coordinates (x, y, z) |
+| `labels` | (N,) | `int32` | JTG 5210-2018 class [0, 37] |
+| `feats` | (N, 3) | `float32` | Intensity, curvature, crack distance |
+| `normals` | (N, 3) | `float32` | Unit surface normals |
+| `pavement_type` | — | `str` | `'asphalt'` or `'concrete'` |
 
 ```python
+import numpy as np
 data = np.load("scene_0000.npz", allow_pickle=True)
+points = data["points"]   # (N, 3) float32
+labels = data["labels"]   # (N,) int32
 ```
 
 ---
 
-## 🎨 Visualization
+## Training
 
-13 figures: 2D overlay, 3D mesh, height maps, feature channels, label statistics.
+| Mode | Command | Description |
+|:----:|---------|-------------|
+| `baseline` | `python roadmc/train.py baseline --data_dir ./data/synthetic_output --max_epochs 50` | Synthetic data segmentation only |
+| `gan_enhanced` | `python roadmc/train.py gan_enhanced --max_epochs 50` | GAN pre-training + style-transfer mixing |
+| `end2end` | `python roadmc/train.py end2end --max_epochs 50` | Alternating GAN + segmentation joint optimization |
 
-<p align="center">
-  <img src="docs/asphalt_multi_disease_2d_overlay.png" alt="2D Disease Overlay" width="45%"/>
-  <img src="docs/label_statistics.png" alt="Label Statistics" width="45%"/>
-  <br>
-  <em>Left: label-colored top-down view  Right: per-scene label distribution</em>
-</p>
+Optimizer: AdamW (lr=1e-4, weight_decay=0.05). Scheduler: CosineAnnealingLR.  
+Loss: λ₁·FocalLoss(γ=2) + λ₂·DiceLoss + λ₃·EdgeLoss(Sobel).
 
 ---
 
-## 📁 Project Structure
+## Evaluation
+
+Per-class IoU, Recall, and Precision across 38 JTG 5210-2018 labels, grouped by asphalt [1–20] and concrete [21–37]. Outputs JSON report and terminal-formatted tables.
+
+```bash
+python roadmc/evaluate.py --checkpoint ./lightning_logs/version_X/checkpoints/best.ckpt
+```
+
+---
+
+## Project Structure
 
 ```
 roadmc/
 ├── data/
-│   ├── synthetic/     # Config + 13 primitives + Generator
-│   └── real/          # Real point cloud dataset
+│   ├── synthetic/
+│   │   ├── config.py              # GeneratorConfig dataclasses
+│   │   ├── primitives.py          # 11 physical defect primitives
+│   │   └── generator.py           # SyntheticRoadDataset (10-step pipeline)
+│   ├── real/                      # Real .ply/.npy loader (stub)
+│   └── dataloader.py              # PyTorch Lightning DataModule
 ├── models/
-│   ├── mhc/           # MHC Connection
-│   ├── attention/     # WindowAttention3D
-│   ├── backbone/      # Swin3D backbone
-│   ├── gan/           # Generator + Discriminator
-│   └── model_pl.py    # LightningModule
-├── scripts/           # CLI batch generation
-├── test/              # Visualization suite
-├── train.py           # Training (3 modes)
-├── evaluate.py        # JTG evaluation report
-├── README.md
-├── LICENSE
-├── .gitignore
+│   ├── backbone/swin3d.py         # 4-stage Swin3D Transformer (31.2M)
+│   ├── attention/                 # WindowAttention3D + DeformableAttention3D
+│   ├── mhc/mhc.py                 # Doubly-stochastic channel mixing (arXiv:2512.24880)
+│   ├── gan/
+│   │   ├── generator.py           # DGCNN StyleTransferGen (125K params)
+│   │   └── discriminator.py       # PointNet WGAN-GP critic (83K params)
+│   └── model_pl.py                # LightningModule + FocalLoss + DiceLoss + EdgeLoss
+├── scripts/
+│   └── generate_synthetic.py      # CLI batch .npz generation
+├── test/
+│   └── test_visualize.py          # 13 diagnostic PNG outputs
+├── docs/
+│   ├── data_pipeline.png          # Data pipeline diagram
+│   ├── model_pipeline.png         # Model pipeline diagram
+│   └── architecture.png           # Full system architecture
+├── train.py                       # Training entry (baseline / gan_enhanced / end2end)
+├── evaluate.py                    # Per-class IoU / Recall / Precision
+├── configs/                       # Placeholder (unused, dataclass config instead)
+├── LICENSE                        # MIT
 └── pyproject.toml
 ```
 
 ---
 
-## 📄 License & Citation
-
-**MIT** © 2026 YQGHL
+## Citation
 
 ```bibtex
 @misc{roadmc2026,
-  author = {YQGHL},
-  title = {RoadMC: Physics-Simulation-Driven Road Surface Point Cloud Disease Detection},
-  year = {2026}
+  author       = {YQGHL},
+  title        = {RoadMC: Physics-Simulation-Driven Road Surface Point Cloud Defect Detection},
+  year         = {2026},
+  howpublished = {\url{https://github.com/YQGHL/roadmc}},
 }
 ```
 
 ---
 
+## License
+
+MIT © 2026 YQGHL. See [LICENSE](LICENSE).
+
+---
+
 <div align="center">
 
-**English** · [**中文版 (Chinese)**](README.md)
+> [**中文**](README.md)
 
 </div>

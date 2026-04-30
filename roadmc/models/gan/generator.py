@@ -17,8 +17,6 @@ All operations use pure PyTorch (no external graph libraries).
 k-NN is computed via torch.cdist in coordinate space.
 """
 
-from typing import Optional
-
 import torch
 from torch import nn as nn
 
@@ -151,19 +149,16 @@ class StyleTransferGen(nn.Module):
         Returns:
             (B, N, 6) residuals.
         """
-        # Concatenate input features
         x = torch.cat([syn_points, syn_normals], dim=-1)     # (B, N, 6)
         x = x.transpose(1, 2)                                 # (B, 6, N)
 
         # Coordinate space for k-NN
         coords = syn_points.transpose(1, 2)                   # (B, 3, N)
 
-        # Encoder
         x = self.enc1(x, coords)                              # (B,  64, N)
         x = self.enc2(x, coords)                              # (B, 128, N)
         x = self.enc3(x, coords)                              # (B, 256, N)
 
-        # Decoder
         x = x.transpose(1, 2)                                 # (B, N, 256)
         x = self.decoder(x)                                   # (B, N,   6)
 

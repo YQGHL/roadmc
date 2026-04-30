@@ -27,12 +27,6 @@ from roadmc.data.synthetic.config import (
 )
 
 
-def _get_label_info(label: int) -> Tuple[str, str]:
-    """Get pavement type and severity from label."""
-    info = LABEL_MAP.get(label, {})
-    return info.get("pavement", "通用"), info.get("severity", "-")
-
-
 def generate_dataset(
     count: int,
     config: GeneratorConfig,
@@ -57,11 +51,9 @@ def generate_dataset(
     """
     from roadmc.data.synthetic.generator import SyntheticRoadDataset
 
-    # Create output directory
     split_dir = output_dir / split
     split_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize tracking structures
     class_counts = {i: 0 for i in range(NUM_CLASSES)}
     point_counts = []
     failed_count = 0
@@ -72,7 +64,6 @@ def generate_dataset(
         from dataclasses import replace
         scene_config = replace(config, seed=config.seed + 100000)
 
-    # Create dataset instance
     dataset = SyntheticRoadDataset(config=scene_config, dataset_size=count)
 
     # Try to use tqdm, fallback to simple print
@@ -87,10 +78,8 @@ def generate_dataset(
         scene_id = i
 
         try:
-            # Generate scene using the dataset's generate_scene method
             scene = dataset.generate_scene(scene_id)
 
-            # Extract arrays
             points = scene["points"]
             labels = scene["labels"]
             feats = scene["feats"]
@@ -108,7 +97,6 @@ def generate_dataset(
                 failed_count += 1
                 continue
 
-            # Update statistics
             unique_labels = np.unique(labels)
             for lbl in unique_labels:
                 lbl_int = int(lbl)
@@ -116,7 +104,6 @@ def generate_dataset(
                     class_counts[lbl_int] += 1
             point_counts.append(len(points))
 
-            # Save scene as .npz
             filename = f"scene_{scene_id:04d}.npz"
             filepath = split_dir / filename
 
@@ -135,7 +122,6 @@ def generate_dataset(
             warnings.warn(f"Scene {scene_id} failed: {e}")
             continue
 
-    # Compute statistics
     total_points = sum(point_counts) if point_counts else 0
     stats = {
         "split": split,
@@ -215,7 +201,6 @@ def main():
     parser.add_argument("--no-stratified", action="store_true", help="禁用分层采样")
     args = parser.parse_args()
 
-    # Create config
     pavement_for_config = args.pavement if args.pavement != "mixed" else "asphalt"
     config = GeneratorConfig(
         road=RoadSurfaceConfig(
@@ -228,7 +213,6 @@ def main():
 
     output_dir = Path(args.output_dir)
 
-    # Generate training set
     print("\n开始生成数据集...")
     print(f"配置: 网格分辨率={args.grid_res}m, 路面类型={args.pavement}, 粗糙度={args.roughness}")
     print(f"随机种子: {args.seed}")
@@ -239,12 +223,10 @@ def main():
     stats["train"] = generate_dataset(args.train_count, config, "train", output_dir, use_stratified=use_stratified)
     stats["val"] = generate_dataset(args.val_count, config, "val", output_dir, use_stratified=use_stratified)
 
-    # Verify class distribution
     print("\n" + "=" * 60)
     for split in ["train", "val"]:
         verify_class_distribution(output_dir, split)
 
-    # Save metadata
     metadata = {
         "config": {
             "grid_res": args.grid_res,

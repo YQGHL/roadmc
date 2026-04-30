@@ -112,7 +112,6 @@ def format_report(
     per_class: Dict[str, Dict[str, float]],
     grouped: Dict[str, float],
 ) -> str:
-    """Format evaluation results as a readable string."""
     lines = []
     lines.append("=" * 72)
     lines.append("  RoadMC Evaluation Report — JTG 5210-2018")
@@ -134,21 +133,18 @@ def format_report(
 
 
 def evaluate(args):
-    """Main evaluation flow."""
     from roadmc.models.model_pl import RoadMCSegModel
     from roadmc.data.dataloader import SyntheticPointCloudDataset
     from torch.utils.data import DataLoader
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Load model from checkpoint
     model = RoadMCSegModel.load_from_checkpoint(
         args.checkpoint,
         in_channels=3, num_classes=38,
     )
     model = model.to(device).eval()
     
-    # Load validation data
     dataset = SyntheticPointCloudDataset(
         args.data_dir, split="val",
         max_points=args.max_points,
@@ -174,15 +170,12 @@ def evaluate(args):
     preds = torch.cat(all_preds)
     targets = torch.cat(all_targets)
     
-    # Compute metrics
     per_class = compute_per_class_metrics(preds, targets)
     grouped = compute_grouped_metrics(per_class)
     
-    # Format and output
     report = format_report(per_class, grouped)
     print(report)
     
-    # JSON output
     if args.output_json:
         output = {
             "per_class": {k: v for k, v in sorted(per_class.items())},
