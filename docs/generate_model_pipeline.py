@@ -1,8 +1,4 @@
-"""
-RoadMC Model Pipeline Diagram Generator (v2 - Grid Layout)
-Generates: docs/model_pipeline.png
-Focus: Swin3D backbone + GAN adaptation + training + inference
-"""
+"""RoadMC model pipeline diagram generator."""
 
 import matplotlib
 matplotlib.use("Agg")
@@ -29,7 +25,7 @@ fig, ax = plt.subplots(figsize=(W, H), dpi=DPI)
 ax.set_xlim(0, W); ax.set_ylim(0, H); ax.axis("off")
 fig.patch.set_facecolor("white")
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# Helpers
 def box(x, y, w, h, fc, ec=None, lw=1.0, alpha=1.0, z=3, rnd=0.06):
     ec = ec or C["border"]
     ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle=f"round,pad=0.02,rounding_size={rnd}",
@@ -61,29 +57,21 @@ def mod(x, y, w, h, title, sub="", fc=C["data_light"], ec=None, lw=0.8):
     else:
         txt(x + w/2, y + h/2, title, fs=9, fw="bold", z=4)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# BACKGROUND
-# ═════════════════════════════════════════════════════════════════════════════
+# Background
 box(0.1, 0.1, W-0.2, H-0.2, fc=C["bg"], ec="#DEE2E6", lw=1.0, rnd=0.15, z=0)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TITLE
-# ═════════════════════════════════════════════════════════════════════════════
+# Title
 txt(W/2, 12.3, "RoadMC Model Pipeline", fs=18, fw="bold", z=5)
 txt(W/2, 11.9, "Swin3D Transformer + GAN Adaptation + Training + Inference", fs=10, c=C["text3"], z=5)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# LAYOUT CONSTANTS
-# ═════════════════════════════════════════════════════════════════════════════
+# Layout Constants
 HDR_Y = 11.3      # header center
 ULINE_Y = 11.15   # underline (must be > first block top)
 BLOCK_H = 0.75
 GAP = 0.15
-FIRST_Y = 10.2    # first block bottom; top = 10.95 < 11.15 ✓
+FIRST_Y = 10.2    # first block bottom; top = 10.95 < 11.15
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 2 — Core Network (center, x=2.5, w=8.0)
-# ═════════════════════════════════════════════════════════════════════════════
+# Phase 2 -- Core Network (center, x=2.5, w=8.0)
 p2x, p2w = 2.5, 8.0
 p2_cx = p2x + p2w/2
 
@@ -111,19 +99,17 @@ arrow(p2_cx, FIRST_Y, p2_cx, stage_y + BLOCK_H + 0.05, c=C["model"], lw=1.0)
 # Transformer
 trans_y = stage_y - 0.65 - GAP
 mod(p2x, trans_y, p2w, 1.1, "ShiftedWindowTransformerBlock",
-    "pre-LN → WindowAttention3D → FFN → MHCConnection (Sinkhorn-Knopp)",
+    "pre-LN -> WindowAttention3D -> FFN -> MHCConnection (Sinkhorn-Knopp)",
     C["model_bg"], ec=C["model"], lw=1.2)
 arrow(p2_cx, stage_y, p2_cx, trans_y + 1.1 + 0.05, c=C["model"], lw=1.0)
 
 # Segmentation Head
 seg_y = trans_y - 1.1 - GAP
 mod(p2x, seg_y, p2w, BLOCK_H, "SegmentationHead",
-    "FCN decoder + 4× skip connections → (B,N,38)", C["model_light"], lw=1.2)
+    "FCN decoder + 4x skip connections -> (B,N,38)", C["model_light"], lw=1.2)
 arrow(p2_cx, trans_y, p2_cx, seg_y + BLOCK_H + 0.05, c=C["model"], lw=1.0)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 3 — GAN Adaptation (right, x=11.0, w=5.5)
-# ═════════════════════════════════════════════════════════════════════════════
+# Phase 3 -- GAN Adaptation (right, x=11.0, w=5.5)
 p3x, p3w = 11.0, 5.5
 p3_cx = p3x + p3w/2
 
@@ -144,23 +130,18 @@ mod(p3x, gan_y3, p3w, 0.65, "GAN Loss",
 arrow(p3_cx, gan_y1, p3_cx, gan_y1 - 0.42, c=C["inf"], lw=1.0)
 arrow(p3_cx, gan_y2, p3_cx, gan_y2 - 0.42, c=C["inf_light"], lw=1.0)
 
-# Styled coords arrow: from GAN to Transformer (label in clear space)
+# Styled coords arrow: from GAN to Transformer
 ax.annotate("", xy=(p2x + p2w, trans_y + 0.5), xytext=(p3x, gan_y1),
             arrowprops=dict(arrowstyle="->", color=C["inf"], lw=1.0,
                             connectionstyle="arc3,rad=-0.15", linestyle="dashed",
                             shrinkA=4, shrinkB=4), zorder=5)
-# Label in clear space between GAN and Transformer
 label(10.0, trans_y + 0.8, "styled coords", fs=8, c=C["inf"], bg=C["inf_bg"])
 
-# ═════════════════════════════════════════════════════════════════════════════
-# DIVIDER
-# ═════════════════════════════════════════════════════════════════════════════
+# Divider
 DIVIDER_Y = 5.8
 ax.plot([0.3, W-0.3], [DIVIDER_Y, DIVIDER_Y], color=C["divider"], lw=1.2, ls="--", zorder=1, alpha=0.6)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 5 — Training (bottom-left, x=0.3, w=9.5)
-# ═════════════════════════════════════════════════════════════════════════════
+# Phase 5 -- Training (bottom-left, x=0.3, w=9.5)
 box(0.3, 0.4, 9.5, 5.0, fc=C["opt_bg"], ec=C["opt"], lw=1.5, alpha=0.25, rnd=0.12, z=1)
 txt(5.05, 5.15, "Training & Evaluation", fs=13, fw="bold", c=C["opt"], z=5)
 
@@ -169,9 +150,9 @@ mw, mg = 2.9, 0.15
 mx = 0.5
 mode_y = 4.2
 for i, (nm, desc, flow, clr) in enumerate([
-    ("baseline", "synthetic only", "Synthetic → Swin3D → L_seg", C["model_light"]),
+    ("baseline", "synthetic only", "Synthetic -> Swin3D -> L_seg", C["model_light"]),
     ("end2end", "alternating opt", "GAN + seg alternating", C["model_dark"]),
-    ("gan_enhanced", "GAN pretrain", "GAN pretrain → mixed", C["model"])]):
+    ("gan_enhanced", "GAN pretrain", "GAN pretrain -> mixed", C["model"])]):
     mod(mx, mode_y, mw, 0.7, nm, desc, clr, lw=0.8)
     txt(mx + mw/2, mode_y - 0.15, flow, fs=6.5, c=C["text3"], z=4)
     mx += mw + mg
@@ -187,9 +168,7 @@ txt(5.05, 1.6, "Optimizer: AdamW (lr=1e-4) + CosineAnnealingLR  |  Metrics: macr
 
 txt(5.05, 0.65, "evaluate.py: per-class IoU / recall / precision  |  asphalt [1-20] / concrete [21-37]", fs=7, c=C["text3"], z=4)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# INFERENCE PIPELINE (bottom-right, x=10.2, w=7.3)
-# ═════════════════════════════════════════════════════════════════════════════
+# Inference Pipeline (bottom-right, x=10.2, w=7.3)
 box(10.2, 0.4, 7.3, 5.0, fc=C["inf_bg"], ec=C["inf"], lw=1.5, alpha=0.25, rnd=0.12, z=1)
 txt(13.85, 5.15, "Real Data Inference Pipeline", fs=13, fw="bold", c=C["inf"], z=5)
 
@@ -207,15 +186,11 @@ arrow(icx, 3.1, icx, 2.75, c=C["model"], lw=1.0)
 ly = 1.0
 txt(icx, ly+0.3, "solid=flow  dashed=adapt", fs=8, c=C["text2"], z=5)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# GAN → Training COUPLING ARROWS (labels in clear space above divider)
-# ═════════════════════════════════════════════════════════════════════════════
-# Route arrows from GAN to Training modes, labels placed in empty space
+# GAN -> Training Coupling Arrows
 ax.annotate("", xy=(3.5, mode_y + 0.35), xytext=(p3x, gan_y2),
             arrowprops=dict(arrowstyle="->", color=C["inf"], lw=1.0,
                             connectionstyle="arc3,rad=-0.3", linestyle="dashed",
                             shrinkA=4, shrinkB=4), zorder=5)
-# Label in empty space between SegHead and Divider
 label(5.5, 6.5, "pretrained weights", fs=8, c=C["inf"], bg=C["inf_bg"])
 
 ax.annotate("", xy=(6.0, mode_y + 0.35), xytext=(p3x+2, gan_y2),
@@ -224,9 +199,7 @@ ax.annotate("", xy=(6.0, mode_y + 0.35), xytext=(p3x+2, gan_y2),
                             shrinkA=4, shrinkB=4), zorder=5)
 label(9.0, 6.5, "alternating opt", fs=8, c=C["opt"], bg=C["opt_bg"])
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SAVE
-# ═════════════════════════════════════════════════════════════════════════════
+# Save
 plt.savefig("docs/model_pipeline.png", dpi=DPI, bbox_inches="tight",
             facecolor="white", edgecolor="none", pad_inches=0.1)
-print(f"[PASS] docs/model_pipeline.png generated ({DPI} dpi, {W}x{H})")
+print(f"docs/model_pipeline.png generated ({DPI} dpi, {W}x{H})")

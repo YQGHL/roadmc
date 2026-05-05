@@ -32,12 +32,8 @@ class WGANDiscriminator(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, N, C_in)
-        # Per-point features: (B, N, 256)
         x = self.mlp(x)
-        # Max pooling over points: (B, 256)
         x = x.max(dim=1)[0]
-        # Global output: (B, 1)
         x = self.global_mlp(x)
         return x
 
@@ -67,5 +63,5 @@ if __name__ == '__main__':
     assert not params_no_grad, f"Params without gradient: {params_no_grad}"
 
     print(
-        f"[PASS] WGANDiscriminator: output={out.shape}, params={sum(p.numel() for p in disc.parameters())}"
+        f"WGANDiscriminator: output={out.shape}, params={sum(p.numel() for p in disc.parameters())}"
     )

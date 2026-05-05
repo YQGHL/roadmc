@@ -1,15 +1,5 @@
 """
-RoadMC 阶段一点云生成测试与可视化 (v2)。
-
-该脚本：
-1. 生成多个包含不同病害类型的点云场景
-2. 验证点云输出的 shape 和标签范围
-3. 二维叠加图 — 俯视图 + JTG 标签着色
-4. 灰度高度图 — z 值映射 + 病害叠加 + 等高线
-5. 3D 视图 — 曲面网格 + 散点 + 真实比例
-6. 特征通道可视化 — intensity / curvature / crack_boundary_dist
-7. 标签分布统计图
-
+RoadMC 可视化套件：生成 3 个测试场景并输出 13 张诊断 PNG (2D/3D/特征/统计).
 输出目录: roadmc/test/output/
 """
 
@@ -164,7 +154,6 @@ def plot_grayscale_height(scene: dict):
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    # --- 左: 纯灰度高度图 + 等高线 ---
     ax = axes[0]
     x, y = pts[:, 0], pts[:, 1]
     try:
@@ -183,7 +172,6 @@ def plot_grayscale_height(scene: dict):
     ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
     plt.colorbar(im, ax=ax, label="Height (m)", shrink=0.75)
 
-    # --- 中: 高度 + 病害叠加 ---
     ax2 = axes[1]
     bg = labels == 0; fg = labels > 0
     ax2.scatter(x[bg], y[bg], c=z[bg], cmap="gray_r", s=0.2, alpha=0.5)
@@ -193,7 +181,6 @@ def plot_grayscale_height(scene: dict):
     ax2.set_title("Height + Disease Overlay", fontsize=10)
     ax2.set_xlabel("X (m)"); ax2.set_ylabel("Y (m)"); ax2.set_aspect("equal")
 
-    # --- 右: 高度剖面 (沿 y 方向中心线) ---
     ax3 = axes[2]
     x_mid = (x.min() + x.max()) / 2
     band = np.abs(x - x_mid) < 0.10
@@ -216,7 +203,6 @@ def plot_3d_view(scene: dict):
 
     fig = plt.figure(figsize=(16, 6))
 
-    # --- 左: 曲面网格 (Trisurf) + 标签着色 ---
     ax = fig.add_subplot(1, 2, 1, projection="3d")
     try:
         from scipy.spatial import Delaunay
@@ -236,7 +222,6 @@ def plot_3d_view(scene: dict):
     ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)"); ax.set_zlabel("Z (mm)")
     ax.set_title(f"3D Surface — {name}", fontsize=11, fontweight="bold")
 
-    # --- 右: 散点 + 法向量 ---
     ax2 = fig.add_subplot(1, 2, 2, projection="3d")
     nrm = scene["normals"]
     n_s = min(len(pts), 3000)

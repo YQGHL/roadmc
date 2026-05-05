@@ -85,15 +85,6 @@ class WindowAttention3D(nn.Module):
 
     Input: (B, N, C) features + (B, N, 3) coordinates
     Output: (B, N, C) attended features
-
-    Procedure:
-    1. Project Q, K, V from input: QKV = Linear(C, 3*C), split into
-       Q, K, V each (B, N, C)
-    2. Reshape to multi-head: Q (B, num_heads, N, C//num_heads)
-    3. Partition points into windows based on (x, y, z) coordinates
-    4. Compute attention scores = QK^T/sqrt(d) + relative_pos_bias
-    5. Mask out cross-window attention
-    6. Softmax → output = AV → reshape back
     """
 
     def __init__(
@@ -150,7 +141,7 @@ class WindowAttention3D(nn.Module):
 
         # 1. Project Q, K, V
         qkv = self.qkv(x)  # (B, N, 3*C)
-        q, k, v = qkv.chunk(3, dim=-1)  # each (B, N, C)
+        q, k, v = qkv.chunk(3, dim=-1)
 
         # 2. Reshape to multi-head: (B, H, N, D)
         q = q.view(B, N, H, D).transpose(1, 2)  # (B, H, N, D)
@@ -207,11 +198,6 @@ class DeformableWindowAttention3D(nn.Module):
     from a deformed grid, enabling adaptive receptive fields.
 
     Reference: Deformable DETR (Zhu et al., 2021) adapted for 3D.
-
-    Structure:
-        offset_net: Linear(C, 3) → predicts (dx, dy, dz) for each query
-        sampled keys/values from deformed positions
-        standard attention on sampled set
     """
 
     def __init__(
@@ -423,14 +409,14 @@ if __name__ == "__main__":
     out = attn(coords, feats)
     assert out.shape == (B, N, C), f"WindowAttention shape: {out.shape}"
     assert not torch.isnan(out).any(), "NaN in attention output"
-    print(f"[PASS] WindowAttention3D: output={out.shape}")
+    print(f"WindowAttention3D: output={out.shape}")
 
     # Test DeformableWindowAttention3D
     def_attn = DeformableWindowAttention3D(dim=C, num_heads=4, num_sample_points=8)
     out_def = def_attn(coords, feats)
     assert out_def.shape == (B, N, C), f"DeformableAttn shape: {out_def.shape}"
     assert not torch.isnan(out_def).any(), "NaN in deformable attention"
-    print(f"[PASS] DeformableWindowAttention3D: output={out_def.shape}")
+    print(f"DeformableWindowAttention3D: output={out_def.shape}")
 
     # Test ShiftedWindowTransformerBlock (with MHC integration)
     block = ShiftedWindowTransformerBlock(dim=C, num_heads=4, window_size=50, use_mhc=True)
@@ -439,10 +425,10 @@ if __name__ == "__main__":
     assert not torch.isnan(out2).any(), "NaN in transformer block"
     # Verify MHC is being used
     assert hasattr(block, 'mhc') and block.mhc is not None, "MHC not integrated"
-    print(f"[PASS] ShiftedWindowTransformerBlock (with MHC): output={out2.shape}")
+    print(f"ShiftedWindowTransformerBlock (with MHC): output={out2.shape}")
 
     # Test without MHC (fallback mode)
     block2 = ShiftedWindowTransformerBlock(dim=C, num_heads=4, window_size=50, use_mhc=False)
     out3 = block2(coords, feats)
     assert out3.shape == (B, N, C), f"Block (no MHC) shape: {out3.shape}"
-    print(f"[PASS] ShiftedWindowTransformerBlock (no MHC): output={out3.shape}")
+    print(f"ShiftedWindowTransformerBlock (no MHC): output={out3.shape}")

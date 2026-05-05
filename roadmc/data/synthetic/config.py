@@ -12,16 +12,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple
 
-# ---------------------------------------------------------------------------
 # 全局常量
-# ---------------------------------------------------------------------------
 
 NUM_CLASSES: int = 38
 """JTG 5210-2018 病害分类总数（含背景标签 0）。"""
 
-# 沥青路面病害标签 ID 范围
 ASPHALT_LABELS: Tuple[int, ...] = tuple(range(0, 21))
-# 水泥路面病害标签 ID 范围
 CONCRETE_LABELS: Tuple[int, ...] = tuple(range(21, 38))
 
 # ISO 8608 路面功率谱密度参数 — 各粗糙度等级对应的不平整度系数 (×10⁻⁶ m³/cycle)
@@ -33,9 +29,7 @@ ISO_ROUGHNESS: Dict[str, float] = {
     "E": 4096,    # 很差
 }
 
-# ---------------------------------------------------------------------------
 # JTG 5210-2018 病害标签定义
-# ---------------------------------------------------------------------------
 
 LABEL_MAP: Dict[int, Dict[str, str]] = {
     0:  {"type": "背景",       "severity": "-",  "pavement": "通用"},
@@ -79,9 +73,7 @@ LABEL_MAP: Dict[int, Dict[str, str]] = {
 }
 
 
-# ---------------------------------------------------------------------------
 # 配置数据类
-# ---------------------------------------------------------------------------
 
 @dataclass
 class RoadSurfaceConfig:
@@ -391,9 +383,7 @@ class GeneratorConfig:
     normalize: bool = True
 
 
-# ---------------------------------------------------------------------------
 # 工具函数
-# ---------------------------------------------------------------------------
 
 def get_severity_label(
     pavement_type: Literal["asphalt", "concrete"],
@@ -415,7 +405,6 @@ def get_severity_label(
     """
     severity_map = {"light": "轻", "severe": "重"}
 
-    # 沥青路面病害映射
     asphalt_map = {
         ("龟裂", "轻"): 1, ("龟裂", "重"): 2,
         ("块状裂缝", "轻"): 3, ("块状裂缝", "重"): 4,
@@ -430,7 +419,6 @@ def get_severity_label(
         ("修补", "-"): 20,
     }
 
-    # 英文关键字到中文的映射
     en_to_cn = {
         "alligator": "龟裂", "block": "块状裂缝",
         "longitudinal": "纵向裂缝", "transverse": "横向裂缝",
@@ -440,7 +428,6 @@ def get_severity_label(
         "patching": "修补",
     }
 
-    # 水泥路面病害映射
     concrete_map = {
         ("破碎板", "轻"): 21, ("破碎板", "重"): 22,
         ("裂缝", "轻"): 23, ("裂缝", "重"): 24,
@@ -495,23 +482,18 @@ if __name__ == "__main__":
     """自检：验证标签映射完整性。"""
     print("=== RoadMC Config Self-Test ===\n")
 
-    # 验证标签数量
     assert NUM_CLASSES == 38, f"NUM_CLASSES should be 38, got {NUM_CLASSES}"
     print(f"[PASS] NUM_CLASSES = {NUM_CLASSES}")
 
-    # 验证标签映射完整性
     assert len(LABEL_MAP) == NUM_CLASSES, f"LABEL_MAP should have {NUM_CLASSES} entries, got {len(LABEL_MAP)}"
     print(f"[PASS] LABEL_MAP has {len(LABEL_MAP)} entries")
 
-    # 验证沥青路面标签范围
     assert min(ASPHALT_LABELS) == 0 and max(ASPHALT_LABELS) == 20
     print(f"[PASS] ASPHALT_LABELS range: {min(ASPHALT_LABELS)}-{max(ASPHALT_LABELS)}")
 
-    # 验证水泥路面标签范围
     assert min(CONCRETE_LABELS) == 21 and max(CONCRETE_LABELS) == 37
     print(f"[PASS] CONCRETE_LABELS range: {min(CONCRETE_LABELS)}-{max(CONCRETE_LABELS)}")
 
-    # 验证 get_severity_label
     assert get_severity_label("asphalt", "alligator", "light") == 1
     assert get_severity_label("asphalt", "alligator", "severe") == 2
     assert get_severity_label("asphalt", "longitudinal", "light") == 5
@@ -523,11 +505,9 @@ if __name__ == "__main__":
     assert get_severity_label("concrete", "exposed_aggregate", "-") == 36
     print("[PASS] get_severity_label 返回值正确")
 
-    # 验证 ISO 粗糙度等级
     assert set(ISO_ROUGHNESS.keys()) == {"A", "B", "C", "D", "E"}
     print("[PASS] ISO_ROUGHNESS 包含 A-E 五个等级")
 
-    # 验证配置类默认值
     cfg = GeneratorConfig()
     assert cfg.road.width == 7.0
     assert cfg.road.grid_res == 0.005

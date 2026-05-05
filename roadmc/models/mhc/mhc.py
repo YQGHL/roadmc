@@ -8,24 +8,14 @@ import torch.nn.functional as F
 def sinkhorn_knopp(M: torch.Tensor, iters: int = 5, eps: float = 1e-6) -> torch.Tensor:
     """Sinkhorn-Knopp normalization to produce a doubly stochastic matrix.
 
-    Args:
-        M: Unnormalized affinity matrix of shape (C, C).
-        iters: Number of alternating row/column normalization iterations.
-        eps: Small constant to clamp denominators and prevent division by zero.
-
-    Returns:
-        Doubly stochastic matrix H of shape (C, C) satisfying
-        H.sum(dim=0) ≈ 1 and H.sum(dim=1) ≈ 1.
+    Alternating row/column normalization until row and column sums ≈ 1.
     """
-    # Exponentiate to get positive entries
     H = torch.exp(M)
 
     for _ in range(iters):
-        # Row normalize: each row sums to 1
         row_sum = H.sum(dim=1, keepdim=True).clamp(min=eps)
         H = H / row_sum
 
-        # Column normalize: each column sums to 1
         col_sum = H.sum(dim=0, keepdim=True).clamp(min=eps)
         H = H / col_sum
 
@@ -57,7 +47,6 @@ class MHCConnection(nn.Module):
         # softplus(-5 + ε) ≈ 0.007, M ≈ C × 0.007², exp(M) ≈ exp(C×5e-5).
         # For C=768: exp(0.038) ≈ 1.04 — numerically safe.
 
-        # Buffers
         self.register_buffer("stochastic_matrix", None)
         self.register_buffer("_deployed", torch.tensor(False))
 
@@ -65,27 +54,18 @@ class MHCConnection(nn.Module):
         """Apply manifold hyper-connection.
 
         If deployed, uses the frozen H directly (no Sinkhorn iterations).
-
-        Args:
-            x: Input tensor of shape (B, C).
-            residual: Residual tensor of shape (B, C).
-
-        Returns:
-            Output tensor of shape (B, C): x + H @ residual.
+        Output: x + H @ residual.
         """
         if self._deployed.item():
             # Fast path: use pre-computed frozen H
             H = self.stochastic_matrix
         else:
-            # Compute positive affinity matrix
             M = F.softplus(self.W1) @ F.softplus(self.W2).T  # (C, C)
 
-            # Sinkhorn-Knopp normalization with temperature
             H = sinkhorn_knopp(M / self.temp, iters=self.sinkhorn_iters)  # (C, C)
         # Save H as buffer (detached) for deploy() and verification
         self.stochastic_matrix = H.detach().clone()
 
-        # y = x + H @ r  — matrix multiply on channel dimension
         y = x + (residual @ H.T)
         return y
 
@@ -143,7 +123,7 @@ if __name__ == "__main__":
     assert not torch.isnan(y).any()
 
     print(
-        f"[PASS] MHCConnection: output={y.shape}, "
+        f"MHCConnection test passed: output={y.shape}, "
         f"row_err={row_sum.sub(1).abs().max():.6f}, "
         f"col_err={col_sum.sub(1).abs().max():.6f}"
     )

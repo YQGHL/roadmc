@@ -1,8 +1,4 @@
-"""
-RoadMC Data Pipeline Diagram Generator (v2 - Grid Layout)
-Generates: docs/data_pipeline.png
-Focus: Point cloud generation → data loading → batch preparation
-"""
+"""RoadMC data pipeline diagram generator."""
 
 import matplotlib
 matplotlib.use("Agg")
@@ -29,7 +25,7 @@ fig, ax = plt.subplots(figsize=(W, H), dpi=DPI)
 ax.set_xlim(0, W); ax.set_ylim(0, H); ax.axis("off")
 fig.patch.set_facecolor("white")
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# Helpers
 def box(x, y, w, h, fc, ec=None, lw=1.0, alpha=1.0, z=3, rnd=0.06):
     ec = ec or C["border"]
     ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle=f"round,pad=0.02,rounding_size={rnd}",
@@ -61,20 +57,14 @@ def mod(x, y, w, h, title, sub="", fc=C["data_light"], ec=None, lw=0.8):
     else:
         txt(x + w/2, y + h/2, title, fs=10, fw="bold", z=4)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# BACKGROUND
-# ═════════════════════════════════════════════════════════════════════════════
+# Background
 box(0.1, 0.1, W-0.2, H-0.2, fc=C["bg"], ec="#DEE2E6", lw=1.0, rnd=0.15, z=0)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TITLE
-# ═════════════════════════════════════════════════════════════════════════════
+# Title
 txt(W/2, 10.3, "RoadMC Data Pipeline", fs=18, fw="bold", z=5)
 txt(W/2, 9.9, "Point Cloud Generation → Batch Preparation", fs=10, c=C["text3"], z=5)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# LAYOUT CONSTANTS
-# ═════════════════════════════════════════════════════════════════════════════
+# Layout Constants
 # Strict grid: headers at top, blocks below with clear gap
 HDR_Y = 9.3       # header text center
 ULINE_Y = 9.15    # underline y (must be > block top)
@@ -82,9 +72,7 @@ BLOCK_H = 0.8
 GAP = 0.15
 FIRST_Y = 8.2     # first block bottom; top = 9.0 < ULINE_Y(9.15) ✓
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 1 — Data Generation (left, x=0.5, w=4.0)
-# ═════════════════════════════════════════════════════════════════════════════
+# Phase 1 — Data Generation (left, x=0.5, w=4.0)
 p1x, p1w = 0.5, 4.0
 p1_cx = p1x + p1w/2
 
@@ -114,9 +102,7 @@ box(p1x, ann_y, p1w, 0.6, fc="#F8F9FA", ec=C["divider"], lw=0.5, alpha=0.7, rnd=
 txt(p1_cx, ann_y + 0.35, "feats: intensity, curvature, crack-dist", fs=7, c=C["text3"], z=4)
 txt(p1_cx, ann_y + 0.15, "normals: unit surface normals", fs=7, c=C["text3"], z=4)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CROSS ARROW: P1 → P4 (route in clear space between blocks)
-# ═════════════════════════════════════════════════════════════════════════════
+# Cross Arrow: P1 → P4 (route in clear space between blocks)
 # Arrow from P1 Output to P4 SyntheticPointCloudDataset
 arrow_end_y = FIRST_Y + BLOCK_H*0.5  # middle of first P4 block
 ax.annotate("", xy=(8.5, arrow_end_y), xytext=(p1x+p1w, FIRST_Y),
@@ -125,9 +111,7 @@ ax.annotate("", xy=(8.5, arrow_end_y), xytext=(p1x+p1w, FIRST_Y),
 # Label in clear space above arrow
 label(7.0, FIRST_Y + 0.55, ".npz files", fs=9, bg=C["data_bg"])
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 4 — Data Loading (right, x=8.5, w=4.5)
-# ═════════════════════════════════════════════════════════════════════════════
+# Phase 4 — Data Loading (right, x=8.5, w=4.5)
 p4x, p4w = 8.5, 4.5
 p4_cx = p4x + p4w/2
 
@@ -151,9 +135,7 @@ for i in range(3):
     ay = FIRST_Y - i*(BLOCK_H+GAP) - 0.05
     arrow(p4_cx, ay, p4_cx, ay - GAP + 0.1, c=C["opt"], lw=1.0)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# OUTPUT — Batch Tensor (far right)
-# ═════════════════════════════════════════════════════════════════════════════
+# Output — Batch Tensor (far right)
 out_x, out_w = 13.5, 2.2
 out_cx = out_x + out_w/2
 out_top = FIRST_Y + 0.3
@@ -182,9 +164,7 @@ ax.annotate("", xy=(out_x, out_top - 1.5), xytext=(p4_cx, FIRST_Y - 3*(BLOCK_H+G
                             connectionstyle="arc3,rad=0.15", shrinkA=5, shrinkB=5), zorder=5)
 label(12.5, 6.0, "batch tensor", fs=8, c=C["model"], bg=C["model_bg"])
 
-# ═════════════════════════════════════════════════════════════════════════════
-# DATA FLOW SUMMARY (bottom)
-# ═════════════════════════════════════════════════════════════════════════════
+# Data Flow Summary (bottom)
 box(0.5, 0.4, 12.5, 1.3, fc=C["panel"], ec=C["divider"], lw=1.0, rnd=0.08, z=2)
 txt(6.75, 1.35, "Data Flow Summary", fs=11, fw="bold", c=C["text"], z=5)
 txt(6.75, 0.9,
@@ -194,18 +174,14 @@ txt(6.75, 0.6,
     ".npz → SyntheticPointCloudDataset → RoadMCDataModule → collate_fn → batch tensor",
     fs=8, c=C["text2"], z=4)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# LEGEND (bottom-left, below annotation)
-# ═════════════════════════════════════════════════════════════════════════════
+# Legend (bottom-left, below annotation)
 leg_y = 3.5
 txt(1.5, leg_y + 0.3, "Legend", fs=9, fw="bold", z=5)
 for i, (clr, nm) in enumerate([(C["data"],"Synthetic"),(C["opt"],"Loading"),(C["model"],"Output")]):
     ax.plot([0.7+i*1.6, 0.7+i*1.6+0.3], [leg_y, leg_y], color=clr, lw=3, zorder=5)
     txt(0.7+i*1.6+0.45, leg_y, nm, fs=8, c=C["text2"], ha="left", z=5)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SAVE
-# ═════════════════════════════════════════════════════════════════════════════
+# Save
 plt.savefig("docs/data_pipeline.png", dpi=DPI, bbox_inches="tight",
             facecolor="white", edgecolor="none", pad_inches=0.1)
-print(f"[PASS] docs/data_pipeline.png generated ({DPI} dpi, {W}x{H})")
+print(f"docs/data_pipeline.png generated ({DPI} dpi, {W}x{H})")

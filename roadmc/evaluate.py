@@ -54,16 +54,7 @@ def compute_per_class_metrics(
     targets: torch.Tensor,
     num_classes: int = 38,
 ) -> Dict[str, Dict[str, float]]:
-    """Compute per-class IoU, recall, precision for all classes.
-    
-    Args:
-        preds: (N,) predicted labels.
-        targets: (N,) ground truth labels.
-        num_classes: Number of classes (default 38).
-    
-    Returns:
-        dict mapping class_id → {iou, recall, precision}.
-    """
+    """Compute per-class IoU, recall and precision."""
     metrics = {}
     for c in range(num_classes):
         pred_c = preds == c
@@ -84,14 +75,7 @@ def compute_per_class_metrics(
 def compute_grouped_metrics(
     per_class: Dict[str, Dict[str, float]],
 ) -> Dict[str, float]:
-    """Compute grouped statistics for asphalt [0-20] and concrete [21-37].
-    
-    Args:
-        per_class: Output from compute_per_class_metrics.
-    
-    Returns:
-        dict with 'asphalt_mIoU', 'concrete_mIoU', 'overall_mIoU', etc.
-    """
+    """Compute grouped statistics for asphalt [0-20] and concrete [21-37]."""
     ious = {int(k): v["iou"] for k, v in per_class.items()}
     
     asphalt_ious = [ious[c] for c in range(1, 21) if str(c) in per_class]
@@ -151,7 +135,7 @@ def evaluate(args):
     )
     loader = DataLoader(
         dataset, batch_size=1, shuffle=False,
-        collate_fn=lambda batch: batch[0],  # single sample
+        collate_fn=lambda batch: batch[0],
     )
     
     all_preds, all_targets = [], []
@@ -215,11 +199,11 @@ if __name__ == "__main__":
         targets = torch.randint(0, 38, (1000,))
         metrics = compute_per_class_metrics(preds, targets)
         grouped = compute_grouped_metrics(metrics)
-        print(f"[PASS] compute_per_class_metrics: {len(metrics)} classes")
-        print(f"[PASS] grouped: asphalt_mIoU={grouped['asphalt_mIoU']:.4f}")
+        print(f"compute_per_class_metrics: {len(metrics)} classes")
+        print(f"grouped: asphalt_mIoU={grouped['asphalt_mIoU']:.4f}")
         
         report = format_report(metrics, grouped)
         print(report[:200] + "...")
-        print("\n[PASS] Evaluation module ready.")
+        print("\nEvaluation module ready.")
     else:
         main()

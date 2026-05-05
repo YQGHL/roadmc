@@ -1,6 +1,5 @@
 """
 RoadMC 数学与力学基元 —— Physics-Simulation-Driven Road Surface Primitives.
-=======================================================================
 
 严格遵循 JTG 5210-2018《公路技术状况评定标准》，共 38 个标签 (0-37)。
 
@@ -32,11 +31,6 @@ try:
     from .config import ISO_ROUGHNESS
 except ImportError:
     from config import ISO_ROUGHNESS
-
-# ===========================================================================
-# 辅助函数 (Helpers)
-# ===========================================================================
-
 
 def _compute_normals(
     Z: np.ndarray, dx: float, dy: float
@@ -71,7 +65,6 @@ def _compute_normals(
     dz_dx = np.zeros_like(Z)
     dz_dy = np.zeros_like(Z)
 
-    # 内部点用中心差分
     dz_dx[1:-1, :] = (Z[2:, :] - Z[:-2, :]) / (2.0 * dx)
     dz_dy[:, 1:-1] = (Z[:, 2:] - Z[:, :-2]) / (2.0 * dy)
 
@@ -154,7 +147,7 @@ def _fractal_perturbation(
     yi = np.asarray(y)
 
     for o in range(octaves):
-        grid_size = 8  # 粗网格分辨率
+        grid_size = 8
         noise_grid = rng.uniform(-1.0, 1.0, (grid_size, grid_size))
 
         interp = interpolate.RegularGridInterpolator(
@@ -164,7 +157,6 @@ def _fractal_perturbation(
             fill_value=0.0,
         )
 
-        # 在扰动坐标处采样
         sample_x = (xi * frequency) % 1.0
         sample_y = (yi * frequency) % 1.0
         result += amplitude * interp(np.stack([sample_x, sample_y], axis=-1))
@@ -203,11 +195,10 @@ def _point_to_segment_distance(
     if ab2 < 1e-12:
         return np.sqrt(np.sum(AP ** 2, axis=1))
 
-    # 投影参数 t = (AP · AB) / (AB · AB)
+# 投影参数 t = (AP · AB) / (AB · AB)
     t = np.sum(AP * AB, axis=1) / ab2
     t = np.clip(t, 0.0, 1.0)
 
-    # 最近点
     closest = A + t[:, None] * AB
     return np.sqrt(np.sum((points - closest) ** 2, axis=1))
 
@@ -241,7 +232,6 @@ def _point_to_segment_distance_t(
     # 投影参数 t = (AP · AB) / (AB · AB)
     t_local = np.clip(np.sum(AP * AB, axis=1) / ab2, 0.0, 1.0)
 
-    # 最近点
     closest = A + t_local[:, None] * AB
     dist = np.sqrt(np.sum((points - closest) ** 2, axis=1))
     return dist, t_local
@@ -271,9 +261,7 @@ def _bilinear_interpolation(
     return interp(np.stack([x, y], axis=-1))
 
 
-# ===========================================================================
 # 1.1.1 — 路面宏观轮廓生成 (ISO 8608 PSD)
-# ===========================================================================
 
 
 def generate_road_surface(
@@ -320,18 +308,15 @@ def generate_road_surface(
     """
     rng = np.random.default_rng(seed)
 
-    # --- 创建网格 ---
     x = np.arange(0.0, width, grid_res)
     y = np.arange(0.0, length, grid_res)
     nx, ny = len(x), len(y)
     X, Y = np.meshgrid(x, y, indexing="ij")  # (nx, ny)
 
-    # --- ISO 8608 PSD 参数 ---
     n0 = 0.1  # 参考空间频率 (cycle/m)
     w = 2.0  # 波度指数 (waviness exponent)
     Gd0 = ISO_ROUGHNESS[roughness_class] * 1e-6  # m³/cycle
 
-    # --- 空间频率网格 ---
     fx = np.fft.fftfreq(nx, d=grid_res)  # (nx,)
     fy = np.fft.fftfreq(ny, d=grid_res)  # (ny,)
 
@@ -343,17 +328,15 @@ def generate_road_surface(
     # 二维 PSD (可分离模型)：S(fx, fy) = G_d(|fx|) * G_d(|fy|)
     psd_2d = np.outer(psd_x, psd_y)  # (nx, ny)
 
-    # --- 谱合成：白噪声 → FFT → 滤波 → IFFT ---
     white_noise = rng.normal(0.0, 1.0, (nx, ny))
     W_hat = np.fft.fft2(white_noise)
 
     H_hat = np.sqrt(psd_2d + 1e-30) * W_hat  # 避免 sqrt(0)
     h_field = np.real(np.fft.ifft2(H_hat))
 
-    # 零均值化
     h_field = h_field - np.mean(h_field)
 
-    # --- RMS 缩放：将 RMS 匹配到 PSD 积分值 ---
+    # RMS 缩放：将 RMS 匹配到 PSD 积分值
     # 理论方差：σ²_target = [Σ G_d(fx_i)Δfx] · [Σ G_d(fy_j)Δfy]
     dfx = 1.0 / (nx * grid_res)  # 频率分辨率
     dfy = 1.0 / (ny * grid_res)
@@ -363,19 +346,15 @@ def generate_road_surface(
     if rms_current > 1e-12:
         h_field = h_field * (rms_target / rms_current)
 
-    # --- 计算法向量 ---
     normals_grid = _compute_normals(h_field, grid_res, grid_res)
 
-    # --- 展平为点云 ---
     points = np.stack([X.ravel(), Y.ravel(), h_field.ravel()], axis=1)  # (N, 3)
     normals = normals_grid.reshape(-1, 3)  # (N, 3)
 
     return points, normals
 
 
-# ===========================================================================
 # 1.1.2 — 微观纹理叠加 (fBm)
-# ===========================================================================
 
 
 def resample_to_lidar_pattern(
@@ -431,20 +410,16 @@ def resample_to_lidar_pattern(
     r_max = np.max(r_dist) + 1e-12
 
     if scan_pattern == "rotating":
-        # 扫描线在 y 方向上分布
         scan_spacing = (y_max - y_min) / scan_lines
-        # 每条扫描线上的 y 中心位置
         y_scans = np.linspace(y_min, y_max, scan_lines)
 
-        # 每个点到最近扫描线的距离
         nearest_scan = np.argmin(np.abs(y[:, None] - y_scans[None, :]), axis=1)
         dist_to_scan = np.abs(y - y_scans[nearest_scan])
 
         # 到扫描线距离越远，保留概率越低（Gaussian falloff）
-        scan_sigma = scan_spacing * 0.8  # 扫描线有效宽度
+        scan_sigma = scan_spacing * 0.8
         scan_prob = np.exp(-0.5 * (dist_to_scan / scan_sigma) ** 2)
 
-        # 距离衰减
         range_prob = 1.0 - range_decay * (r_dist / r_max)
 
         # 入射角效应：边缘点更稀疏（大角度入射 → 低反射率 → 丢点率高）
@@ -509,17 +484,13 @@ def add_micro_texture(
     pts = points.copy()
     nrm = normals.copy()
 
-    # Lévy stable alpha = 2*H (但限制在 [0.1, 1.9] 以避免 scipy 数值问题)
+    # Lévy stable alpha = 2*H (clamped to [0.1, 1.9] for scipy stability)
     alpha = max(0.1, min(1.9, 2.0 * hurst))
 
-    # 法向量方向位移
     delta = np.zeros(N, dtype=np.float64)
 
     for k in range(octaves):
-        # 每倍频程的缩放因子
         scale = 2.0 ** (-k * hurst)
-        # 用 Lévy stable 生成噪声
-        # 生成 N 个独立同分布随机数
         noise = stats.levy_stable.rvs(
             alpha=alpha,
             beta=0.0,  # 对称
@@ -532,16 +503,13 @@ def add_micro_texture(
         noise = np.clip(noise, -5.0, 5.0)
         delta += scale * noise
 
-    # 沿法线方向位移
     displacement = amplitude * delta[:, None] * nrm
     pts += displacement
 
     return pts, nrm
 
 
-# ===========================================================================
 # 1.1.3 — 裂缝生成 (沥青路面)
-# ===========================================================================
 
 
 def _generate_alligator_seeds(
@@ -642,7 +610,7 @@ def add_crack(
     N = pts.shape[0]
     xy = pts[:, :2]
 
-    # --- 从映射或直接参数获取标签 ---
+    # 从映射或直接参数获取标签
     if crack_type == "alligator":
         label_val = 1 if severity == "light" else 2
         d_max = params.get("d_max", 0.010 if severity == "light" else 0.030)
@@ -661,15 +629,10 @@ def add_crack(
     width_mean = params.get("width_mean", 0.005)
     width_std = params.get("width_std", 0.3)
 
-    # =======================================================================
-    # 纵向/横向裂缝
-    # =======================================================================
     if crack_type in ("longitudinal", "transverse"):
-        # 确定路面范围
         x_min, x_max = float(np.min(xy[:, 0])), float(np.max(xy[:, 0]))
         y_min, y_max = float(np.min(xy[:, 1])), float(np.max(xy[:, 1]))
 
-        # 生成 Bézier 控制点
         if "bezier_control_points" in params:
             control_pts = np.array(params["bezier_control_points"], dtype=np.float64)
         else:
@@ -695,11 +658,9 @@ def add_crack(
                 control_pts = np.stack([x_vals, y_center + np.full(4, offsets[0]) + offsets],
                                        axis=1)
 
-        # 在 Bézier 曲线上采样密集点
         num_curve_samples = max(N // 100, 100)
         curve_pts = _cubic_bezier(control_pts, num_curve_samples)
 
-        # 分形扰动
         pert_seed = rng.integers(0, 2**31)
         x_curve = curve_pts[:, 0]
         y_curve = curve_pts[:, 1]
@@ -710,9 +671,8 @@ def add_crack(
         curve_pts[:, 0] += pert_x * 0.02
         curve_pts[:, 1] += pert_y * 0.02
 
-        # 对每个点计算到扰动曲线的最小距离和投影参数
         min_dist = np.full(N, np.inf)
-        min_t = np.zeros(N)  # 每个点在曲线上最近位置的参数 t ∈ [0, 1]
+        min_t = np.zeros(N)
         # 用多段线近似，计算到每段距离和局部参数
         for k in range(num_curve_samples - 1):
             t_start = k / (num_curve_samples - 1)
@@ -742,7 +702,7 @@ def add_crack(
         lambda_param = half_width / 2.0  # λ 与宽度相关
         p_param = 2.0  # 高斯槽 (p=2)
 
-        # 裂缝区域掩码：距离小于半宽
+        # 裂缝区域掩码
         crack_mask = min_dist <= half_width
         if np.any(crack_mask):
             depth_ratio = min_dist[crack_mask] / np.clip(lambda_param[crack_mask], 1e-12, None)
@@ -750,9 +710,7 @@ def add_crack(
             pts[crack_mask, 2] -= depth
             lbl[crack_mask] = label_val
 
-    # =======================================================================
     # 龟裂 / 块状裂缝 (Voronoi 图)
-    # =======================================================================
     elif crack_type in ("alligator", "block"):
         x_min, x_max = float(np.min(xy[:, 0])), float(np.max(xy[:, 0]))
         y_min, y_max = float(np.min(xy[:, 1])), float(np.max(xy[:, 1]))
@@ -778,11 +736,10 @@ def add_crack(
         # Voronoi 图
         vor = spatial.Voronoi(seeds)
 
-        # 收集有限脊线 (ridge vertices)
         ridge_segments = []
         for v_idx_pair in vor.ridge_vertices:
             v1, v2 = v_idx_pair
-            if v1 >= 0 and v2 >= 0:  # 有限脊线
+            if ridge[0] >= 0 and ridge[1] >= 0:
                 p1 = vor.vertices[v1]
                 p2 = vor.vertices[v2]
                 ridge_segments.append((p1, p2))
@@ -826,9 +783,7 @@ def add_crack(
     return pts, lbl
 
 
-# ===========================================================================
 # 1.1.4 — 坑槽生成 (Pothole)
-# ===========================================================================
 
 
 def add_pothole(
@@ -885,7 +840,7 @@ def add_pothole(
 
     # 超椭圆指数 β
     if severity == "light":
-        beta = 2.0  # 椭球
+        beta = 2.0
     else:
         beta = 3.0 + rng.random() * 2.0  # β ∈ [3, 5] 平底
 
@@ -898,24 +853,20 @@ def add_pothole(
         pts[in_pothole, 2] += z_depression
         lbl[in_pothole] = label_val
 
-    # --- 边缘剥落 (edge spalling) ---
+    # 边缘剥落 (edge spalling)
     if edge_quality < 1.0:
-        # 边缘区域：0.8R ≤ r ≤ 1.2R
         edge_mask = (r >= 0.8 * radius) & (r <= 1.2 * radius)
         if np.any(edge_mask):
             edge_idx = np.where(edge_mask)[0]
-            # 随机选一部分边缘点剥落
             num_spall = int(edge_quality * len(edge_idx))
             if num_spall < len(edge_idx):
                 spall_idx = rng.choice(edge_idx, size=len(edge_idx) - num_spall,
                                        replace=False)
-                # 边缘剥落：轻微降低高度
                 spall_depth = rng.uniform(0.0, depth * 0.3, size=len(spall_idx))
                 pts[spall_idx, 2] -= spall_depth
                 lbl[spall_idx] = label_val
 
-        # --- Poisson 微坑 (小尺度次生坑) ---
-        # 在坑槽边缘附近随机撒点
+        # Poisson 微坑 (小尺度次生坑)
         num_pits = rng.poisson(max(1, int(radius * 5)))
         for _ in range(num_pits):
             pit_angle = rng.uniform(0, 2 * np.pi)
@@ -936,9 +887,7 @@ def add_pothole(
     return pts, lbl
 
 
-# ===========================================================================
 # M3: Lévy 极值剥落 — 重尾分布模拟裂缝/坑槽边缘的深层剥落
-# ===========================================================================
 
 
 def add_edge_spalling_heavy_tail(
@@ -1008,9 +957,7 @@ def add_edge_spalling_heavy_tail(
     return pts, lbl
 
 
-# ===========================================================================
 # 1.1.5 — 松散 (Raveling)
-# ===========================================================================
 
 
 def add_raveling(
@@ -1088,9 +1035,7 @@ def add_raveling(
     return pts, lbl
 
 
-# ===========================================================================
 # 1.1.6 — 沉陷 (Depression)
-# ===========================================================================
 
 
 def add_depression(
@@ -1139,7 +1084,6 @@ def add_depression(
     r2 = (xy[:, 0] - cx) ** 2 + (xy[:, 1] - cy) ** 2
     sigma2 = (radius / 3.0) ** 2
 
-    # 高斯凹陷
     depression = -depth * np.exp(-0.5 * r2 / sigma2)
 
     pts[:, 2] += depression
@@ -1151,9 +1095,7 @@ def add_depression(
     return pts, lbl
 
 
-# ===========================================================================
 # 1.1.7 — 车辙 (Rutting)
-# ===========================================================================
 
 
 def add_rutting(
@@ -1206,20 +1148,16 @@ def add_rutting(
     x = pts[:, 0]
     y = pts[:, 1]
 
-    # 左右轮迹中心
     x_left = center_line - wheel_separation / 2.0
     x_right = center_line + wheel_separation / 2.0
 
-    # 轮迹宽度标准差
     sigma = width / 3.0
 
-    # 纵向调制参数
     y_range = np.max(y) - np.min(y)
-    modulation_wavelength = y_range * 0.5  # 调制波长为路面长度一半
-    epsilon = 0.2  # 调制幅度
+    modulation_wavelength = y_range * 0.5
+    epsilon = 0.2
     modulation = 1.0 + epsilon * np.sin(2.0 * np.pi * y / modulation_wavelength)
 
-    # 高斯轮迹
     track_left = np.exp(-0.5 * ((x - x_left) / sigma) ** 2)
     track_right = np.exp(-0.5 * ((x - x_right) / sigma) ** 2)
 
@@ -1227,16 +1165,13 @@ def add_rutting(
 
     pts[:, 2] -= rut_depth
 
-    # 标注车辙区域
     affected = rut_depth > depth * 0.05
     lbl[affected] = label_val
 
     return pts, lbl
 
 
-# ===========================================================================
 # 1.1.8 — 波浪拥包 (Corrugation)
-# ===========================================================================
 
 
 def add_corrugation(
@@ -1289,20 +1224,16 @@ def add_corrugation(
     else:
         raise ValueError(f"Unknown direction: {direction}")
 
-    # 正弦波调制
     modulation = amplitude * np.cos(2.0 * np.pi * u / wavelength)
     pts[:, 2] += modulation
 
-    # 标注拥包区域 (振幅超过 10% 的点)
     affected = np.abs(modulation) > amplitude * 0.1
     lbl[affected] = label_val
 
     return pts, lbl
 
 
-# ===========================================================================
 # 1.1.9 — 泛油 (Bleeding)
-# ===========================================================================
 
 
 def add_bleeding(
@@ -1333,9 +1264,7 @@ def add_bleeding(
     return lbl
 
 
-# ===========================================================================
 # 1.1.10 — 水泥路面损坏 (Concrete Damage)
-# ===========================================================================
 
 
 def add_concrete_damage(
@@ -1391,7 +1320,7 @@ def add_concrete_damage(
     xy = pts[:, :2]
     x, y = pts[:, 0], pts[:, 1]
 
-    # --- 解析板块参数 ---
+    # 解析板块参数
     slab_len = params.get("slab_length", 5.0)
     slab_wid = params.get("slab_width", 4.0)
     joint_w = params.get("joint_width", 0.008)
@@ -1399,7 +1328,7 @@ def add_concrete_damage(
     x_offset = params.get("x_offset", 0.0)
     y_offset = params.get("y_offset", 0.0)
 
-    # --- 获取标签 ---
+    # 获取标签
     # 对无程度区分的类型，直接用固定标签
     no_severity_types = {"pumping": 29, "pitting": 34, "blowup": 35,
                          "exposed_aggregate": 36}
@@ -1419,8 +1348,8 @@ def add_concrete_damage(
         }
         label_val = label_map.get(damage_type, 24)
 
-    # --- 辅助：计算点到 slab 接缝的距离 ---
-    # 接缝位置 (沿 x 方向)
+    # 辅助：计算点到 slab 接缝的距离
+    # 接缝位置
     x_min, x_max = float(np.min(x)), float(np.max(x))
     y_min, y_max = float(np.min(y)), float(np.max(y))
 
@@ -1443,15 +1372,12 @@ def add_concrete_damage(
 
     joint_dist = dist_to_nearest_joint(x, y)
 
-    # =======================================================================
     # 1) 破碎板 (Slab Shatter)
-    # =======================================================================
     if damage_type == "slab_shatter":
         # 选择一块或多块板，将板内点分割成 Voronoi 碎片
         # 每个碎片随机垂直错台
 
         ix, iy = slab_indices(x, y)
-        # 选一个随机板块
         unique_slabs = np.unique(np.stack([ix, iy], axis=1), axis=0)
         target_slab = unique_slabs[rng.integers(len(unique_slabs))]
 
@@ -1459,7 +1385,6 @@ def add_concrete_damage(
         slab_idx = np.where(slab_mask)[0]
 
         if len(slab_idx) > 3:
-            # 板内生成随机碎片种子
             slab_x = x[slab_idx]
             slab_y = y[slab_idx]
             x_s_min, x_s_max = np.min(slab_x), np.max(slab_x)
@@ -1472,11 +1397,9 @@ def add_concrete_damage(
             ])
 
             vor = spatial.Voronoi(seeds)
-            # 对每个点，找最近的种子 (所属碎片)
             tree = spatial.KDTree(seeds)
             _, frag_idx = tree.query(np.column_stack([slab_x, slab_y]))
 
-            # 每块碎片随机垂直位移
             fragment_disp = rng.normal(0, 0.01 if severity == "light" else 0.03,
                                        size=n_fragments)
             for fi in range(n_fragments):
@@ -1499,12 +1422,9 @@ def add_concrete_damage(
 
             lbl[slab_idx] = label_val
 
-    # =======================================================================
     # 2) 水泥裂缝 (Concrete Crack)
-    # =======================================================================
     elif damage_type == "slab_crack":
         # 通过板体的直线裂缝，边缘更尖锐
-        # 随机角度和位置
         angle = rng.uniform(0, np.pi)
         x_span = x_max - x_min
         y_span = y_max - y_min
@@ -1514,7 +1434,6 @@ def add_concrete_damage(
         )
 
         cos_a, sin_a = np.cos(angle), np.sin(angle)
-        # 点到直线的距离
         dist_to_line = np.abs(cos_a * y - sin_a * x + intercept) / np.sqrt(cos_a ** 2 + sin_a ** 2 + 1e-12)
 
         crack_width_joint = joint_w * 2
@@ -1528,9 +1447,7 @@ def add_concrete_damage(
             pts[crack_mask, 2] -= depth_crack
             lbl[crack_mask] = label_val
 
-    # =======================================================================
     # 3) 板角断裂 (Corner Break)
-    # =======================================================================
     elif damage_type == "corner_break":
         # 选择一个板块的一个角
         ix, iy = slab_indices(x, y)
@@ -1560,10 +1477,8 @@ def add_concrete_damage(
             dx_corner = slab_x - corner_x
             dy_corner = slab_y - corner_y
             cos_da, sin_da = np.cos(diag_angle), np.sin(diag_angle)
-            # 到斜线的有符号距离
             dist_diag = np.abs(cos_da * dy_corner - sin_da * dx_corner)
 
-            # 到角的距离
             dist_to_corner = np.sqrt(dx_corner ** 2 + dy_corner ** 2)
 
             # 裂缝区域
@@ -1582,12 +1497,9 @@ def add_concrete_damage(
             pts[slab_idx[corner_region], 2] -= corner_settle * np.clip(settle_factor, 0, 1)
             lbl[slab_idx[corner_region]] = label_val
 
-    # =======================================================================
     # 4) 错台 (Faulting)
-    # =======================================================================
     elif damage_type == "faulting":
         # 接缝两侧高度差
-        # 选一个横向接缝 (确保至少有一个有效的内部接缝)
         if len(trans_joints) > 2:
             joint_y = trans_joints[rng.integers(1, len(trans_joints) - 1)]
         else:
@@ -1595,7 +1507,6 @@ def add_concrete_damage(
 
         fault_offset = params.get("d_max", 0.005 if severity == "light" else 0.015)
 
-        # 接缝两侧各 slab_wid 范围
         near_joint = np.abs(y - joint_y) < joint_w * 5
         if np.any(near_joint):
             # 一侧上升，一侧下降
@@ -1603,11 +1514,8 @@ def add_concrete_damage(
             pts[near_joint, 2] += side[near_joint] * fault_offset * 0.5
             lbl[near_joint] = label_val
 
-    # =======================================================================
     # 5) 唧泥 (Pumping)
-    # =======================================================================
     elif damage_type == "pumping":
-        # 在接缝处添加湿润泥点特征
         # 仅修改标签，不改变几何
         near_joint = joint_dist < joint_w * 8
         lbl[near_joint] = label_val
@@ -1626,12 +1534,9 @@ def add_concrete_damage(
                     pts[in_spot, 2] += rng.uniform(0.0005, 0.002)
                     lbl[in_spot] = label_val
 
-    # =======================================================================
     # 6) 边角剥落 (Edge Spall)
-    # =======================================================================
     elif damage_type == "edge_spall":
         # 板块边缘破损
-        # 找离接缝一定距离的边界点
         near_joint = joint_dist < joint_w * 10
 
         # 随机选择一些接缝附近区域
@@ -1645,16 +1550,12 @@ def add_concrete_damage(
             pts[spall_idx, 2] -= spall_depth
             lbl[spall_idx] = label_val
 
-    # =======================================================================
     # 7) 接缝料损坏 (Joint Damage)
-    # =======================================================================
     elif damage_type == "joint_damage":
         # 接缝处填充物缺失 → 形成沟槽
-        # 沿接缝的窄带
         near_joint = joint_dist < joint_w
 
         if np.any(near_joint):
-            # 随机选部分接缝段损坏
             joint_idx = np.where(near_joint)[0]
             damage_ratio = 0.4 if severity == "light" else 0.8
             n_damage = int(damage_ratio * len(joint_idx))
@@ -1667,9 +1568,7 @@ def add_concrete_damage(
             pts[damage_idx, 2] -= depth_joint
             lbl[damage_idx] = label_val
 
-    # =======================================================================
     # 8) 坑洞 (Pitting) — 类似坑槽但更深
-    # =======================================================================
     elif damage_type == "pitting":
         center_x = rng.uniform(x_min + 0.05 * (x_max - x_min),
                                x_max - 0.05 * (x_max - x_min))
@@ -1687,9 +1586,7 @@ def add_concrete_damage(
             pts[in_pit, 2] += z_pit
             lbl[in_pit] = label_val
 
-    # =======================================================================
     # 9) 拱起 (Blowup)
-    # =======================================================================
     elif damage_type == "blowup":
         # 板体向上拱起 (余弦拱形)
         ix, iy = slab_indices(x, y)
@@ -1707,27 +1604,21 @@ def add_concrete_damage(
 
             blowup_height = params.get("d_max", rng.uniform(0.02, 0.06))
 
-            # 径向余弦拱起
             dx_blow = (slab_x - x_s_center) / (slab_wid * 0.5)
             dy_blow = (slab_y - y_s_center) / (slab_len * 0.5)
             r_blow = np.sqrt(dx_blow ** 2 + dy_blow ** 2)
             r_blow = np.clip(r_blow, 0, 1.5)
 
-            # 拱起剖面
             uplift = blowup_height * (np.cos(np.pi * r_blow * 0.5) ** 2)
             uplift = np.clip(uplift, 0, blowup_height)
 
             pts[slab_idx, 2] += uplift
-            # 拱起中心区域标注
             uplifted = uplift > blowup_height * 0.1
             lbl[slab_idx[uplifted]] = label_val
 
-    # =======================================================================
     # 10) 露骨 (Exposed Aggregate)
-    # =======================================================================
     elif damage_type == "exposed_aggregate":
         # 表面纹理缺失 → 增加粗糙度 + 降低强度
-        # 在随机区域添加高频噪声
         region_idx = np.where(
             (x > x_min + 0.1 * (x_max - x_min)) &
             (x < x_max - 0.1 * (x_max - x_min)) &
@@ -1739,7 +1630,6 @@ def add_concrete_damage(
             n_exposed = max(1, int(len(region_idx) * rng.uniform(0.1, 0.4)))
             exposed_idx = rng.choice(region_idx, size=n_exposed, replace=False)
 
-            # 表面粗糙化：增加高频噪声
             roughness = rng.normal(0, params.get("d_max", 0.003), size=n_exposed)
             pts[exposed_idx, 2] += roughness
             lbl[exposed_idx] = label_val
@@ -1750,9 +1640,7 @@ def add_concrete_damage(
     return pts, lbl
 
 
-# ===========================================================================
 # 1.1.11 — LiDAR 噪声仿真
-# ===========================================================================
 
 
 def simulate_lidar_noise(
@@ -1802,37 +1690,28 @@ def simulate_lidar_noise(
     pts = points.copy()
     N = pts.shape[0]
 
-    # ===================================================================
     # 1. 笛卡尔 → 球坐标
-    # ===================================================================
     x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
     r = np.sqrt(x ** 2 + y ** 2 + z ** 2) + 1e-12
     theta = np.arctan2(y, x)
     phi = np.arcsin(np.clip(z / r, -1.0, 1.0))
 
-    # ===================================================================
     # 2. 加噪声
-    # ===================================================================
     angular_jitter_rad = np.deg2rad(angular_jitter_deg)
 
     r_noisy = r + rng.normal(0.0, distance_noise_std, size=N)
-    r_noisy = np.maximum(r_noisy, 0.0)  # 非负半径
+    r_noisy = np.maximum(r_noisy, 0.0)
     theta_noisy = theta + rng.normal(0.0, angular_jitter_rad, size=N)
     phi_noisy = phi + rng.normal(0.0, angular_jitter_rad, size=N)
-    # 限制 phi 在 [-π/2, π/2]
     phi_noisy = np.clip(phi_noisy, -np.pi / 2.0, np.pi / 2.0)
 
-    # ===================================================================
     # 3. 球坐标 → 笛卡尔
-    # ===================================================================
     pts_noisy = np.empty_like(pts)
     pts_noisy[:, 0] = r_noisy * np.cos(theta_noisy) * np.cos(phi_noisy)
     pts_noisy[:, 1] = r_noisy * np.sin(theta_noisy) * np.cos(phi_noisy)
     pts_noisy[:, 2] = r_noisy * np.sin(phi_noisy)
 
-    # ===================================================================
     # 4. Dropout
-    # ===================================================================
     if dropout_rate > 0:
         # 基础丢失概率 + 距离相关附加
         r_max = np.max(r_noisy)
@@ -1845,9 +1724,7 @@ def simulate_lidar_noise(
     else:
         keep_mask = np.ones(N, dtype=bool)
 
-    # ===================================================================
     # 5. 边缘混合效应 (Edge Mixing) — P2-3 修复
-    # ===================================================================
     if enable_edge_mixing and len(pts_noisy) > 10:
         n_mixed = max(1, int(len(pts_noisy) * mixed_pixel_prob))
 
@@ -1859,12 +1736,10 @@ def simulate_lidar_noise(
                 cur = curvature[keep_mask]
             else:
                 cur = curvature
-            # 高曲率区域的索引（top-n by curvature magnitude）
+            # 高曲率区域的索引
             cur_abs = np.abs(cur)
-            # 筛选曲率大于阈值的候选点
             edge_candidates = np.where(cur_abs > curvature_threshold * np.std(cur_abs))[0]
             if len(edge_candidates) > n_mixed:
-                # 在高曲率点中随机选择
                 mixed_idx = rng.choice(edge_candidates, size=n_mixed, replace=False)
             elif len(edge_candidates) > 0:
                 mixed_idx = edge_candidates
@@ -1885,31 +1760,19 @@ def simulate_lidar_noise(
     return pts_noisy
 
 
-# ===========================================================================
 # __main__ — 自检脚本 (测试所有 11 个函数)
-# ===========================================================================
 
 if __name__ == "__main__":
-    """自检：验证所有 11 个基元函数的输出形状和标签范围。"""
-    print("=" * 72)
-    print("  RoadMC Primitives Self-Test")
-    print("  验证 11 个数学与力学基元函数")
-    print("=" * 72)
-
     seed = 42
     passed = 0
     total = 11
 
-    # 小尺寸测试参数
     test_width = 0.5
     test_length = 0.5
-    test_grid_res = 0.02  # 粗网格加速测试
+    test_grid_res = 0.02
     expected_N = int(test_width / test_grid_res) * int(test_length / test_grid_res)
 
-    # ===================================================================
-    # 测试 1: generate_road_surface
-    # ===================================================================
-    print("\n[Test 1/11] generate_road_surface ...")
+    print("\n[1/11] generate_road_surface ...", end=" ")
     try:
         pts, nrm = generate_road_surface(
             width=test_width, length=test_length, grid_res=test_grid_res,
@@ -1918,22 +1781,17 @@ if __name__ == "__main__":
         N_actual = pts.shape[0]
         assert pts.shape == (N_actual, 3), f"points shape: {pts.shape}"
         assert nrm.shape == (N_actual, 3), f"normals shape: {nrm.shape}"
-        # 法向量应为单位向量
         normal_norms = np.linalg.norm(nrm, axis=1)
         assert np.allclose(normal_norms, 1.0, atol=1e-6), (
             f"Normals not unit: max dev={np.max(np.abs(normal_norms - 1.0))}"
         )
         assert np.all(np.isfinite(pts)), "Non-finite points detected"
-        print(f"  [PASS] points={pts.shape}, normals={nrm.shape}, "
-              f"z=[{np.min(pts[:,2]):.6f}, {np.max(pts[:,2]):.6f}]")
+        print(f"OK (N={N_actual})")
         passed += 1
     except Exception as e:
-        print(f"  [FAIL] {e}")
+        print(f"FAIL: {e}")
 
-    # ===================================================================
-    # 测试 2: add_micro_texture
-    # ===================================================================
-    print("\n[Test 2/11] add_micro_texture ...")
+    print("\n[2/11] add_micro_texture ...", end=" ")
     try:
         pts, nrm = generate_road_surface(test_width, test_length, test_grid_res,
                                          seed=seed)
@@ -1943,16 +1801,12 @@ if __name__ == "__main__":
         assert pts2.shape == pts.shape, f"shape mismatch: {pts2.shape} vs {pts.shape}"
         assert nrm2.shape == nrm.shape, "normal shape mismatch"
         assert np.all(np.isfinite(pts2)), "Non-finite points"
-        print(f"  [PASS] points={pts2.shape}, "
-              f"z=[{np.min(pts2[:,2]):.6f}, {np.max(pts2[:,2]):.6f}]")
+        print("OK")
         passed += 1
     except Exception as e:
-        print(f"  [FAIL] {e}")
+        print(f"FAIL: {e}")
 
-    # ===================================================================
-    # 测试 3: add_crack (4 种类型)
-    # ===================================================================
-    print("\n[Test 3/11] add_crack ...")
+    print("\n[3/11] add_crack ...", end=" ")
     try:
         pts, nrm = generate_road_surface(test_width, test_length, test_grid_res,
                                          seed=seed)
@@ -1969,21 +1823,17 @@ if __name__ == "__main__":
                 assert pts_c.shape == pts.shape
                 assert lbl_c.shape == lbl.shape
                 assert lbl_c.dtype == lbl.dtype
-                # 检查标签范围
                 unique_labels = np.unique(lbl_c)
                 for ul in unique_labels:
                     if ul > 0:
                         assert 1 <= ul <= 8, f"Label {ul} out of range [1, 8]"
 
-        print("  [PASS] All 4 crack types × 2 severities tested")
+        print("OK (4 types × 2 severities)")
         passed += 1
     except Exception as e:
-        print(f"  [FAIL] {e}")
+        print(f"FAIL: {e}")
 
-    # ===================================================================
-    # 测试 4: add_pothole
-    # ===================================================================
-    print("\n[Test 4/11] add_pothole ...")
+    print("\n[4/11] add_pothole ...", end=" ")
     try:
         pts, nrm = generate_road_surface(test_width, test_length, test_grid_res,
                                          seed=seed)
@@ -1997,36 +1847,29 @@ if __name__ == "__main__":
         )
         assert pts_p.shape == pts.shape
         assert lbl_p.shape == lbl.shape
-        # 验证标签
         assert 9 in np.unique(lbl_p) or np.all(lbl_p == 0), (
             f"Expected label 9, got {np.unique(lbl_p)}"
         )
-        # 验证深度变化
         z_diff = pts_p[:, 2] - pts[:, 2]
         assert np.all(z_diff <= 0 + 1e-10), "Pothole should only lower points"
 
-        # 重度坑槽
         pts_p2, lbl_p2 = add_pothole(
             pts, lbl, center=(cx, cy), radius=0.08, depth=0.04,
             edge_quality=0.5, severity="severe", seed=seed,
         )
         assert 10 in np.unique(lbl_p2) or np.all(lbl_p2 == 0)
 
-        print("  [PASS] Light(label=9) and Severe(label=10) potholes")
+        print("OK (light=9, severe=10)")
         passed += 1
     except Exception as e:
-        print(f"  [FAIL] {e}")
+        print(f"FAIL: {e}")
 
-    # ===================================================================
-    # 测试 5: add_raveling
-    # ===================================================================
-    print("\n[Test 5/11] add_raveling ...")
+    print("\n[5/11] add_raveling ...", end=" ")
     try:
         pts, nrm = generate_road_surface(test_width, test_length, test_grid_res,
                                          seed=seed)
         lbl = np.zeros(pts.shape[0], dtype=np.int64)
 
-        # 创建区域掩码 (右侧一半区域)
         region_mask = pts[:, 0] > test_width / 2.0
 
         pts_r, lbl_r = add_raveling(
@@ -2034,24 +1877,19 @@ if __name__ == "__main__":
         )
         assert pts_r.shape == pts.shape
         assert lbl_r.shape == lbl.shape
-        # 检查标签
         unique_lbl = np.unique(lbl_r)
         assert 0 in unique_lbl, "Background points should remain label 0"
         assert 11 in unique_lbl or np.any(lbl_r[region_mask] == 11), (
             "Raveling region should have label 11"
         )
 
-        # 验证移除点 (NaN)
         n_nan = np.sum(np.any(np.isnan(pts_r), axis=1))
-        print(f"  [PASS] Light raveling: {n_nan} NaN points (removed)")
+        print(f"OK ({n_nan} NaN points)")
         passed += 1
     except Exception as e:
-        print(f"  [FAIL] {e}")
+        print(f"FAIL: {e}")
 
-    # ===================================================================
-    # 测试 6: add_depression
-    # ===================================================================
-    print("\n[Test 6/11] add_depression ...")
+    print("\n[6/11] add_depression ...", end=" ")
     try:
         pts, nrm = generate_road_surface(test_width, test_length, test_grid_res,
                                          seed=seed)
@@ -2065,22 +1903,18 @@ if __name__ == "__main__":
         assert pts_d.shape == pts.shape
         assert lbl_d.shape == lbl.shape
         z_diff = pts_d[:, 2] - pts[:, 2]
-        # 中心应沉陷最多
         center_d = np.argmin((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2)
         assert z_diff[center_d] < -0.01, (
             f"Center depression too shallow: {z_diff[center_d]}"
         )
         assert np.max(np.abs(z_diff)) <= 0.02 + 1e-6
 
-        print(f"  [PASS] Depression depth range: [{np.min(z_diff):.6f}, {np.max(z_diff):.6f}]")
+        print("OK")
         passed += 1
     except Exception as e:
-        print(f"  [FAIL] {e}")
+        print(f"FAIL: {e}")
 
-    # ===================================================================
-    # 测试 7: add_rutting
-    # ===================================================================
-    print("\n[Test 7/11] add_rutting ...")
+    print("\n[7/11] add_rutting ...", end=" ")
     try:
         pts, nrm = generate_road_surface(test_width, test_length, test_grid_res,
                                          seed=seed)
@@ -2094,10 +1928,8 @@ if __name__ == "__main__":
         assert pts_ru.shape == pts.shape
         assert lbl_ru.shape == lbl.shape
         z_diff = pts_ru[:, 2] - pts[:, 2]
-        # 双轮迹叠加 + 纵向调制，最大深度 ≈ depth × (1 + ε)
         assert np.max(np.abs(z_diff)) <= 0.015 * 1.5 + 1e-6
 
-        # 重度车辙
         pts_ru2, lbl_ru2 = add_rutting(
             pts, lbl, center_line=test_width / 2.0,
             wheel_separation=0.2, depth=0.03, width=0.08,
@@ -2106,15 +1938,12 @@ if __name__ == "__main__":
         z_diff2 = pts_ru2[:, 2] - pts[:, 2]
         assert np.any(z_diff2 < -0.015)
 
-        print(f"  [PASS] Rutting depth range: [{np.min(z_diff):.6f}, {np.max(z_diff):.6f}]")
+        print("OK")
         passed += 1
     except Exception as e:
-        print(f"  [FAIL] {e}")
+        print(f"FAIL: {e}")
 
-    # ===================================================================
-    # 测试 8: add_corrugation
-    # ===================================================================
-    print("\n[Test 8/11] add_corrugation ...")
+    print("\n[8/11] add_corrugation ...", end=" ")
     try:
         pts, nrm = generate_road_surface(test_width, test_length, test_grid_res,
                                          seed=seed)
@@ -2127,10 +1956,8 @@ if __name__ == "__main__":
         assert pts_c.shape == pts.shape
         assert lbl_c.shape == lbl.shape
         z_diff = pts_c[:, 2] - pts[:, 2]
-        # 振幅应约为 0.015
         assert np.max(np.abs(z_diff)) <= 0.015 + 1e-6
 
-        # 横向波纹
         pts_c2, lbl_c2 = add_corrugation(
             pts, lbl, direction="transverse",
             wavelength=0.1, amplitude=0.02, severity="severe", seed=seed,
@@ -2138,15 +1965,12 @@ if __name__ == "__main__":
         z_diff2 = pts_c2[:, 2] - pts[:, 2]
         assert np.any(np.abs(z_diff2) > 0.015)
 
-        print(f"  [PASS] Corrugation amplitude: [{np.min(z_diff):.6f}, {np.max(z_diff):.6f}]")
+        print("OK")
         passed += 1
     except Exception as e:
-        print(f"  [FAIL] {e}")
+        print(f"FAIL: {e}")
 
-    # ===================================================================
-    # 测试 9: add_bleeding
-    # ===================================================================
-    print("\n[Test 9/11] add_bleeding ...")
+    print("\n[9/11] add_bleeding ...", end=" ")
     try:
         pts, nrm = generate_road_surface(test_width, test_length, test_grid_res,
                                          seed=seed)
@@ -2158,16 +1982,12 @@ if __name__ == "__main__":
         assert np.all(lbl_b[region] == 19), "Bleeding region should be label 19"
         assert np.all(lbl_b[~region] == 0), "Background should remain label 0"
 
-        # 验证几何未改变
-        print(f"  [PASS] Bleeding labels: {np.unique(lbl_b, return_counts=True)}")
+        print("OK")
         passed += 1
     except Exception as e:
-        print(f"  [FAIL] {e}")
+        print(f"FAIL: {e}")
 
-    # ===================================================================
-    # 测试 10: add_concrete_damage
-    # ===================================================================
-    print("\n[Test 10/11] add_concrete_damage ...")
+    print("\n[10/11] add_concrete_damage ...", end=" ")
     try:
         pts, nrm = generate_road_surface(test_width, test_length, test_grid_res,
                                          pavement_type="concrete", seed=seed)
@@ -2199,15 +2019,12 @@ if __name__ == "__main__":
                         f"{dtype}: label {ul} out of concrete range [21, 36]"
                     )
 
-        print("  [PASS] All 10 concrete damage types tested")
+        print("OK (10 types)")
         passed += 1
     except Exception as e:
-        print(f"  [FAIL] {e}")
+        print(f"FAIL: {e}")
 
-    # ===================================================================
-    # 测试 11: simulate_lidar_noise
-    # ===================================================================
-    print("\n[Test 11/11] simulate_lidar_noise ...")
+    print("\n[11/11] simulate_lidar_noise ...", end=" ")
     try:
         pts, nrm = generate_road_surface(test_width, test_length, test_grid_res,
                                          seed=seed)
@@ -2215,7 +2032,6 @@ if __name__ == "__main__":
             pts, distance_noise_std=0.01, dropout_rate=0.05,
             angular_jitter_deg=0.01, seed=seed,
         )
-        # 有 dropout 时 N' <= N
         assert pts_noisy.shape[1] == 3
         assert pts_noisy.shape[0] <= pts.shape[0], (
             f"Noisy points {pts_noisy.shape[0]} > original {pts.shape[0]}"
@@ -2225,7 +2041,6 @@ if __name__ == "__main__":
             f"Too many points dropped: {pts_noisy.shape[0]}/{pts.shape[0]}"
         )
 
-        # 无 dropout
         pts_noisy2 = simulate_lidar_noise(
             pts, distance_noise_std=0.005, dropout_rate=0.0,
             angular_jitter_deg=0.005, seed=seed,
@@ -2234,15 +2049,12 @@ if __name__ == "__main__":
             f"Without dropout, shape should match: {pts_noisy2.shape[0]} vs {pts.shape[0]}"
         )
 
-        print(f"  [PASS] Noisy points: {pts_noisy.shape} "
-              f"(dropped {pts.shape[0] - pts_noisy.shape[0]}/{pts.shape[0]})")
+        print(f"OK (dropped {pts.shape[0] - pts_noisy.shape[0]}/{pts.shape[0]})")
         passed += 1
     except Exception as e:
-        print(f"  [FAIL] {e}")
+        print(f"FAIL: {e}")
 
-    # ===================================================================
     # 汇总
-    # ===================================================================
     print("\n" + "=" * 72)
     print(f"  结果: {passed}/{total} 测试通过")
     if passed == total:

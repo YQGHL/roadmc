@@ -1,7 +1,4 @@
-"""
-RoadMC System Architecture Diagram Generator (v7)
-Compact grid layout — no header/content overlap, minimal wasted space.
-"""
+"""RoadMC system architecture diagram generator."""
 
 import matplotlib
 matplotlib.use("Agg")
@@ -29,7 +26,7 @@ fig, ax = plt.subplots(figsize=(W, H), dpi=DPI)
 ax.set_xlim(0, W); ax.set_ylim(0, H); ax.axis("off")
 fig.patch.set_facecolor("white")
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# Helpers
 def box(x, y, w, h, fc, ec=None, lw=1.0, alpha=1.0, z=3, rnd=0.06):
     ec = ec or C["border"]
     ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle=f"round,pad=0.02,rounding_size={rnd}",
@@ -61,21 +58,15 @@ def mod(x, y, w, h, title, sub="", fc=C["data_light"], ec=None, lw=0.8):
     else:
         txt(x + w/2, y + h/2, title, fs=9, fw="bold", z=4)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# BACKGROUND
-# ═════════════════════════════════════════════════════════════════════════════
+# Background
 box(0.1, 0.1, W-0.2, H-0.2, fc=C["bg"], ec="#DEE2E6", lw=1.0, rnd=0.15, z=0)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TITLE
-# ═════════════════════════════════════════════════════════════════════════════
+# Title
 txt(W/2, 15.2, "RoadMC System Architecture", fs=18, fw="bold", z=5)
 txt(W/2, 14.8, "Physics-Simulation-Driven  ·  Math-Constraint-Enhanced  ·  Pavement Point Cloud Defect Detection",
     fs=9, c=C["text3"], z=5)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE HEADERS — text + underline (no background box)
-# ═════════════════════════════════════════════════════════════════════════════
+# Phase Headers — text + underline (no background box)
 Y_PH = 12.0   # header text center y
 ULINE = 11.65  # underline y (must be > first block top)
 
@@ -90,16 +81,12 @@ for x, w, title, sub, clr in [
     ax.plot([x + 0.1, x + w - 0.1], [ULINE, ULINE],
             color=clr, lw=2.0, solid_capstyle="round", zorder=10)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# LAYOUT CONSTANTS
-# ═════════════════════════════════════════════════════════════════════════════
+# Layout Constants
 # First block top must be BELOW underline: first_y + BH < ULINE
 BH, BG = 0.75, 0.15
 FIRST_Y = 10.8   # first block bottom y; top = 10.8 + 0.75 = 11.55 < ULINE(11.65) ✓
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 1 — Data Generation (x=0.3, w=3.4)
-# ═════════════════════════════════════════════════════════════════════════════
+# Phase 1 — Data Generation (x=0.3, w=3.4)
 p1x, p1w = 0.3, 3.4
 p1_cx = p1x + p1w/2
 
@@ -121,9 +108,7 @@ for i in range(3):
     ay = FIRST_Y - i*(BH+BG) - 0.05
     arrow(p1_cx, ay, p1_cx, ay - BG + 0.1, c=C["data"], lw=0.8)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 2 — Core Network (x=4.0, w=4.8)
-# ═════════════════════════════════════════════════════════════════════════════
+# Phase 2 — Core Network (x=4.0, w=4.8)
 p2x, p2w = 4.0, 4.8
 p2_cx = p2x + p2w/2
 
@@ -153,9 +138,7 @@ seg_y = trans_y - 1.0 - BG
 mod(p2x, seg_y, p2w, 0.65, "SegmentationHead", "FCN decoder -> (B,N,38)", C["model_light"], lw=1.2)
 arrow(p2_cx, trans_y, p2_cx, seg_y + 0.65 + 0.05, c=C["model"], lw=0.8)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 3 — GAN (x=9.0, w=4.2)
-# ═════════════════════════════════════════════════════════════════════════════
+# Phase 3 — GAN (x=9.0, w=4.2)
 p3x, p3w = 9.0, 4.2
 p3_cx = p3x + p3w/2
 
@@ -169,9 +152,7 @@ mod(p3x, gan_y3, p3w, 0.7, "GAN Loss", "WGAN-GP + ChamferDist + NormalCos", C["o
 arrow(p3_cx, gan_y1, p3_cx, gan_y1 - 0.5, c=C["inf"], lw=0.8)
 arrow(p3_cx, gan_y2, p3_cx, gan_y2 - 0.5, c=C["inf_light"], lw=0.8)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 4 — Data Loading (x=13.5, w=4.0)
-# ═════════════════════════════════════════════════════════════════════════════
+# Phase 4 — Data Loading (x=13.5, w=4.0)
 p4x, p4w = 13.5, 4.0
 p4_cx = p4x + p4w/2
 
@@ -188,9 +169,7 @@ for i in range(3):
     ay = FIRST_Y - i*(BH+BG) - 0.05
     arrow(p4_cx, ay, p4_cx, ay - BG + 0.1, c=C["opt"], lw=0.8)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CROSS-PHASE ARROWS
-# ═════════════════════════════════════════════════════════════════════════════
+# Cross-Phase Arrows
 # P1→P4 (route between underline and first block)
 route_y = ULINE - 0.05  # 11.6
 ax.annotate("", xy=(p4x, route_y), xytext=(p1x+p1w, route_y),
@@ -216,14 +195,10 @@ DIVIDER_Y = 5.5
 arrow(p2_cx, seg_y, p2_cx, DIVIDER_Y + 0.3, c=C["model"], lw=1.3, z=5)
 label(p2_cx + 0.8, seg_y - 0.5, "logits (B,N,38)", fs=7, bg=C["model_bg"])
 
-# ═════════════════════════════════════════════════════════════════════════════
-# DIVIDER
-# ═════════════════════════════════════════════════════════════════════════════
+# Divider
 ax.plot([0.3, W-0.3], [DIVIDER_Y, DIVIDER_Y], color=C["divider"], lw=1.2, ls="--", zorder=1, alpha=0.6)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 5 — Training (bottom-left)
-# ═════════════════════════════════════════════════════════════════════════════
+# Phase 5 — Training (bottom-left)
 box(0.3, 0.5, 9.8, 4.5, fc=C["opt_bg"], ec=C["opt"], lw=1.5, alpha=0.25, rnd=0.12, z=1)
 txt(5.2, 4.75, "Phase 5: Training & Evaluation", fs=12, fw="bold", c=C["opt"], z=5)
 
@@ -249,9 +224,7 @@ txt(5.2, 1.6, "Optimizer: AdamW (lr=1e-4) + CosineAnnealingLR  |  Metrics: macro
 
 txt(5.2, 1.0, "evaluate.py: per-class IoU / recall / precision  |  asphalt [1-20] / concrete [21-37]", fs=6.5, c=C["text3"], z=4)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# INFERENCE PIPELINE (bottom-right)
-# ═════════════════════════════════════════════════════════════════════════════
+# Inference Pipeline (bottom-right)
 box(10.5, 0.5, 6.8, 4.5, fc=C["inf_bg"], ec=C["inf"], lw=1.5, alpha=0.25, rnd=0.12, z=1)
 txt(13.9, 4.75, "Real Data Inference Pipeline", fs=12, fw="bold", c=C["inf"], z=5)
 
@@ -274,9 +247,7 @@ for i, (clr, nm) in enumerate([(C["data"],"Data"),(C["model"],"Model"),(C["opt"]
     txt(lx+i*1.6+0.3, ly+0.5, nm, fs=6, c=C["text2"], ha="left", z=5)
 txt(icx, ly+0.2, "solid=flow  dashed=adapt", fs=6, c=C["text2"], z=5)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# GAN→P5 COUPLING ARROWS
-# ═════════════════════════════════════════════════════════════════════════════
+# GAN→P5 Coupling Arrows
 ax.annotate("", xy=(3.5, 3.8), xytext=(p3x, gan_y2),
             arrowprops=dict(arrowstyle="->", color=C["inf"], lw=1.0,
                             connectionstyle="arc3,rad=-0.3", linestyle="dashed",
@@ -289,15 +260,11 @@ ax.annotate("", xy=(6.5, 3.8), xytext=(p3x+2, gan_y2),
                             shrinkA=4, shrinkB=4), zorder=5)
 label(8.5, 6.3, "alternating opt", fs=6.5, c=C["opt"], bg=C["opt_bg"])
 
-# ═════════════════════════════════════════════════════════════════════════════
-# FOOTNOTES
-# ═════════════════════════════════════════════════════════════════════════════
+# Footnotes
 txt(0.3, 0.2, "mHC = Manifold Hyper-Connection  |  JTG 5210-2018 = Highway Technical Condition Evaluation Standard",
     fs=5.5, c=C["text3"], ha="left", va="bottom", z=5)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SAVE
-# ═════════════════════════════════════════════════════════════════════════════
+# Save
 plt.savefig("docs/architecture.png", dpi=DPI, bbox_inches="tight",
             facecolor="white", edgecolor="none", pad_inches=0.1)
-print(f"[PASS] docs/architecture.png generated ({DPI} dpi, {W}x{H})")
+print(f"docs/architecture.png generated ({DPI} dpi, {W}x{H})")

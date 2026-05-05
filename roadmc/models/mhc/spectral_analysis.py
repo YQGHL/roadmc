@@ -10,36 +10,23 @@ import torch
 
 
 class SpectralAnalyzer:
-    """Analyze MHC matrices for spectral properties.
+    """Analyze MHC matrices for spectral contractive properties.
 
-    Provides:
-    1. Spectral norm verification (largest singular value ≤ 1)
-    2. Cascade stability: simulate 60-layer propagation
-    3. Birkhoff polytope membership test
+    Spectral norm verification, 60-layer cascade stability simulation,
+    and Birkhoff polytope membership test.
     """
 
     @staticmethod
     def spectral_norm(H: torch.Tensor) -> torch.Tensor:
-        """Compute the spectral norm (largest singular value) of matrix H.
-
-        For doubly stochastic H, this should be ≤ 1 + 1e-6.
-
-        Args:
-            H: (C, C) matrix.
-
-        Returns:
-            Scalar tensor: σ_max(H).
+        """Compute spectral norm (largest singular value) of H.
+        For doubly stochastic H, should be ≤ 1 + 1e-6.
         """
-        svals = torch.linalg.svdvals(H)  # (C,)
+        svals = torch.linalg.svdvals(H)
         return svals.max()
 
     @staticmethod
     def verify_doubly_stochastic(H: torch.Tensor, tol: float = 1e-4) -> dict[str, float]:
-        """Verify H satisfies doubly stochastic properties.
-
-        Returns:
-            Dict with 'row_err', 'col_err', 'min_entry', 'spectral_norm'.
-        """
+        """Verify H satisfies row-sum=1, col-sum=1, non-negativity, and spectral norm ≤ 1."""
         row_sum = H.sum(dim=1)
         col_sum = H.sum(dim=0)
         return {
@@ -55,22 +42,11 @@ class SpectralAnalyzer:
         depth: int = 60,
         n_samples: int = 100,
     ) -> dict[str, float]:
-        """Simulate repeated application of H, tracking energy ratio.
+        """Simulate repeated application of H on random residuals, tracking energy ratio.
 
-        Given H ∈ ℝ^(C×C), simulate:
-          x_{k+1} = x_k + H @ r_k
-
-        where r_k are random residuals. Track ‖x_k‖ / ‖x_0‖ through depth layers.
-
-        For stable systems, the energy ratio should remain bounded (≤ some constant).
-
-        Args:
-            H: (C, C) doubly stochastic matrix.
-            depth: number of cascade steps.
-            n_samples: number of random trials.
-
-        Returns:
-            Dict with 'max_ratio', 'min_ratio', 'final_ratio'.
+        Given H ∈ ℝ^(C×C), simulate x_{k+1} = x_k + H @ r_k where r_k are random
+        residuals. Tracks ‖x_k‖ / ‖x_0‖ through depth layers. For stable systems,
+        the energy ratio should remain bounded.
         """
         C = H.shape[0]
         ratios = []
@@ -126,7 +102,7 @@ if __name__ == "__main__":
     assert cascade["max_ratio"] < 50, f"Energy ratio too high: {cascade}"
 
     print(
-        f"[PASS] SpectralAnalyzer: norm={stats['spectral_norm']:.6f}, "
+        f"SpectralAnalyzer: norm={stats['spectral_norm']:.6f}, "
         f"row_err={stats['row_err']:.2e}, "
         f"cascade_ratio={cascade['avg_ratio']:.2f}±{cascade['std_ratio']:.2f}"
     )

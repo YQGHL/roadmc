@@ -36,9 +36,6 @@ def generate_dataset(
 ) -> Dict:
     """Generate and save a dataset split.
 
-    Uses SyntheticRoadDataset.generate_scene() to generate each scene,
-    then saves to .npz files.
-
     Args:
         count: Number of scenes to generate.
         config: Generator configuration.
@@ -86,7 +83,7 @@ def generate_dataset(
             normals = scene["normals"]
             pavement_type = scene["pavement_type"]
 
-            # Filter out any remaining NaN points (shouldn't happen but safety check)
+            # Safety filter for remaining NaN points
             valid_mask = ~np.any(np.isnan(points), axis=1)
             points = points[valid_mask]
             normals = normals[valid_mask]
@@ -142,8 +139,6 @@ def generate_dataset(
 
 def verify_class_distribution(output_dir: Path, split: str) -> Dict[int, int]:
     """Verify class distribution in generated data.
-
-    Prints statistics about how many samples contain each disease type.
 
     Args:
         output_dir: Output directory.

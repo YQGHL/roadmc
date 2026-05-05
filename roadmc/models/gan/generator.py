@@ -24,19 +24,12 @@ from torch import nn as nn
 class EdgeConv(nn.Module):
     """Edge convolution: aggregate features from k-NN neighbors.
 
-    For each point i, we find its k nearest neighbors (in coordinate space),
-    construct edge features as ``cat([x_i, x_j - x_i])``, apply an MLP,
-    and max-pool over the k neighbors.
+    For each point i, find k nearest neighbors (in coordinate space),
+    construct edge features as ``cat([x_i, x_j - x_i])``, apply MLP,
+    max-pool over neighbors.
 
     **Memory warning**: ``torch.cdist`` computes O(N²) pairwise distances.
-    At N=65536 (default config), this requires ~17 GB per sample.
-    For production use, consider random downsampling before the GAN,
-    or limit input N to ≤ 8192.
-
-    Args:
-        in_channels: Number of input feature channels.
-        out_channels: Number of output feature channels.
-        k: Number of nearest neighbors.
+    At N=65536 (default config), ~17 GB per sample. Limit input N ≤ 8192.
     """
 
     def __init__(self, in_channels: int, out_channels: int, k: int = 16) -> None:
@@ -53,16 +46,7 @@ class EdgeConv(nn.Module):
         x: torch.Tensor,
         coords: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: Input features, shape ``(B, C_in, N)``.
-            coords: Coordinate space for k-NN, shape ``(B, 3, N)``.
-                Typically ``syn_points.transpose(1, 2)``.
-
-        Returns:
-            Aggregated features, shape ``(B, C_out, N)``.
-        """
+        """Forward pass: k-NN gather → edge features → MLP → max-pool."""
         B, C, N = x.shape
         k = min(self.k, max(N - 1, 1))  # handle tiny point clouds
 
@@ -140,15 +124,7 @@ class StyleTransferGen(nn.Module):
         syn_points: torch.Tensor,
         syn_normals: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            syn_points:  (B, N, 3) point coordinates.
-            syn_normals: (B, N, 3) unit normals.
-
-        Returns:
-            (B, N, 6) residuals.
-        """
+        """Forward pass: concat points+normals → 3 EdgeConv stages → decoder."""
         x = torch.cat([syn_points, syn_normals], dim=-1)     # (B, N, 6)
         x = x.transpose(1, 2)                                 # (B, 6, N)
 
@@ -165,9 +141,6 @@ class StyleTransferGen(nn.Module):
         return x
 
 
-# ====================================================================
-# Self-test
-# ====================================================================
 if __name__ == "__main__":
     import sys
     from pathlib import Path
@@ -196,7 +169,7 @@ if __name__ == "__main__":
     assert not params_no_grad, f"Params without gradient: {params_no_grad}"
 
     print(
-        f"[PASS] StyleTransferGen: "
+        f"StyleTransferGen: "
         f"output={out.shape}, "
         f"params={sum(p.numel() for p in gen.parameters())}"
     )

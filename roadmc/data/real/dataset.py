@@ -60,10 +60,8 @@ class RealRoadDataset(Dataset):
             normals: (N, 3) float32 (zeros if not available)
             intensities: (N,) float32 (zeros if not available)
         """
-        # Try loading .ply
         points, labels, normals, intensities = self._load_file(self.files[idx])
 
-        # Subsample if too large
         if self.max_points is not None and points.shape[0] > self.max_points:
             idx_keep = np.random.choice(points.shape[0], self.max_points, replace=False)
             points = points[idx_keep]
@@ -71,7 +69,6 @@ class RealRoadDataset(Dataset):
             normals = normals[idx_keep] if normals is not None else None
             intensities = intensities[idx_keep] if intensities is not None else None
 
-        # Normalize
         if self.normalize:
             centroid = np.mean(points, axis=0)
             points = points - centroid
@@ -112,7 +109,6 @@ class RealRoadDataset(Dataset):
                 has_intensity = "property float intensity" in header or \
                                 "property uchar intensity" in header
 
-                # Use numpy to load ply
                 data = np.genfromtxt(filepath, skip_header=self._ply_header_lines(filepath),
                                      dtype=np.float32, max_rows=1000000)
                 if data.shape[1] >= 3:

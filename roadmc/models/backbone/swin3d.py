@@ -38,16 +38,7 @@ class Stage(nn.Module):
     def forward(
         self, coords: torch.Tensor, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass.
-
-        Args:
-            coords: (B, N, 3) point coordinates.
-            x: (B, N, C_in) input features.
-
-        Returns:
-            x:   (B, N, C_out) features after blocks + downsample.
-            skip: (B, N, C_in)  features after blocks, before downsample.
-        """
+        """Forward pass: blocks → downsample, returning both output and skip."""
         for block in self.blocks:
             x = block(coords, x)
         skip = x
@@ -96,34 +87,23 @@ class SegmentationHead(nn.Module):
     def forward(
         self, features: List[torch.Tensor], coords: torch.Tensor
     ) -> torch.Tensor:
-        """Forward pass.
+        """Multi-scale feature fusion: f3→f2→f1→f0 merge chain → per-point logits.
 
-        Args:
-            features: [stage0, stage1, stage2, stage3] features
-                      at channel dims [C0, C1, C2, C3].
-            coords:   (B, N, 3) point coordinates (reserved for future
-                      position-aware decoding; currently unused).
-
-        Returns:
-            (B, N, num_classes) per-point logits.
+        ``coords`` reserved for future position-aware decoding; currently unused.
         """
         f0, f1, f2, f3 = features
 
-        # Stage 3 → Stage 2
-        x = self.merge3(f3)              # C3 → C2
-        x = torch.cat([x, f2], dim=-1)   # 2×C2
-        x = self.fuse3(x)                # 2×C2 → C1
+        x = self.merge3(f3)
+        x = torch.cat([x, f2], dim=-1)
+        x = self.fuse3(x)
 
-        # Stage 1
-        x = torch.cat([x, f1], dim=-1)   # 2×C1
-        x = self.fuse2(x)                # 2×C1 → C0
+        x = torch.cat([x, f1], dim=-1)
+        x = self.fuse2(x)
 
-        # Stage 0
-        x = torch.cat([x, f0], dim=-1)   # 2×C0
-        x = self.fuse1(x)                # 2×C0 → C0
+        x = torch.cat([x, f0], dim=-1)
+        x = self.fuse1(x)
 
-        # Classification
-        x = self.cls_head(x)             # C0 → num_classes
+        x = self.cls_head(x)
 
         return x
 
@@ -172,18 +152,16 @@ class Swin3D(nn.Module):
         # Channels per stage: [C0, C1, C2, C3]
         channels = [embed_dim * (2 ** i) for i in range(4)]
 
-        # ── Patch Embedding ──────────────────────────────────────────
         self.patch_embed = nn.Sequential(
             nn.Linear(in_channels + 3, embed_dim),
             nn.LayerNorm(embed_dim),
         )
 
-        # ── Stages ───────────────────────────────────────────────────
         self.stages = nn.ModuleList()
         for i in range(4):
             blocks: List[ShiftedWindowTransformerBlock] = []
             for j in range(depths[i]):
-                shift = (j % 2 == 0)  # even → shifted window, odd → regular
+                shift = (j % 2 == 0)
                 blocks.append(
                     ShiftedWindowTransformerBlock(
                         dim=channels[i],
@@ -203,24 +181,14 @@ class Swin3D(nn.Module):
 
             self.stages.append(Stage(blocks, downsample))
 
-        # ── Segmentation Head ────────────────────────────────────────
         self.decode = SegmentationHead(channels, num_classes)
 
     def forward(
         self, coords: torch.Tensor, feats: torch.Tensor
     ) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            coords: (B, N, 3) point coordinates.
-            feats:  (B, N, in_channels) input features
-                    (e.g. [intensity, curvature, crack_boundary_dist]).
-
-        Returns:
-            (B, N, num_classes) per-point logits.
-        """
-        x = torch.cat([coords, feats], dim=-1)   # (B, N, 3 + in_channels)
-        x = self.patch_embed(x)                   # (B, N, C0)
+        """Patch embed → 4 stages (collect skip features) → decode."""
+        x = torch.cat([coords, feats], dim=-1)
+        x = self.patch_embed(x)
 
         skip_features: List[torch.Tensor] = []
         for stage in self.stages:
@@ -273,9 +241,9 @@ if __name__ == "__main__":
     )
 
     param_count = sum(p.numel() for p in model.parameters())
-    print(f"[PASS] Swin3D: output={logits.shape}, params={param_count}")
+    print(f"Swin3D: output={logits.shape}, params={param_count}")
 
     # Test 4: forward pass consistency (deterministic)
     logits2 = model(coords, feats)
     assert torch.allclose(logits, logits2, atol=1e-5), "Non-deterministic output"
-    print("[PASS] Swin3D: deterministic forward pass")
+    print("Swin3D: deterministic forward pass")

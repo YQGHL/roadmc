@@ -1,4 +1,4 @@
-"""RoadMC Data Loading Module �?Lightweight PyTorch Dataset + Lightning DataModule.
+"""RoadMC Data Loading Module  - Lightweight PyTorch Dataset + Lightning DataModule.
 
 Supports:
 - Synthetic .npz data loading
@@ -21,12 +21,6 @@ class SyntheticPointCloudDataset(Dataset):
     """PyTorch Dataset for synthetic road point cloud .npz files.
 
     Each .npz file contains one scene with points, labels, feats, normals.
-
-    Args:
-        data_dir: Directory containing split subdirectory (train/val/test).
-        split: 'train' or 'val' or 'test'.
-        max_points: Maximum points per scene (None = keep all).
-        augment: Whether to apply data augmentation.
     """
 
     def __init__(
@@ -49,12 +43,7 @@ class SyntheticPointCloudDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Load a single scene.
-
-        Returns:
-            dict with keys: 'coords' (N,3), 'feats' (N,3),
-            'labels' (N,), 'normals' (N,3)
-        """
+        """Load a single scene."""
         data = np.load(self.files[idx], allow_pickle=True)
 
         coords = torch.from_numpy(data["points"]).float()
@@ -62,7 +51,6 @@ class SyntheticPointCloudDataset(Dataset):
         feats = torch.from_numpy(data["feats"]).float()
         normals = torch.from_numpy(data["normals"]).float()
 
-        # Subsample if too large
         if self.max_points is not None and coords.shape[0] > self.max_points:
             idx_keep = torch.randperm(coords.shape[0])[:self.max_points]
             coords = coords[idx_keep]
@@ -85,27 +73,16 @@ def _augment_point_cloud(
     coords: torch.Tensor,
     normals: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply data augmentation: random rotation, translation, scaling.
-
-    Args:
-        coords: (N, 3) point coordinates.
-        normals: (N, 3) unit normals.
-
-    Returns:
-        Augmented (coords, normals).
-    """
-    # Random rotation around Z axis (yaw)
+    """Apply data augmentation: random rotation, translation, scaling."""
     angle = torch.rand(1).item() * 2 * torch.pi
     c, s = float(torch.cos(torch.tensor(angle))), float(torch.sin(torch.tensor(angle)))
     rot_z = torch.tensor([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
     coords = coords @ rot_z.T
     normals = normals @ rot_z.T
 
-    # Random translation (±0.2m)
     translation = torch.randn(3) * 0.2
     coords = coords + translation
 
-    # Random scaling (0.8-1.2)
     scale = 0.8 + torch.rand(1) * 0.4
     coords = coords * scale
 
@@ -154,14 +131,7 @@ def collate_pointcloud_batch(
 
 
 class RoadMCDataModule(pl.LightningDataModule):
-    """Lightning DataModule for RoadMC point cloud data.
-
-    Args:
-        data_dir: Path to synthetic data directory (with train/val subdirs).
-        batch_size: Batch size.
-        max_points: Max points per scene (default 65536).
-        num_workers: DataLoader workers.
-    """
+    """Lightning DataModule for RoadMC point cloud data."""
 
     def __init__(
         self,
@@ -251,13 +221,13 @@ if __name__ == '__main__':
         sample = dataset[0]
         assert sample["coords"].shape[-1] == 3
         assert sample["labels"].ndim == 1
-        print(f"[PASS] Dataset loaded: {len(dataset)} files, sample coords={sample['coords'].shape}")
+        print(f"Dataset loaded: {len(dataset)} files, sample coords={sample['coords'].shape}")
 
         # Test DataModule
         dm = RoadMCDataModule(data_dir=tmpdir, batch_size=2, max_points=1024)
         dm.setup("fit")
         batch = next(iter(dm.train_dataloader()))
         assert batch["coords"].shape[0] == 2, f"Batch size wrong: {batch['coords'].shape}"
-        print(f"[PASS] DataModule: batch coords={batch['coords'].shape}, labels={batch['labels'].shape}")
+        print(f"DataModule: batch coords={batch['coords'].shape}, labels={batch['labels'].shape}")
 
-    print("[PASS] All DataLoader tests passed.")
+    print("All DataLoader tests passed.")

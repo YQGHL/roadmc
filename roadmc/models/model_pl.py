@@ -11,11 +11,6 @@ import pytorch_lightning as pl
 from typing import Optional, Tuple
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Loss Functions
-# ═══════════════════════════════════════════════════════════════════════
-
-
 class FocalLoss(nn.Module):
     """Focal Loss: -α(1-p_t)^γ log(p_t)
 
@@ -34,15 +29,7 @@ class FocalLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor,
                 valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Compute focal loss with optional ignore_index masking.
-
-        Args:
-            logits: (B, N, C) raw scores.
-            targets: (B, N) integer labels in [0, C-1]. -1 values are ignored.
-            valid_mask: optional (B, N) bool mask. True = valid.
-
-        Returns:
-            Scalar focal loss.
+        """Compute focal loss with optional valid_mask masking. -1 target values are ignored.
         """
         if valid_mask is not None:
             logits = logits[valid_mask]
@@ -87,15 +74,7 @@ class DiceLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor,
                 valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Compute dice loss (vectorized, L2 fix), with optional ignore_index masking.
-
-        Args:
-            logits: (B, N, C) raw scores.
-            targets: (B, N) integer labels in [0, C-1]. -1 values are ignored.
-            valid_mask: optional (B, N) bool mask. True = valid.
-
-        Returns:
-            Scalar dice loss.
+        """Compute dice loss (vectorized, L2 fix) with optional valid_mask masking. -1 target values are ignored.
         """
         if valid_mask is not None:
             logits = logits[valid_mask]
@@ -135,7 +114,6 @@ class EdgeLoss(nn.Module):
         self.sigma = sigma
         self.threshold = sigma  # crack_boundary_dist threshold
 
-        # Sobel kernels (3×3)
         sobel_x = torch.tensor(
             [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32
         ).reshape(1, 1, 3, 3)
@@ -152,13 +130,6 @@ class EdgeLoss(nn.Module):
 
         Uses ``scatter_add_`` + count tracking for per-pixel mean (not "last write wins").
         Preserves physical aspect ratio by computing grid dimensions from coordinate ranges.
-
-        Args:
-            values: (N,) per-point scalar values.
-            coords: (N, 3) point coordinates (x, y, z).
-
-        Returns:
-            (grid_size, grid_size) BEV grid.
         """
         gs = self.grid_size
         x_phys = coords[:, 0]
@@ -203,14 +174,7 @@ class EdgeLoss(nn.Module):
 
     def _sobel_edge(self, grid: torch.Tensor) -> torch.Tensor:
         """Apply Sobel filter to a 2D grid.
-
-        Args:
-            grid: (H, W) 2D grid.
-
-        Returns:
-            (H, W) edge magnitude map.
         """
-        # (1, 1, H, W) for conv2d
         grid_4d = grid.unsqueeze(0).unsqueeze(0)
         gx = F.conv2d(grid_4d, self.sobel_x, padding=1)
         gy = F.conv2d(grid_4d, self.sobel_y, padding=1)
@@ -225,17 +189,7 @@ class EdgeLoss(nn.Module):
         crack_boundary_dist: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute edge loss, with optional valid_mask to exclude padded points.
-
-        Args:
-            logits: (B, N, C) raw scores.
-            targets: (B, N) integer labels.
-            coords: (B, N, 3) point coordinates.
-            crack_boundary_dist: optional (B, N) from feats[:,:,2].
-            valid_mask: optional (B, N) bool mask, True = valid.
-
-        Returns:
-            Scalar edge loss (0 if no crack data).
+        """Compute edge loss with optional valid_mask. Returns 0 if no crack data.
         """
         B = logits.shape[0]
 
@@ -283,11 +237,6 @@ class EdgeLoss(nn.Module):
             return torch.tensor(0.0, device=logits.device, requires_grad=False)
 
         return total_loss / count
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Lightning Module
-# ═══════════════════════════════════════════════════════════════════════
 
 
 class RoadMCSegModel(pl.LightningModule):
@@ -345,27 +294,11 @@ class RoadMCSegModel(pl.LightningModule):
 
     def forward(self, coords: torch.Tensor, feats: torch.Tensor) -> torch.Tensor:
         """Forward pass through backbone.
-
-        Args:
-            coords: (B, N, 3) point coordinates.
-            feats: (B, N, in_channels) input features.
-
-        Returns:
-            (B, N, num_classes) per-point logits.
         """
         return self.backbone(coords, feats)
 
     def training_step(self, batch, batch_idx):
-        """Training step.
-
-        Accepts both dict batches (from DataLoader) and tuple batches (from self-test).
-
-        Args:
-            batch: dict with keys 'coords','feats','labels','valid_mask' or tuple.
-            batch_idx: int.
-
-        Returns:
-            Loss tensor.
+        """Training step. Accepts both dict batches (DataLoader) and tuple batches (self-test).
         """
         if isinstance(batch, dict):
             coords, feats, labels = batch["coords"], batch["feats"], batch["labels"]
@@ -389,9 +322,7 @@ class RoadMCSegModel(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation step with mIoU computation.
-
-        Accepts both dict batches (from DataLoader) and tuple batches (from self-test).
+        """Validation step with mIoU computation. Accepts both dict and tuple batches.
         """
         if isinstance(batch, dict):
             coords, feats, labels = batch["coords"], batch["feats"], batch["labels"]
@@ -437,16 +368,7 @@ class RoadMCSegModel(pl.LightningModule):
         preds: torch.Tensor, targets: torch.Tensor, num_classes: int,
         valid_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute macro mean IoU + per-class IoU, recall, precision.
-
-        Args:
-            preds: (B, N) predicted labels.
-            targets: (B, N) ground truth labels. -1 entries ignored.
-            num_classes: C.
-            valid_mask: optional (B, N) bool, True=valid.
-
-        Returns:
-            Tuple of (mIoU, per_class_IoU, per_class_recall, per_class_precision).
+        """Compute macro mean IoU + per-class IoU, recall, precision. -1 target entries ignored.
         """
         if valid_mask is not None:
             preds_flat = preds[valid_mask]
@@ -499,9 +421,6 @@ class RoadMCSegModel(pl.LightningModule):
         return miou, per_class_iou, per_class_recall, per_class_precision
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Self-test
-# ═══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import sys
     from pathlib import Path
@@ -520,25 +439,25 @@ if __name__ == "__main__":
     logits = torch.randn(B, N, 38)
     loss_f = fl(logits, labels)
     assert torch.isfinite(loss_f), "FocalLoss should be finite"
-    print(f"[PASS] FocalLoss: {loss_f.item():.4f}")
+    print(f"  FocalLoss: {loss_f.item():.4f}")
 
     # Test DiceLoss
     dl = DiceLoss()
     loss_d = dl(logits, labels)
     assert torch.isfinite(loss_d), "DiceLoss should be finite"
-    print(f"[PASS] DiceLoss: {loss_d.item():.4f}")
+    print(f"  DiceLoss: {loss_d.item():.4f}")
 
     # Test EdgeLoss (when no cracks, should be 0)
     el = EdgeLoss()
     loss_e = el(logits, labels, coords)
     assert torch.isfinite(loss_e), "EdgeLoss should be finite"
-    print(f"[PASS] EdgeLoss: {loss_e.item():.4f}")
+    print(f"  EdgeLoss: {loss_e.item():.4f}")
 
     # Test mIoU + per-class metrics
     preds = logits.argmax(dim=-1)
     miou, _, _, _ = RoadMCSegModel.compute_miou(preds, labels, 38)
     assert 0 <= miou <= 1, f"mIoU out of range: {miou}"
-    print(f"[PASS] mIoU: {miou:.4f}, per-class metrics implemented")
+    print(f"  mIoU: {miou:.4f}, per-class metrics implemented")
 
     # Test LightningModule (small config)
     model = RoadMCSegModel(
@@ -552,15 +471,15 @@ if __name__ == "__main__":
 
     loss = model.training_step(batch, 0)
     assert torch.isfinite(loss), f"Training loss NaN: {loss}"
-    print(f"[PASS] Training step: loss={loss.item():.4f}")
+    print(f"  Training step: loss={loss.item():.4f}")
 
     model.validation_step(batch, 0)
-    print("[PASS] Validation step OK")
+    print("  Validation step OK")
 
     # Test configure_optimizers
     optimizers = model.configure_optimizers()
     assert len(optimizers) >= 1
-    print(f"[PASS] Optimizer configured: {type(optimizers[0]).__name__}")
+    print(f"  Optimizer configured: {type(optimizers[0]).__name__}")
 
     print(
         f"\nAll tests passed. Parameter count: {sum(p.numel() for p in model.parameters())}"

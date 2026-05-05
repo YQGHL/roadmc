@@ -17,7 +17,6 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 
 def train_baseline(args):
-    """Train segmentation model on synthetic data."""
     from roadmc.data.dataloader import RoadMCDataModule
     from roadmc.models.model_pl import RoadMCSegModel
 
@@ -54,7 +53,6 @@ def train_baseline(args):
 
 
 def train_gan_enhanced(args):
-    """GAN pre-training → synthetic + stylized mixed training."""
     from roadmc.data.dataloader import RoadMCDataModule, collate_pointcloud_batch
     from roadmc.models.gan.discriminator import WGANDiscriminator
     from roadmc.models.gan.generator import StyleTransferGen
@@ -63,7 +61,6 @@ def train_gan_enhanced(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. Create GAN components
     gen = StyleTransferGen().to(device)
     disc = WGANDiscriminator(in_channels=6).to(device)
 
@@ -82,9 +79,9 @@ def train_gan_enhanced(args):
     g_opt = torch.optim.Adam(gen.parameters(), lr=1e-4, betas=(0.5, 0.9))
     d_opt = torch.optim.Adam(disc.parameters(), lr=1e-4, betas=(0.5, 0.9))
 
-    n_critic = 5  # discriminator updates per generator update
-    lambda_gp = 10.0  # gradient penalty coefficient
-    gan_epochs = min(args.max_epochs, 5)  # short pre-training
+    n_critic = 5
+    lambda_gp = 10.0
+    gan_epochs = min(args.max_epochs, 5)
 
     print(f"[GAN] Pre-training for {gan_epochs} epochs...")
     gen.train()
@@ -332,13 +329,13 @@ if __name__ == "__main__":
         in_channels=3, num_classes=38,
         embed_dim=48, depths=(1, 1, 2, 1), num_heads=(2, 4, 8, 16),
     )
-    print(f"[PASS] RoadMCSegModel loaded: {sum(p.numel() for p in model.parameters()):,} params")
+    print(f"RoadMCSegModel loaded: {sum(p.numel() for p in model.parameters()):,} params")
 
     gen = StyleTransferGen()
-    print(f"[PASS] StyleTransferGen loaded: {sum(p.numel() for p in gen.parameters()):,} params")
+    print(f"StyleTransferGen loaded: {sum(p.numel() for p in gen.parameters()):,} params")
 
     disc = WGANDiscriminator()
-    print(f"[PASS] WGANDiscriminator loaded: {sum(p.numel() for p in disc.parameters()):,} params")
+    print(f"WGANDiscriminator loaded: {sum(p.numel() for p in disc.parameters()):,} params")
 
     _ = SpectralAnalyzer  # verify import resolves
     _ = RoadMCDataModule  # verify import resolves

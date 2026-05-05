@@ -1,6 +1,4 @@
-"""
-RoadMC 合成数据集生成器 —— SyntheticRoadDataset.
-==================================================
+"""RoadMC 合成数据集生成器 —— SyntheticRoadDataset.
 
 组合 config.py 的配置参数和 primitives.py 的基元函数，
 生成符合 JTG 5210-2018 标准的合成道路点云数据集。
@@ -69,8 +67,6 @@ except ImportError:
         simulate_lidar_noise,
         resample_to_lidar_pattern,
     )
-
-# 常量
 
 CONCRETE_DAMAGE_TYPES: List[str] = [
     "slab_shatter",
@@ -158,11 +154,6 @@ LABEL_PRIORITY: Dict[int, int] = {
     37: 8,   # 水泥修补
 }
 
-# ===========================================================================
-# SyntheticRoadDataset
-# ===========================================================================
-
-
 class SyntheticRoadDataset(torch.utils.data.Dataset):
     """JTG 5210-2018 合成道路点云数据集。
 
@@ -190,8 +181,6 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         self.config = config
         self.dataset_size = dataset_size
 
-    # 标准 Dataset 接口
-
     def __len__(self) -> int:
         return self.dataset_size
 
@@ -205,8 +194,6 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
             "normals": torch.from_numpy(scene["normals"]).float(),
             "pavement_type": scene["pavement_type"],
         }
-
-    # 核心场景生成
 
     def generate_scene(self, idx: int) -> Dict:
         """生成一个完整的合成道路场景。
@@ -233,7 +220,7 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         Returns:
             包含 points, labels, feats, normals, pavement_type 的字典。
         """
-        # --- 种子管理 ----------------------------------------------------
+        # 种子管理
         if self.config.seed is not None:
             scene_seed = self.config.seed + idx
         else:
@@ -251,14 +238,10 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         nx = len(x_tmp)
         ny = len(y_tmp)
 
-        # ================================================================
         # 1. 路面类型选择
-        # ================================================================
         pavement_type = self._select_pavement_type(rng)
 
-        # ================================================================
         # 2. 路面宏观轮廓 + 微观纹理
-        # ================================================================
         points, normals = generate_road_surface(
             width=width,
             length=length,
@@ -278,9 +261,7 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
                 seed=int(rng.integers(0, 2 ** 31)),
             )
 
-        # ================================================================
         # 2.5 P1-1: LiDAR 扫描线密度重采样（可选）
-        # ================================================================
         if self.config.lidar_scan.enable:
             scan_idx = resample_to_lidar_pattern(
                 points,
@@ -297,9 +278,7 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
             # 更新网格尺寸（扫描线重采样改变了点数）
             nx, ny = len(x_tmp), len(y_tmp)  # 网格维度保持不变（后续重建会用）
 
-        # ================================================================
         # 3. 标签初始化 + 病害选择 & 应用
-        # ================================================================
         labels = np.zeros(points.shape[0], dtype=np.int64)
 
         diseases = self._select_diseases(rng, pavement_type)
@@ -317,7 +296,7 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
 
         for disease_type, severity in non_raveling_diseases:
             seed = int(rng.integers(0, 2 ** 31))
-            old_labels = labels.copy()  # 保存旧标签用于优先级比较
+            old_labels = labels.copy()
 
             if disease_type == "crack":
                 crack_type = str(rng.choice(self.config.crack.crack_types))
@@ -429,34 +408,26 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
                     params=params, seed=seed,
                 )
 
-            # P1-3 修复 + Q3 向量化：仅在优先级更高时保留新标签
-            # 使用 numpy 查找表替代 Python 逐点 for 循环
+            # P1-3 + Q3 向量化：仅在优先级更高时保留新标签
             changed_mask = labels != old_labels
             if np.any(changed_mask):
-                # 预构建优先级查找表
                 max_label = max(LABEL_PRIORITY.keys()) + 1
                 priority_lut = np.zeros(max_label, dtype=np.int32)
                 for k, v in LABEL_PRIORITY.items():
                     priority_lut[k] = v
-                # 向量化比较
                 old_prio = priority_lut[old_labels[changed_mask]]
                 new_prio = priority_lut[labels[changed_mask]]
                 restore = old_prio > new_prio
                 changed_indices = np.where(changed_mask)[0]
                 labels[changed_indices[restore]] = old_labels[changed_indices[restore]]
 
-        # ================================================================
-        # 4. 曲率计算 — P2-2 修复：使用 KDTree 局部邻域，解除网格顺序依赖
-        # ================================================================
+        # 4. 曲率计算 — P2-2: KDTree 局部邻域，解除网格顺序依赖
         curvature = _compute_kdtree_curvature(points, k_neighbors=20)
 
-        # ================================================================
         # 5. 应用松散 (raveling) — 产生 NaN 点
-        # ================================================================
         if raveling_entry is not None:
             disease_type, severity = raveling_entry
             seed = int(rng.integers(0, 2 ** 31))
-            # 生成随机矩形区域掩码
             x_frac_min = float(rng.uniform(0.05, 0.35))
             x_frac_max = x_frac_min + float(rng.uniform(0.2, 0.5))
             y_frac_min = float(rng.uniform(0.05, 0.35))
@@ -474,10 +445,8 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
                 region_mask=region_mask, severity=severity, seed=seed,
             )
 
-# ================================================================
         # 6. 松散标签膨胀 + NaN 点过滤
-        # ================================================================
-        # P0-3 修复：在移除 NaN 点之前，将松散标签膨胀到 NaN 点的邻域，
+        # P0-3: 在移除 NaN 点之前，将松散标签膨胀到 NaN 点的邻域，
         # 确保噪声仿真后落在原松散区域的点能获得正确的松散标签。
         raveling_labels_mask = (labels == 11) | (labels == 12)
         valid_mask = ~np.any(np.isnan(points), axis=1)
@@ -489,7 +458,6 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         if np.any(raveling_valid_mask):
             raveling_xy = points[raveling_valid_mask][:, :2]
             raveling_severity = labels[raveling_valid_mask]
-            # 有效背景点（非 NaN、非松散）
             background_valid_mask = valid_mask & ~raveling_labels_mask
             if np.any(background_valid_mask) and raveling_xy.shape[0] > 0:
                 from scipy.spatial import KDTree as _KDTree
@@ -497,13 +465,11 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
                 bg_labels = labels[background_valid_mask]
                 bg_global_idx = np.where(background_valid_mask)[0]
                 tree_dilate = _KDTree(raveling_xy)
-                dilate_radius = grid_res * 3.0  # 膨胀半径：3倍网格分辨率
-                # 查询背景点到最近的松散点距离
+                dilate_radius = grid_res * 3.0
                 nn_dist, nn_idx = tree_dilate.query(bg_xy, k=1)
-                # 距离在膨胀半径内的背景点标记为松散
                 in_dilate = nn_dist <= dilate_radius
                 for i in np.where(in_dilate)[0]:
-                    if bg_labels[i] == 0:  # 仅膨胀到背景点
+                    if bg_labels[i] == 0:
                         labels[bg_global_idx[i]] = raveling_severity[nn_idx[i]]
 
         if np.any(valid_mask):
@@ -517,15 +483,11 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         if points.shape[0] == 0:
             raise RuntimeError("Empty point cloud after NaN filtering.")
 
-        # ================================================================
         # 7. 强度反射率计算（在松散标签应用之后）
-        # P0-2 修复：移到松散应用之后，确保松散区域的标签 11/12 被正确反映
-        # ================================================================
+        # P0-2: 移到松散应用之后，确保松散区域的标签 11/12 被正确反映
         intensity = self._compute_intensity(labels, pavement_type, rng)
 
-        # ================================================================
         # 8. LiDAR 噪声仿真
-        # ================================================================
         # 保存噪声前状态以传递标签/特征
         pre_points = points.copy()
         pre_labels = labels.copy()
@@ -548,10 +510,8 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         if noisy_points.shape[0] == 0:
             raise RuntimeError("All points dropped during LiDAR noise simulation.")
 
-        # ================================================================
         # 9. 最近邻传递标签/特征/法向量（带距离阈值保护）
-        # P0-4 修复：增加距离阈值，防止标签溢出/侵蚀
-        # ================================================================
+        # P0-4: 增加距离阈值，防止标签溢出/侵蚀
         from scipy.spatial import KDTree
         tree = KDTree(pre_points)
         nn_dist, nn_idx = tree.query(noisy_points, k=1)
@@ -569,13 +529,10 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         # 但保留松散、车辙、沉陷等大面积病害标签
         crack_mask = (labels >= 1) & (labels <= 8)  # Q1: 布尔掩码替代 set + for
         restore_mask = uncertain_mask & crack_mask
-        labels[restore_mask] = 0  # 不确定的裂缝标签降为背景
+        labels[restore_mask] = 0
 
-        # ================================================================
         # 10. P2-4: 裂缝边界软标签 + P1-2: 体素下采样
-        # ================================================================
         # P2-4: 为每个点计算到最近裂缝边界的距离，转换为裂缝概率软标签
-        # 裂缝边界点: label ∈ [1,8] 且邻域有背景点的点
         crack_boundary_dist = np.zeros(len(noisy_points), dtype=np.float32)
         crack_mask_p2_4 = (labels >= 1) & (labels <= 8)
         if np.any(crack_mask_p2_4) and np.any(~crack_mask_p2_4):
@@ -583,31 +540,23 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
             crack_pts = noisy_points[crack_mask_p2_4]
             bg_pts = noisy_points[~crack_mask_p2_4]
             if len(crack_pts) > 1 and len(bg_pts) > 1:
-                # 对每个背景点，计算到最近裂缝点的距离
                 crack_tree = _KDTree(crack_pts)
                 bg_dists, _ = crack_tree.query(bg_pts, k=1)
-                # 对裂缝点，计算到最近背景点的距离（双向检测）
                 bg_tree = _KDTree(bg_pts)
                 crack_dists, _ = bg_tree.query(crack_pts, k=1)
-                # 填充距离数组
                 crack_boundary_dist[crack_mask_p2_4] = crack_dists
                 crack_boundary_dist[~crack_mask_p2_4] = bg_dists
                 # 距离→概率：exp(-d²/2σ²)，σ 取 3×grid_res
                 sigma = grid_res * 3.0
-                # crack_probability: 1 表示确定是裂缝区域（低距离），0 表示远离裂缝
-                # 使用对称 sigmoid: probability = exp(-d²/2σ²) 用于非裂缝点
-                # 裂缝点内部概率=1，边界点概率衰减
         # P1-2: 使用体素下采样替代随机重采样
         if self.config.target_density is not None and self.config.target_density > 0:
             road_area = width * length
             target_count = int(road_area * self.config.target_density)
-            # 计算合适的体素大小以逼近目标点数
-            # N_voxels ≈ area / voxel_size²（仅用 xy 维度）
+            # 体素大小逼近目标点数：N_voxels ≈ area / voxel_size²
             effective_voxel_size = max(
                 np.sqrt(road_area / max(target_count, 1)),
                 grid_res * 1.5
             )
-            # 体素质心下采样
             points_final, labels_final, intensity_final, curvature_final, normals_final = (
                 self._voxel_downsample(
                     noisy_points, labels, intensity, curvature, normals,
@@ -633,15 +582,11 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
             _, bd_idx = bd_tree.query(points_final, k=1)
             crack_boundary_dist_final = crack_boundary_dist[bd_idx]
 
-        # ================================================================
         # 11. 坐标归一化
-        # ================================================================
         if self.config.normalize:
             points_final = self._normalize(points_final)
 
-        # ================================================================
         # 12. 特征拼接 (P2-4: 增加裂缝边界距离通道)
-        # ================================================================
         feats = np.stack(
             [intensity_final, curvature_final, crack_boundary_dist_final], axis=1
         ).astype(np.float32)
@@ -654,17 +599,10 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
             "pavement_type": pavement_type,
         }
 
-    # 辅助方法
-
     def _select_pavement_type(self, rng: np.random.Generator) -> str:
-        """根据配置的病害概率选择最合适的路面类型。
+        """根据配置的病害概率选择路面类型。
 
-        如果配置中只有沥青病害概率 > 0，返回 'asphalt'；
-        如果只有水泥病害概率 > 0，返回 'concrete'；
-        否则等概率随机选择。
-
-        Returns:
-            'asphalt' 或 'concrete'。
+        仅沥青概率 > 0 → 'asphalt'；仅水泥 > 0 → 'concrete'；否则等概率随机。
         """
         disease_probs = self.config.disease.disease_probs
         has_asphalt = any(disease_probs.get(k, 0) > 0 for k in
@@ -689,15 +627,7 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         rng: np.random.Generator,
         pavement_type: str,
     ) -> List[Tuple[str, str]]:
-        """根据路面类型和配置概率随机选择病害组合。
-
-        Args:
-            rng: 随机数生成器。
-            pavement_type: 路面类型。
-
-        Returns:
-            [(disease_type, severity), ...] 列表。
-        """
+        """根据路面类型和配置概率随机选择病害组合。"""
         disease_probs = self.config.disease.disease_probs
         max_diseases = self.config.disease.max_diseases_per_scene
         severity_ratio = self.config.disease.severity_ratio
@@ -707,22 +637,18 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         else:
             available = ["concrete_damage"]
 
-        # 按概率独立选择
         selected: List[str] = []
         for disease in available:
             prob = disease_probs.get(disease, 0.0)
             if prob > 0.0 and rng.random() < prob:
                 selected.append(disease)
 
-        # 限制最大数量
         if len(selected) > max_diseases:
             selected = list(rng.choice(selected, size=max_diseases, replace=False))
 
-        # 分配严重程度
         result: List[Tuple[str, str]] = []
         for disease in selected:
             if disease == "bleeding":
-                # 泛油无严重程度区分
                 result.append((disease, "light"))
             else:
                 severity = "light" if rng.random() < severity_ratio else "severe"
@@ -738,43 +664,29 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
     ) -> np.ndarray:
         """模拟 LiDAR 强度反射率（基于物理反射率模型）。
 
-        P1-6 修复：使用物理合理的反射率范围和单位。
-        沥青基底反射率 0.10-0.25 (低反射率深色路面)，
-        水泥基底反射率 0.30-0.50 (浅色路面)。
+        P1-6: 沥青基底反射率 0.10-0.25，水泥基底 0.30-0.50。
         输出范围 [0, 1]，代表归一化反射率。
-
-        Args:
-            labels: 标签数组 (N,)。
-            pavement_type: 路面类型。
-            rng: 随机数生成器。
-
-        Returns:
-            强度值 (N,) float32，范围 [0, 1]。
         """
         N = labels.shape[0]
-        # P1-6 修复：使用物理合理的反射率基线
+        # P1-6: 物理合理的反射率基线
         if pavement_type == "asphalt":
-            # 沥青路面反射率低，0.10-0.25 (深灰到黑)
             base = float(rng.uniform(0.10, 0.25))
         else:
-            # 水泥路面反射率较高，0.30-0.50 (浅灰)
             base = float(rng.uniform(0.30, 0.50))
 
         intensity = np.full(N, base, dtype=np.float64)
-        # 随机空间变化（模拟路面局部反射率差异）
         intensity += rng.normal(0.0, 0.02, size=N)
 
-        # 病害区域强度修正（基于 JTG 标准中病害的视觉反射率特征）
+        # 病害区域强度修正（JTG 标准病害反射率特征）
         intensity[labels == 19] += 0.20   # 泛油：反射率显著增加 (油膜反射)
-        intensity[(labels == 11) | (labels == 12)] -= 0.10  # 松散：反射率降低 (粗糙表面散射)
-        intensity[labels == 36] -= 0.08   # 露骨：骨料反射率略低于均匀水泥表面
-        intensity[(labels == 20) | (labels == 37)] += 0.15  # 修补：修补材料通常反射率较高
-        intensity[labels == 29] += 0.12   # 唧泥：湿润泥浆反射率高于干燥路面
-        intensity[labels == 34] -= 0.05   # 坑洞：深处反射率极低
-        # 裂缝：反射率轻微降低 (阴影 + 粗糙边缘)
+        intensity[(labels == 11) | (labels == 12)] -= 0.10
+        intensity[labels == 36] -= 0.08
+        intensity[(labels == 20) | (labels == 37)] += 0.15
+        intensity[labels == 29] += 0.12
+        intensity[labels == 34] -= 0.05
+        # 裂缝：反射率轻微降低（阴影 + 粗糙边缘）
         crack_mask = (labels >= 1) & (labels <= 8)
         intensity[crack_mask] -= 0.05
-        # 坑槽：反射率降低
         intensity[(labels == 9) | (labels == 10)] -= 0.08
 
         return np.clip(intensity, 0.0, 1.0).astype(np.float32)
@@ -789,22 +701,7 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         target_num: int,
         rng: np.random.Generator,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """重采样到目标点数。
-
-        多于目标则随机下采样，少于目标则随机重复补齐。
-
-        Args:
-            points: 点云 (N, 3)。
-            labels: 标签 (N,)。
-            intensity: 强度 (N,)。
-            curvature: 曲率 (N,)。
-            normals: 法向量 (N, 3)。
-            target_num: 目标点数。
-            rng: 随机数生成器。
-
-        Returns:
-            (points, labels, intensity, curvature, normals) 均重采样至 target_num。
-        """
+        """重采样到目标点数。多于目标则随机下采样，少于目标则随机重复补齐。"""
         N = points.shape[0]
         if N == target_num:
             return points, labels, intensity, curvature, normals
@@ -812,7 +709,6 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         if N > target_num:
             idx = rng.choice(N, size=target_num, replace=False)
         else:
-            # 点数不足时重复随机点
             n_extra = target_num - N
             extra_idx = rng.choice(N, size=n_extra, replace=True)
             idx = np.concatenate([np.arange(N), extra_idx])
@@ -838,9 +734,8 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         if points.shape[0] < 10:
             return points, labels, intensity, curvature, normals
 
-        # 体素索引 — 仅使用 xy 维度（路面高度变化不应用来分割体素）
+        # 体素索引仅使用 xy 维度（路面高度变化不应用于体素分割）
         voxel_indices = np.floor(points[:, :2] / voxel_size).astype(np.int64)
-        # 用字典聚合
         voxel_dict: Dict[Tuple[int, int], List[int]] = {}
         for i, vi in enumerate(voxel_indices):
             key = (int(vi[0]), int(vi[1]))
@@ -859,16 +754,12 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
 
         for vi, (key, idx_list) in enumerate(voxel_dict.items()):
             idx_arr = np.array(idx_list)
-            # 质心
             result_pts[vi] = np.mean(points[idx_arr], axis=0)
-            # 多数投票标签
             lbl_counts = np.bincount(labels[idx_arr].astype(np.int64))
             result_labels[vi] = np.argmax(lbl_counts)
-            # 均值特征
             result_intensity[vi] = np.mean(intensity[idx_arr])
             result_curvature[vi] = np.mean(curvature[idx_arr])
             result_normals[vi] = np.mean(normals[idx_arr], axis=0)
-            # 重新归一化法向量
             nrm = np.linalg.norm(result_normals[vi])
             if nrm > 1e-12:
                 result_normals[vi] /= nrm
@@ -883,23 +774,13 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def _normalize(points: np.ndarray) -> np.ndarray:
-        """归一化点云到单位球：平移到原点，缩放至最大半径为 1。
-
-        Args:
-            points: 点云 (N, 3)。
-
-        Returns:
-            归一化后点云 (N, 3)。
-        """
+        """归一化点云到单位球：平移到原点，缩放至最大半径为 1。"""
         centroid = np.mean(points, axis=0)
         centered = points - centroid
         max_radius = np.max(np.linalg.norm(centered, axis=1))
         if max_radius > 1e-12:
             centered /= max_radius
         return centered
-
-
-# 工具函数
 
 
 def _compute_kdtree_curvature(
@@ -934,11 +815,8 @@ def _compute_kdtree_curvature(
     for i in range(N):
         _, idx = tree.query(points[i], k=k + 1)  # k+1 包含自身
         neighbors = points[idx[1:]]  # 排除自身
-        # 中心化
         centered = neighbors - neighbors.mean(axis=0)
-        # 3x3 协方差矩阵
         cov = np.dot(centered.T, centered) / (k - 1)
-        # 特征值分解
         try:
             eigvals = np.linalg.eigvalsh(cov)
             # PCA 曲率 = λ_min / (λ_1 + λ_2 + λ_3)
@@ -983,16 +861,12 @@ def _compute_grid_curvature(z_grid: np.ndarray, grid_res: float) -> np.ndarray:
     return curvature
 
 
-# 自检脚本
-
 if __name__ == "__main__":
     """自检：生成 5 个场景并验证输出。"""
-    print("=" * 72)
-    print("  SyntheticRoadDataset Self-Test")
-    print("  生成 5 个场景并验证输出形状 / 标签范围 / 归一化")
-    print("=" * 72)
+    print("SyntheticRoadDataset Self-Test")
+    print("生成 5 个场景并验证输出形状 / 标签范围 / 归一化")
 
-    # 小尺寸测试配置（加快测试速度）
+    # 小尺寸测试配置
     try:
         from .config import GeneratorConfig, RoadSurfaceConfig, DiseaseConfig
     except ImportError:
@@ -1030,7 +904,6 @@ if __name__ == "__main__":
         try:
             data = dataset[i]
 
-            # 验证返回值类型
             assert isinstance(data, dict), f"Expected dict, got {type(data)}"
             for key in ("points", "labels", "feats", "normals", "pavement_type"):
                 assert key in data, f"Missing key: {key}"
@@ -1041,7 +914,6 @@ if __name__ == "__main__":
             nrm = data["normals"]
             ptype = data["pavement_type"]
 
-            # 验证形状
             N = pts.shape[0]
             assert N == cfg.num_points, (
                 f"points.shape[0]={N} != {cfg.num_points}"
@@ -1052,13 +924,11 @@ if __name__ == "__main__":
             assert nrm.shape == (N, 3), f"normals shape: {nrm.shape}"
             assert ptype in ("asphalt", "concrete"), f"pavement_type: {ptype}"
 
-            # 验证类型
             assert pts.dtype == torch.float32, f"points dtype: {pts.dtype}"
             assert lbl.dtype == torch.int64, f"labels dtype: {lbl.dtype}"
             assert feats.dtype == torch.float32, f"feats dtype: {feats.dtype}"
             assert nrm.dtype == torch.float32, f"normals dtype: {nrm.dtype}"
 
-            # 验证标签范围
             unique_labels = torch.unique(lbl).tolist()
             for ul in unique_labels:
                 assert 0 <= ul < NUM_CLASSES, (
@@ -1066,7 +936,6 @@ if __name__ == "__main__":
                 )
             all_labels.update(unique_labels)
 
-            # 验证归一化
             if cfg.normalize:
                 centered = pts - pts.mean(dim=0)
                 max_r = torch.max(torch.norm(centered, dim=1))
@@ -1074,45 +943,40 @@ if __name__ == "__main__":
                     f"max radius after normalize: {max_r:.6f}"
                 )
 
-            # 验证非零
             assert not torch.isnan(pts).any(), "NaN in points"
             assert not torch.isinf(pts).any(), "Inf in points"
             assert not torch.isnan(nrm).any(), "NaN in normals"
 
-            # 验证法向量近似单位
             normal_norms = torch.norm(nrm, dim=1)
             assert normal_norms.min() > 0.9, "Normals too short"
             assert normal_norms.max() < 1.1, "Normals too long"
 
-            # 验证特征值范围
             assert feats[:, 0].min() >= 0.0, f"Intensity < 0: {feats[:, 0].min()}"
             assert feats[:, 0].max() <= 1.0, f"Intensity > 1: {feats[:, 0].max()}"
 
             pavement_counts[ptype] = pavement_counts.get(ptype, 0) + 1
 
-            print(f"  [PASS] N={N}, labels=[{min(unique_labels)}, {max(unique_labels)}], "
+            print(f"  Scene {i}: N={N}, labels=[{min(unique_labels)}, {max(unique_labels)}], "
                   f"pavement={ptype}, feat_range=[{feats[:, 0].min():.3f}, {feats[:, 0].max():.3f}]")
             passed += 1
 
         except Exception as e:
-            print(f"  [FAIL] Scene {i}: {e}")
+            print(f"  Scene {i} failed: {e}")
             import traceback
             traceback.print_exc()
 
     # 汇总
-    print("\n" + "=" * 72)
-    print(f"  场景总数: {total}")
-    print(f"  通过: {passed}/{total}")
+    print(f"\n场景总数: {total}, 通过: {passed}/{total}")
 
     if passed == total:
-        print("  [OK] 全部通过")
+        print("全部通过")
 
-    print(f"\n  路面类型分布: {pavement_counts}")
-    print(f"  覆盖标签数: {len(all_labels)}/{NUM_CLASSES}")
-    print(f"  标签范围: [{min(all_labels)}, {max(all_labels)}]")
+    print(f"路面类型分布: {pavement_counts}")
+    print(f"覆盖标签数: {len(all_labels)}/{NUM_CLASSES}")
+    print(f"标签范围: [{min(all_labels)}, {max(all_labels)}]")
 
     # 验证不同场景输出不同
-    print("\n  检验多样性...")
+    print("\n检验多样性...")
     scenes = [dataset[i] for i in range(len(dataset))]
     pts_list = [s["points"] for s in scenes]
     different = any(
@@ -1120,8 +984,6 @@ if __name__ == "__main__":
         for j in range(1, len(pts_list))
     )
     if different:
-        print("  [PASS] 不同场景产生不同输出")
+        print("不同场景产生不同输出")
     else:
-        print("  [WARN] 所有场景输出相同（可能种子管理有问题）")
-
-    print("\n" + "=" * 72)
+        print("所有场景输出相同（可能种子管理有问题）")
