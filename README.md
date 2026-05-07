@@ -308,13 +308,6 @@ roadmc/
   year = {2025}
 }
 
-@misc{roadmc2026,
-  author = {YQGHL},
-  title = {RoadMC: 物理仿真驱动的路面点云病害检测系统},
-  year = {2026},
-  howpublished = {\url{https://github.com/YQGHL/roadmc}}
-}
-```
 
 ## 许可
 
