@@ -14,17 +14,32 @@ JTG 5210-2018 · 38 类语义分割 · Python 3.12 · PyTorch 2.x
 
 ## 系统架构
 
+### 系统总体架构
+
+<p align="center">
+  <img src="readmeimage/architecture.png" alt="RoadMC 系统总体架构" width="80%"/>
+</p>
+
+系统的完整架构包含四个核心阶段：数据生成、Swin3D + mHC 分割网络、GAN 域适应、评估。
+
 ### 数据管线
 
 <p align="center">
-  <img src="docs/data_pipeline.png" alt="RoadMC 数据管线" width="95%"/>
+  <img src="readmeimage/data_pipeline.png" alt="RoadMC 数据管线" width="95%"/>
 </p>
 
-### 模型管线
+### 模型架构
 
 <p align="center">
-  <img src="docs/model_pipeline.png" alt="RoadMC 模型管线" width="95%"/>
+  <img src="readmeimage/model_architecture.png" alt="RoadMC 模型架构" width="95%"/>
 </p>
+
+### GAN 域适应
+
+<p align="center">
+  <img src="readmeimage/gan_architecture.png" alt="GAN 域适应架构" width="85%"/>
+</p>
+
 
 ---
 
@@ -78,6 +93,8 @@ JTG 5210-2018 · 38 类语义分割 · Python 3.12 · PyTorch 2.x
 ## 网络模型架构
 
 ### Swin3D 骨干
+
+Swin3D 骨干网络的详细配置如下：
 
 | Stage | 深度 | 通道 | 头数 | 下采样 |
 |-------|------|------|------|--------|
@@ -228,9 +245,10 @@ fts = d["feats"]       # (N, 3)
 | `asphalt_multi_disease_2d_overlay.png` | 沥青路面多病害 2D 俯视图 |
 | `asphalt_rutting_corrugation_3d.png` | 车辙病害 3D 形态 |
 | `label_statistics.png` | 标签分布统计柱状图 |
-| `docs/architecture.png` | 完整系统架构图 |
-| `docs/data_pipeline.png` | 数据管线图 |
-| `docs/model_pipeline.png` | 模型管线图 |
+| `readmeimage/architecture.png` | 系统总体架构图 |
+| `readmeimage/data_pipeline.png` | 数据管线图 |
+| `readmeimage/model_architecture.png` | 模型架构图 |
+| `readmeimage/gan_architecture.png` | GAN 域适应架构图 |
 
 ---
 

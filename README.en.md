@@ -14,16 +14,30 @@ JTG 5210-2018 · 38-class semantic segmentation · Python 3.12 · PyTorch 2.x
 
 ## System Architecture
 
+### System Architecture
+
+<p align="center">
+  <img src="readmeimage/architecture.png" alt="RoadMC System Architecture" width="80%"/>
+</p>
+
+The system architecture consists of four core phases: Data Generation, Swin3D + mHC segmentation network, GAN domain adaptation, and Evaluation.
+
 ### Data Pipeline
 
 <p align="center">
-  <img src="docs/data_pipeline.png" alt="RoadMC Data Pipeline" width="95%"/>
+  <img src="readmeimage/data_pipeline.png" alt="RoadMC Data Pipeline" width="95%"/>
 </p>
 
-### Model Pipeline
+### Model Architecture
 
 <p align="center">
-  <img src="docs/model_pipeline.png" alt="RoadMC Model Pipeline" width="95%"/>
+  <img src="readmeimage/model_architecture.png" alt="RoadMC Model Architecture" width="95%"/>
+</p>
+
+### GAN Domain Adaptation
+
+<p align="center">
+  <img src="readmeimage/gan_architecture.png" alt="GAN Domain Adaptation Architecture" width="85%"/>
 </p>
 
 ---
@@ -228,9 +242,10 @@ Run `python roadmc/test/test_visualize.py`. Generates 13 diagnostic PNGs in `tes
 | `asphalt_multi_disease_2d_overlay.png` | Multi-defect asphalt 2D top view |
 | `asphalt_rutting_corrugation_3d.png` | Rutting 3D morphology |
 | `label_statistics.png` | Label distribution histogram |
-| `docs/architecture.png` | Full system architecture |
-| `docs/data_pipeline.png` | Data pipeline diagram |
-| `docs/model_pipeline.png` | Model pipeline diagram |
+| `readmeimage/architecture.png` | Full system architecture |
+| `readmeimage/data_pipeline.png` | Data pipeline diagram |
+| `readmeimage/model_architecture.png` | Model architecture diagram |
+| `readmeimage/gan_architecture.png` | GAN domain adaptation diagram |
 
 ---
 
