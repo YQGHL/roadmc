@@ -739,7 +739,7 @@ def add_crack(
         ridge_segments = []
         for v_idx_pair in vor.ridge_vertices:
             v1, v2 = v_idx_pair
-            if ridge[0] >= 0 and ridge[1] >= 0:
+            if v1 >= 0 and v2 >= 0:
                 p1 = vor.vertices[v1]
                 p2 = vor.vertices[v2]
                 ridge_segments.append((p1, p2))

@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta:__legacy__"
 
 [project]
 name = "roadmc"
@@ -10,11 +10,27 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.11",
-    "torch>=2.1",
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "torchaudio>=2.0",
     "pytorch-lightning>=2.0",
     "torchmetrics>=1.0",
     "matplotlib>=3.7",
+    "ipykernel>=7.2.0",
 ]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.setuptools.packages.find]
+include = ["roadmc*"]
 
 [tool.ruff]
 target-version = "py311"

@@ -13,21 +13,50 @@ from pathlib import Path
 
 import pytorch_lightning as pl
 import torch
+import torch.nn as nn
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 
 def train_baseline(args):
+    torch.set_float32_matmul_precision('high')
     from roadmc.data.dataloader import RoadMCDataModule
     from roadmc.models.model_pl import RoadMCSegModel
 
+    num_classes = 2 if args.binary else 38
+    if args.binary:
+        print("[BINARY] 38-class labels → background(0) vs disease(1)")
+
+    class_weights = None
+    if args.class_weights:
+        cw_path = Path(args.class_weights)
+        if cw_path.exists():
+            cw = torch.load(cw_path, weights_only=True)
+            if args.binary:
+                # Collapse 38-class weights to binary: bg=weight[0], all diseases=mean(weight[1:])
+                bg_w = cw[0]
+                disease_w = cw[1:].mean()
+                class_weights = torch.tensor([bg_w, disease_w])
+                print(f"[CW] Collapsed 38-class → binary weights: [{bg_w:.4f}, {disease_w:.4f}]")
+            else:
+                class_weights = cw
+                print(f"[CW] Loaded class weights from {cw_path}")
+                print(f"[CW] Shape: {class_weights.shape}, Range: [{class_weights.min():.4f}, {class_weights.max():.4f}]")
+        else:
+            print(f"[CW] WARNING: {cw_path} not found, running without class weights")
+
     model = RoadMCSegModel(
         in_channels=3,
-        num_classes=38,
+        num_classes=num_classes,
         embed_dim=args.embed_dim,
         depths=tuple(args.depths),
         num_heads=tuple(args.num_heads),
         lr=args.lr,
         weight_decay=args.weight_decay,
+        class_weights=class_weights,
+        use_checkpoint=args.gradient_checkpointing,
+        lambda_focal=args.lambda_focal,
+        lambda_dice=args.lambda_dice,
+        lambda_edge=args.lambda_edge,
     )
 
     datamodule = RoadMCDataModule(
@@ -35,7 +64,51 @@ def train_baseline(args):
         batch_size=args.batch_size,
         max_points=args.max_points,
         num_workers=args.num_workers,
+        binary=args.binary,
     )
+
+    # Load binary pretrained backbone (strip classifier head) for 38-class fine-tuning
+    if args.pretrained_binary:
+        if num_classes != 38:
+            print("[PRETRAINED] WARNING: --pretrained_binary is designed for 38-class fine-tuning, "
+                  f"but num_classes={num_classes}. Proceeding anyway.")
+        ckpt_path = Path(args.pretrained_binary)
+        if not ckpt_path.exists():
+            print(f"[PRETRAINED] ERROR: checkpoint not found: {ckpt_path}")
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+        print(f"[PRETRAINED] Loading binary checkpoint: {ckpt_path}")
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+
+        if "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+
+        # Strip keys with shape mismatch (classifier head, class weights)
+        stripped = {}
+        skipped = []
+        loaded = 0
+        # Keys to skip when loading binary checkpoint into 38-class model
+        skip_patterns = ["decode.cls_head", "focal_loss.alpha"]
+        for k, v in state_dict.items():
+            if any(p in k for p in skip_patterns):
+                skipped.append(k)
+                continue
+            stripped[k] = v
+            loaded += 1
+
+        # Load backbone weights (strict=False to ignore cls_head mismatch)
+        msg = model.load_state_dict(stripped, strict=False)
+        unexpected = getattr(msg, 'unexpected_keys', [])
+        missing = getattr(msg, 'missing_keys', [])
+        if unexpected:
+            print(f"[PRETRAINED] Unexpected keys (skipped): {[str(k) for k in unexpected]}")
+        if missing:
+            print(f"[PRETRAINED] Missing keys (init from scratch): {[str(k) for k in missing]}")
+        print(f"[PRETRAINED] Loaded {loaded} param tensors, skipped {len(skipped)} shape-mismatched keys:")
+        for k in skipped:
+            print(f"  └─ skipped: {k}")
+        print(f"[PRETRAINED] 38-class classifier head + focal_loss.alpha initialized from scratch.")
+        del state_dict, stripped
 
     callbacks = [
         ModelCheckpoint(monitor="val_mIoU", mode="max", save_top_k=3, filename="baseline-{epoch}-{val_mIoU:.3f}"),
@@ -45,11 +118,15 @@ def train_baseline(args):
         max_epochs=args.max_epochs,
         accelerator="auto",
         devices=1,
+        precision="16-mixed",       # P0: AMP halves VRAM, 1.5-2x speedup
+        gradient_clip_val=1.0,      # P1: prevent loss spikes
         callbacks=callbacks,
         log_every_n_steps=10,
+        benchmark=True,             # P2: cudnn benchmark for fixed input sizes
+        num_sanity_val_steps=0,     # skip val sanity at start
     )
 
-    trainer.fit(model, datamodule=datamodule)
+    trainer.fit(model, datamodule=datamodule, ckpt_path=args.resume_from_checkpoint)
 
 
 def train_gan_enhanced(args):
@@ -290,15 +367,34 @@ def main():
                         help="Training mode")
     parser.add_argument("--data_dir", type=str, default="./data/synthetic_output")
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--max_points", type=int, default=65536)
+    parser.add_argument("--max_points", type=int, default=4096,
+                        help="Max points per scene after subsampling. Full NxN attention matrix fits 8GB at N=4096.")
     parser.add_argument("--max_epochs", type=int, default=50)
     parser.add_argument("--embed_dim", type=int, default=96)
     parser.add_argument("--depths", type=int, nargs=4, default=[2, 2, 6, 2])
     parser.add_argument("--num_heads", type=int, nargs=4, default=[3, 6, 12, 24])
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.05)
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader workers. Set >0 for async loading with pin_memory.")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--class_weights", type=str, default=None,
+                        help="Path to class weights .pt file for FocalLoss alpha")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing to reduce VRAM")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to checkpoint to resume training from")
+    parser.add_argument("--lambda_focal", type=float, default=1.0,
+                        help="Focal loss weight (default: 1.0)")
+    parser.add_argument("--lambda_dice", type=float, default=1.0,
+                        help="Dice loss weight (default: 1.0)")
+    parser.add_argument("--lambda_edge", type=float, default=0.5,
+                        help="Edge loss weight (default: 0.5)")
+    parser.add_argument("--binary", action="store_true",
+                        help="Binary mode: collapse 38 classes to background(0) vs disease(1)")
+    parser.add_argument("--pretrained_binary", type=str, default=None,
+                        help="Path to binary checkpoint .ckpt to load backbone weights for 38-class fine-tuning. "
+                             "The classifier head (backbone.decode.cls_head) will be reset to 38 classes.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -340,6 +436,10 @@ if __name__ == "__main__":
     _ = SpectralAnalyzer  # verify import resolves
     _ = RoadMCDataModule  # verify import resolves
 
-    print("\nUsage:")
-    print("  python roadmc/train.py baseline --data_dir ./data/synthetic_output --max_epochs 1")
-    print("  python roadmc/train.py gan_enhanced --max_epochs 1")
+    # If called with CLI args (not just the test invocation), run main()
+    if len(sys.argv) > 1:
+        main()
+    else:
+        print("\nUsage:")
+        print("  python roadmc/train.py baseline --data_dir ./data/synthetic_output --max_epochs 1")
+        print("  python roadmc/train.py gan_enhanced --max_epochs 1")

@@ -153,37 +153,32 @@ class WindowAttention3D(nn.Module):
             coords, self.window_size, shift=shift
         )  # (B, N)
 
-        # 4. Per-window attention (avoids O(N²) full attention matrix)
+        # 4. Full N×N attention
+        # NOTE: For N = 4096 (current config), the full attention matrix
+        # (B, H, N, N) fits in 8 GB VRAM.  Per-window loop was removed
+        # because it creates ~10k small CUDA allocs/step, which fragments
+        # the CUDA caching allocator over 2+ epochs → training hang.
+        # See commit 04f6d63 context.
         scale = D ** -0.5
-        out = torch.zeros(B, N, C, device=device, dtype=x.dtype)
+        attn = (q @ k.transpose(-2, -1)) * scale  # (B, H, N, N)
 
-        for b in range(B):
-            unique_windows = window_id[b].unique()
-            for wid in unique_windows:
-                mask = window_id[b] == wid
-                idx = mask.nonzero(as_tuple=True)[0]  # (W,)
-                W = len(idx)
-                if W == 0:
-                    continue
+        # 5. 3D relative position bias via MLP on pairwise offsets
+        # offsets = coords.unsqueeze(2) - coords.unsqueeze(1): (B, N, N, 3)
+        # pos_mlp processes (N², 3) → (N², H) with a 2-layer MLP
+        offsets = coords.unsqueeze(2) - coords.unsqueeze(1)
+        rel_pos_bias = self.pos_mlp(offsets)  # (B, N, N, H)
+        rel_pos_bias = rel_pos_bias.permute(0, 3, 1, 2)  # (B, H, N, N)
+        attn = attn + rel_pos_bias
 
-                # Extract Q, K, V for this window: (1, H, W, D)
-                q_w = q[b:b+1, :, idx, :]
-                k_w = k[b:b+1, :, idx, :]
-                v_w = v[b:b+1, :, idx, :]
+        # 6. Mask out cross-window attention
+        same_window = window_id.unsqueeze(2) == window_id.unsqueeze(1)  # (B, N, N)
+        same_window = same_window.unsqueeze(1)  # (B, 1, N, N)
+        attn = attn.masked_fill(~same_window, -1e4)
 
-                # Attention within window: (1, H, W, W)
-                attn_w = (q_w @ k_w.transpose(-2, -1)) * scale
-
-                # Relative position bias within window: (1, W, W, 3) → (1, H, W, W)
-                coords_w = coords[b:b+1, idx, :]
-                offsets_w = coords_w.unsqueeze(2) - coords_w.unsqueeze(1)
-                rel_bias = self.pos_mlp(offsets_w).permute(0, 3, 1, 2)
-                attn_w = attn_w + rel_bias
-
-                attn_w = self.softmax(attn_w)
-                out_w = attn_w @ v_w  # (1, H, W, D)
-                out_w = out_w.transpose(1, 2).reshape(1, W, C)
-                out[b, idx, :] = out_w.squeeze(0)
+        # 7. Softmax and attend
+        attn = self.softmax(attn)
+        out = attn @ v  # (B, H, N, D)
+        out = out.transpose(1, 2).reshape(B, N, C)  # (B, N, C)
 
         out = self.proj(out)
 

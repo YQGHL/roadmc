@@ -10,6 +10,7 @@ Output: (B, N, num_classes) per-point logits
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from typing import List, Tuple, Optional
 
 from roadmc.models.attention.window_attention import ShiftedWindowTransformerBlock
@@ -30,17 +31,27 @@ class Stage(nn.Module):
         self,
         blocks: List[ShiftedWindowTransformerBlock],
         downsample: Optional[nn.Module] = None,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         self.blocks = nn.ModuleList(blocks)
         self.downsample = downsample if downsample is not None else nn.Identity()
+        self.use_checkpoint = use_checkpoint
+
+    def _run_block(
+        self, block: ShiftedWindowTransformerBlock, coords: torch.Tensor, x: torch.Tensor
+    ) -> torch.Tensor:
+        """Run a single block, optionally with gradient checkpointing."""
+        if self.use_checkpoint and self.training:
+            return checkpoint(block, coords, x, use_reentrant=False)
+        return block(coords, x)
 
     def forward(
         self, coords: torch.Tensor, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass: blocks → downsample, returning both output and skip."""
         for block in self.blocks:
-            x = block(coords, x)
+            x = self._run_block(block, coords, x)
         skip = x
         x = self.downsample(x)
         return x, skip
@@ -146,6 +157,7 @@ class Swin3D(nn.Module):
         num_heads: Tuple[int, ...] = (3, 6, 12, 24),
         window_size: int = 64,
         mlp_ratio: float = 4.0,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
 
@@ -179,7 +191,7 @@ class Swin3D(nn.Module):
             else:
                 downsample = None
 
-            self.stages.append(Stage(blocks, downsample))
+            self.stages.append(Stage(blocks, downsample, use_checkpoint=use_checkpoint))
 
         self.decode = SegmentationHead(channels, num_classes)
 

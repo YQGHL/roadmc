@@ -47,7 +47,7 @@ class MHCConnection(nn.Module):
         # softplus(-5 + ε) ≈ 0.007, M ≈ C × 0.007², exp(M) ≈ exp(C×5e-5).
         # For C=768: exp(0.038) ≈ 1.04 — numerically safe.
 
-        self.register_buffer("stochastic_matrix", None)
+        self.register_buffer("stochastic_matrix", torch.zeros(channels, channels))
         self.register_buffer("_deployed", torch.tensor(False))
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
@@ -63,8 +63,10 @@ class MHCConnection(nn.Module):
             M = F.softplus(self.W1) @ F.softplus(self.W2).T  # (C, C)
 
             H = sinkhorn_knopp(M / self.temp, iters=self.sinkhorn_iters)  # (C, C)
-        # Save H as buffer (detached) for deploy() and verification
-        self.stochastic_matrix = H.detach().clone()
+        # Save H as buffer (detached, in-place) for deploy() and verification.
+        # Use in-place copy so the registered buffer value is never None,
+        # preventing state_dict mismatch on checkpoint save/load.
+        self.stochastic_matrix.copy_(H.detach())
 
         y = x + (residual @ H.T)
         return y

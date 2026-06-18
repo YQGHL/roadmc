@@ -29,11 +29,13 @@ class SyntheticPointCloudDataset(Dataset):
         split: str = "train",
         max_points: Optional[int] = 65536,
         augment: bool = False,
+        binary: bool = False,
     ):
         self.data_dir = Path(data_dir)
         self.split = split
         self.max_points = max_points
         self.augment = augment and (split == "train")
+        self.binary = binary
 
         self.files = sorted((self.data_dir / split).glob("scene_*.npz"))
         if not self.files:
@@ -52,11 +54,33 @@ class SyntheticPointCloudDataset(Dataset):
         normals = torch.from_numpy(data["normals"]).float()
 
         if self.max_points is not None and coords.shape[0] > self.max_points:
-            idx_keep = torch.randperm(coords.shape[0])[:self.max_points]
+            # Stratified sampling: always include disease points (labels > 0)
+            # to avoid pure-background batches where loss is trivially 0.
+            disease_mask = labels > 0
+            disease_indices = torch.where(disease_mask)[0]
+            bg_indices = torch.where(~disease_mask)[0]
+            n_disease = len(disease_indices)
+            n_keep = min(coords.shape[0], self.max_points)
+
+            if n_disease > 0 and n_disease < n_keep:
+                # Keep all disease pts, fill rest with random background
+                n_bg = n_keep - n_disease
+                bg_selected = bg_indices[torch.randperm(len(bg_indices))[:n_bg]]
+                idx_keep = torch.cat([disease_indices, bg_selected])
+            elif n_disease >= n_keep:
+                # Too many disease pts, subsample them
+                idx_keep = disease_indices[torch.randperm(n_disease)[:n_keep]]
+            else:
+                # No disease pts, pure random
+                idx_keep = torch.randperm(coords.shape[0])[:n_keep]
+
             coords = coords[idx_keep]
             labels = labels[idx_keep]
             feats = feats[idx_keep]
             normals = normals[idx_keep]
+
+        if self.binary:
+            labels = (labels > 0).long()
 
         if self.augment:
             coords, normals = _augment_point_cloud(coords, normals)
@@ -139,25 +163,30 @@ class RoadMCDataModule(pl.LightningDataModule):
         batch_size: int = 4,
         max_points: int = 65536,
         num_workers: int = 0,
+        binary: bool = False,
     ):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.max_points = max_points
         self.num_workers = num_workers
+        self.binary = binary
 
     def setup(self, stage: Optional[str] = None):
         """Initialize datasets."""
         if stage in (None, "fit"):
             self.train_dataset = SyntheticPointCloudDataset(
                 self.data_dir, "train", self.max_points, augment=True,
+                binary=self.binary,
             )
             self.val_dataset = SyntheticPointCloudDataset(
                 self.data_dir, "val", self.max_points, augment=False,
+                binary=self.binary,
             )
         if stage in (None, "test"):
             self.test_dataset = SyntheticPointCloudDataset(
                 self.data_dir, "val", self.max_points, augment=False,
+                binary=self.binary,
             )
 
     def train_dataloader(self) -> DataLoader:
@@ -165,6 +194,8 @@ class RoadMCDataModule(pl.LightningDataModule):
             self.train_dataset, batch_size=self.batch_size,
             shuffle=True, collate_fn=collate_pointcloud_batch,
             num_workers=self.num_workers,
+            pin_memory=self.num_workers > 0,
+            persistent_workers=self.num_workers > 0,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -172,6 +203,8 @@ class RoadMCDataModule(pl.LightningDataModule):
             self.val_dataset, batch_size=self.batch_size,
             shuffle=False, collate_fn=collate_pointcloud_batch,
             num_workers=self.num_workers,
+            pin_memory=self.num_workers > 0,
+            persistent_workers=self.num_workers > 0,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -179,6 +212,8 @@ class RoadMCDataModule(pl.LightningDataModule):
             self.test_dataset, batch_size=self.batch_size,
             shuffle=False, collate_fn=collate_pointcloud_batch,
             num_workers=self.num_workers,
+            pin_memory=self.num_workers > 0,
+            persistent_workers=self.num_workers > 0,
         )
 
 

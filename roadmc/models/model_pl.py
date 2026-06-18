@@ -263,6 +263,7 @@ class RoadMCSegModel(pl.LightningModule):
         class_weights: Optional[torch.Tensor] = None,
         crack_dist_feat_idx: int = 2,  # L4: index of crack_boundary_dist in feats
         t_max: int = 50,  # Cosine annealing period
+        use_checkpoint: bool = False,  # gradient checkpointing to reduce VRAM
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -277,6 +278,7 @@ class RoadMCSegModel(pl.LightningModule):
             num_heads=num_heads,
             window_size=window_size,
             mlp_ratio=mlp_ratio,
+            use_checkpoint=use_checkpoint,
         )
 
         self.focal_loss = FocalLoss(gamma=2.0, alpha=class_weights)
