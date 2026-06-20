@@ -11,6 +11,41 @@ import pytorch_lightning as pl
 from typing import Optional, Tuple
 
 
+class HybridMuonAdamW(torch.optim.Optimizer):
+    """Wrap Muon and AdamW so matrix params can use Muon while 1D params use AdamW."""
+
+    def __init__(self, muon: torch.optim.Optimizer, adamw: torch.optim.Optimizer):
+        dummy = torch.nn.Parameter(torch.zeros(1, requires_grad=True))
+        super().__init__([dummy], {})
+        self.muon = muon
+        self.adamw = adamw
+        self.param_groups = self.muon.param_groups + self.adamw.param_groups
+        self.state = {}
+
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+        self.muon.step()
+        self.adamw.step()
+        return loss
+
+    def zero_grad(self, set_to_none: bool = True):
+        self.muon.zero_grad(set_to_none=set_to_none)
+        self.adamw.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        return {
+            "muon": self.muon.state_dict(),
+            "adamw": self.adamw.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict):
+        self.muon.load_state_dict(state_dict["muon"])
+        self.adamw.load_state_dict(state_dict["adamw"])
+        self.param_groups = self.muon.param_groups + self.adamw.param_groups
+
+
 class FocalLoss(nn.Module):
     """Focal Loss: -α(1-p_t)^γ log(p_t)
 
@@ -81,17 +116,17 @@ class DiceLoss(nn.Module):
             targets = targets[valid_mask]
             if targets.numel() == 0:
                 return torch.tensor(0.0, device=logits.device, requires_grad=True)
-        
+
         num_classes = logits.shape[-1]
         probs = F.softmax(logits, dim=-1)  # (M, C) after masking
 
-        targets_one_hot = F.one_hot(targets, num_classes).float()  # (B, N, C)
+        targets_one_hot = F.one_hot(targets, num_classes).float()  # (M, C)
 
         # L2 fix: vectorized per-class dice (no Python loop)
         # intersection: (C,) sum over B,N
-        intersection = (probs * targets_one_hot).sum(dim=(0, 1))  # (C,)
+        intersection = (probs * targets_one_hot).sum(dim=0)  # (C,)
         # union: (C,)
-        union = probs.sum(dim=(0, 1)) + targets_one_hot.sum(dim=(0, 1))  # (C,)
+        union = probs.sum(dim=0) + targets_one_hot.sum(dim=0)  # (C,)
         dice = (2.0 * intersection + self.smooth) / (union + self.smooth)  # (C,)
         dice_loss = 1.0 - dice  # (C,)
 
@@ -206,8 +241,6 @@ class EdgeLoss(nn.Module):
             if crack_boundary_dist is not None:
                 cbd_list = [crack_boundary_dist[b] for b in range(B)]
 
-        preds_list = [l.argmax(dim=-1) for l in logits_list]
-
         total_loss = 0.0
         count = 0
 
@@ -219,12 +252,13 @@ class EdgeLoss(nn.Module):
                 if not near_crack.any():
                     continue
                 mask_coords = coords_list[b][near_crack]
-                mask_preds = preds_list[b][near_crack].float()
-                mask_targets = targets_list[b][near_crack].float()
+                mask_probs = F.softmax(logits_list[b][near_crack], dim=-1)
+                crack_prob = mask_probs[..., 1:9].sum(dim=-1).float()
+                mask_targets = (targets_list[b][near_crack] > 0).float()
             else:
                 continue
 
-            pred_grid = self._scatter_to_bev(mask_preds, mask_coords)
+            pred_grid = self._scatter_to_bev(crack_prob, mask_coords)
             target_grid = self._scatter_to_bev(mask_targets, mask_coords)
 
             pred_edge = self._sobel_edge(pred_grid)
@@ -257,6 +291,8 @@ class RoadMCSegModel(pl.LightningModule):
         mlp_ratio: float = 4.0,
         lr: float = 1e-4,
         weight_decay: float = 0.05,
+        optimizer_name: str = "muon",
+        backbone_name: str = "swin3d",
         lambda_focal: float = 1.0,
         lambda_dice: float = 1.0,
         lambda_edge: float = 0.5,
@@ -264,13 +300,23 @@ class RoadMCSegModel(pl.LightningModule):
         crack_dist_feat_idx: int = 2,  # L4: index of crack_boundary_dist in feats
         t_max: int = 50,  # Cosine annealing period
         use_checkpoint: bool = False,  # gradient checkpointing to reduce VRAM
+        use_mhc: bool = True,
+        binary_threshold: float = 0.5,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        from roadmc.models.backbone.swin3d import Swin3D
+        backbone_name = backbone_name.lower()
+        if backbone_name == "swin3d":
+            from roadmc.models.backbone.swin3d import Swin3D
+            backbone_cls = Swin3D
+        elif backbone_name == "pointmamba":
+            from roadmc.models.backbone.pointmamba import PointMambaBackbone
+            backbone_cls = PointMambaBackbone
+        else:
+            raise ValueError(f"Unsupported backbone_name: {backbone_name}")
 
-        self.backbone = Swin3D(
+        self.backbone = backbone_cls(
             in_channels=in_channels,
             num_classes=num_classes,
             embed_dim=embed_dim,
@@ -279,6 +325,7 @@ class RoadMCSegModel(pl.LightningModule):
             window_size=window_size,
             mlp_ratio=mlp_ratio,
             use_checkpoint=use_checkpoint,
+            use_mhc=use_mhc,
         )
 
         self.focal_loss = FocalLoss(gamma=2.0, alpha=class_weights)
@@ -291,8 +338,11 @@ class RoadMCSegModel(pl.LightningModule):
         self.lambda_edge = lambda_edge
         self.lr = lr
         self.weight_decay = weight_decay
+        self.optimizer_name = optimizer_name.lower()
+        self.backbone_name = backbone_name
         self.crack_dist_feat_idx = crack_dist_feat_idx  # L4
         self.t_max = t_max  # L2: now settable via constructor
+        self.binary_threshold = binary_threshold
 
     def forward(self, coords: torch.Tensor, feats: torch.Tensor) -> torch.Tensor:
         """Forward pass through backbone.
@@ -341,7 +391,7 @@ class RoadMCSegModel(pl.LightningModule):
 
         loss = self.lambda_focal * fl + self.lambda_dice * dl + self.lambda_edge * el
 
-        preds = logits.argmax(dim=-1)
+        preds = self._prediction_from_logits(logits)
         miou, per_class_iou, per_class_recall, per_class_precision = self.compute_miou(
             preds, labels, self.num_classes, valid_mask
         )
@@ -355,15 +405,91 @@ class RoadMCSegModel(pl.LightningModule):
                 self.log(f"val_precision_{c}", per_class_precision[c])
         return loss
 
+    def _prediction_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply calibrated binary threshold when requested, otherwise argmax."""
+        if self.num_classes == 2 and self.binary_threshold != 0.5:
+            disease_prob = torch.softmax(logits, dim=-1)[..., 1]
+            return (disease_prob >= self.binary_threshold).long()
+        return logits.argmax(dim=-1)
+
     def configure_optimizers(self):
-        """AdamW optimizer with cosine annealing scheduler."""
-        optimizer = torch.optim.AdamW(
-            self.parameters(), lr=self.lr, weight_decay=self.weight_decay
-        )
+        """Muon optimizer with grouped learning rates and cosine annealing."""
+        optimizer, scheduler = self.build_optimizer_and_scheduler()
+        return [optimizer], [scheduler]
+
+    def build_optimizer_and_scheduler(self, optimizer_name: Optional[str] = None):
+        """Build the optimizer and scheduler used by both Lightning and manual training."""
+        optimizer_name = (optimizer_name or self.optimizer_name).lower()
+        matrix_params = []
+        head_params = []
+        adamw_params = []
+
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "decode.cls_head" in name and param.ndim == 2:
+                head_params.append(param)
+            elif param.ndim == 2:
+                matrix_params.append(param)
+            else:
+                adamw_params.append(param)
+
+        if optimizer_name == "muon":
+            muon_groups = []
+            if matrix_params:
+                muon_groups.append(
+                    {"params": matrix_params, "lr": self.lr, "weight_decay": self.weight_decay}
+                )
+            if head_params:
+                muon_groups.append(
+                    {"params": head_params, "lr": self.lr * 3.0, "weight_decay": self.weight_decay * 0.5}
+                )
+
+            adamw_groups = []
+            if adamw_params:
+                adamw_groups.append(
+                    {"params": adamw_params, "lr": self.lr, "weight_decay": 0.0}
+                )
+
+            muon = torch.optim.Muon(
+                muon_groups,
+                momentum=0.95,
+                nesterov=True,
+            )
+            if adamw_groups:
+                adamw = torch.optim.AdamW(
+                    adamw_groups,
+                    lr=self.lr,
+                    weight_decay=0.0,
+                )
+                optimizer = HybridMuonAdamW(muon, adamw)
+            else:
+                optimizer = muon
+        elif optimizer_name == "adamw":
+            param_groups = []
+            if matrix_params:
+                param_groups.append(
+                    {"params": matrix_params, "lr": self.lr, "weight_decay": self.weight_decay}
+                )
+            if head_params:
+                param_groups.append(
+                    {"params": head_params, "lr": self.lr * 3.0, "weight_decay": self.weight_decay * 0.5}
+                )
+            if adamw_params:
+                param_groups.append(
+                    {"params": adamw_params, "lr": self.lr, "weight_decay": 0.0}
+                )
+            optimizer = torch.optim.AdamW(
+                param_groups,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer_name: {optimizer_name}")
         # T_max can be set via init param or defaults to 50
         t_max = getattr(self, 't_max', 50)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max)
-        return [optimizer], [scheduler]
+        return optimizer, scheduler
 
     @staticmethod
     def compute_miou(
@@ -417,8 +543,11 @@ class RoadMCSegModel(pl.LightningModule):
         per_class_recall = torch.stack(recalls)
         per_class_precision = torch.stack(precisions)
 
-        # macro mIoU: mean over all classes (or skip background if min_class=1)
-        miou = per_class_iou.mean()
+        # macro mIoU: skip background to match evaluation/reporting convention
+        if num_classes > 1:
+            miou = per_class_iou[1:].mean()
+        else:
+            miou = per_class_iou.mean()
 
         return miou, per_class_iou, per_class_recall, per_class_precision
 
@@ -479,8 +608,9 @@ if __name__ == "__main__":
     print("  Validation step OK")
 
     # Test configure_optimizers
-    optimizers = model.configure_optimizers()
+    optimizers, schedulers = model.configure_optimizers()
     assert len(optimizers) >= 1
+    assert len(schedulers) >= 1
     print(f"  Optimizer configured: {type(optimizers[0]).__name__}")
 
     print(

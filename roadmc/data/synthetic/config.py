@@ -90,7 +90,7 @@ class RoadSurfaceConfig:
     width: float = 7.0
     length: float = 5.0
     grid_res: float = 0.005
-    pavement_type: Literal["asphalt", "concrete"] = "asphalt"
+    pavement_type: Literal["asphalt", "concrete", "mixed"] = "asphalt"
     roughness_class: Literal["A", "B", "C", "D", "E"] = "A"
 
     def __post_init__(self) -> None:
@@ -325,6 +325,7 @@ class DiseaseConfig:
     })
     severity_ratio: float = 0.6
     max_diseases_per_scene: int = 3
+    use_stratified: bool = True
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.severity_ratio <= 1.0:

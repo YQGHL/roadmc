@@ -27,7 +27,13 @@ def train_baseline(args):
         print("[BINARY] 38-class labels → background(0) vs disease(1)")
 
     class_weights = None
-    if args.class_weights:
+    if args.binary and args.binary_class_weights:
+        weights = [float(x) for x in args.binary_class_weights.split(",")]
+        if len(weights) != 2:
+            raise ValueError("--binary_class_weights must contain exactly two comma-separated values")
+        class_weights = torch.tensor(weights, dtype=torch.float32)
+        print(f"[CW] Using explicit binary class weights: {weights}")
+    elif args.class_weights:
         cw_path = Path(args.class_weights)
         if cw_path.exists():
             cw = torch.load(cw_path, weights_only=True)
@@ -52,11 +58,15 @@ def train_baseline(args):
         num_heads=tuple(args.num_heads),
         lr=args.lr,
         weight_decay=args.weight_decay,
+        optimizer_name=args.optimizer,
+        backbone_name=args.backbone,
         class_weights=class_weights,
         use_checkpoint=args.gradient_checkpointing,
+        use_mhc=args.use_mhc,
         lambda_focal=args.lambda_focal,
         lambda_dice=args.lambda_dice,
         lambda_edge=args.lambda_edge,
+        binary_threshold=args.binary_threshold,
     )
 
     datamodule = RoadMCDataModule(
@@ -66,6 +76,19 @@ def train_baseline(args):
         num_workers=args.num_workers,
         binary=args.binary,
     )
+
+    if args.init_from_checkpoint:
+        init_path = Path(args.init_from_checkpoint)
+        if not init_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {init_path}")
+        print(f"[INIT] Loading model weights only from: {init_path}")
+        init_state = torch.load(init_path, map_location="cpu", weights_only=False)
+        if "state_dict" in init_state:
+            init_state = init_state["state_dict"]
+        msg = model.load_state_dict(init_state, strict=False)
+        missing = getattr(msg, "missing_keys", [])
+        unexpected = getattr(msg, "unexpected_keys", [])
+        print(f"[INIT] missing={len(missing)} unexpected={len(unexpected)}")
 
     # Load binary pretrained backbone (strip classifier head) for 38-class fine-tuning
     if args.pretrained_binary:
@@ -118,7 +141,7 @@ def train_baseline(args):
         max_epochs=args.max_epochs,
         accelerator="auto",
         devices=1,
-        precision="16-mixed",       # P0: AMP halves VRAM, 1.5-2x speedup
+        precision=args.precision,   # AMP halves VRAM, 1.5-2x speedup
         gradient_clip_val=1.0,      # P1: prevent loss spikes
         callbacks=callbacks,
         log_every_n_steps=10,
@@ -148,7 +171,7 @@ def train_gan_enhanced(args):
     datamodule = RoadMCDataModule(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
-        max_points=min(args.max_points, 8192),  # limit N for GAN memory
+        max_points=min(args.max_points, 8192),  # keep GAN batches smaller; EdgeConv still uses dense pairwise distances
         num_workers=args.num_workers,
     )
     datamodule.setup("fit")
@@ -177,7 +200,11 @@ def train_gan_enhanced(args):
                 d_opt.zero_grad()
                 real_input = torch.cat([coords, normals], dim=-1)  # (B, N, 6)
                 with torch.no_grad():
-                    fake_input = gen(coords, normals.detach())
+                    styled = gen(coords, normals.detach())
+                    fake_input = torch.cat(
+                        [coords + styled[:, :, :3], normals + styled[:, :, 3:6]],
+                        dim=-1,
+                    )
 
                 real_validity = disc(real_input)
                 fake_validity = disc(fake_input)
@@ -192,10 +219,14 @@ def train_gan_enhanced(args):
 
             # Generator update (NOTE: no torch.no_grad — gradients must flow through disc to gen)
             g_opt.zero_grad()
-            fake_input = gen(coords, normals.detach())
+            styled = gen(coords, normals.detach())
+            fake_input = torch.cat(
+                [coords + styled[:, :, :3], normals + styled[:, :, 3:6]],
+                dim=-1,
+            )
             g_loss_adv = -disc(fake_input).mean()
-            g_loss_chamfer = torch.cdist(fake_input[:,:,:3], coords).min(dim=2)[0].mean() * 10.0
-            g_loss_normal = (1.0 - (fake_input[:,:,3:6] * normals).sum(dim=-1)).mean()
+            g_loss_chamfer = torch.cdist(fake_input[:, :, :3], coords).min(dim=2)[0].mean() * 10.0
+            g_loss_normal = (1.0 - (fake_input[:, :, 3:6] * normals).sum(dim=-1)).mean()
             g_loss = g_loss_adv + g_loss_chamfer + g_loss_normal
             g_loss.backward()
             g_opt.step()
@@ -226,8 +257,11 @@ def train_gan_enhanced(args):
         depths=tuple(args.depths),
         num_heads=tuple(args.num_heads),
         lr=args.lr, weight_decay=args.weight_decay,
+        optimizer_name=args.optimizer,
+        backbone_name=args.backbone,
+        use_mhc=args.use_mhc,
     ).to(device)
-    seg_opt = torch.optim.AdamW(seg_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    seg_opt, seg_sched = seg_model.build_optimizer_and_scheduler(args.optimizer)
 
     gen.eval()
     for epoch in range(args.max_epochs):
@@ -249,6 +283,7 @@ def train_gan_enhanced(args):
 
         if (epoch + 1) % 5 == 0:
             print(f"  [GAN+Seg] Epoch {epoch+1}/{args.max_epochs}")
+        seg_sched.step()
 
     print("[GAN] Mixed training complete.")
 
@@ -281,11 +316,14 @@ def train_end2end(args):
         depths=tuple(args.depths),
         num_heads=tuple(args.num_heads),
         lr=args.lr, weight_decay=args.weight_decay,
+        optimizer_name=args.optimizer,
+        backbone_name=args.backbone,
+        use_mhc=args.use_mhc,
     ).to(device)
 
     g_opt = torch.optim.Adam(gen.parameters(), lr=1e-4, betas=(0.5, 0.9))
     d_opt = torch.optim.Adam(disc.parameters(), lr=1e-4, betas=(0.5, 0.9))
-    seg_opt = torch.optim.AdamW(seg_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    seg_opt, seg_sched = seg_model.build_optimizer_and_scheduler(args.optimizer)
 
     datamodule = RoadMCDataModule(
         data_dir=args.data_dir,
@@ -309,14 +347,22 @@ def train_end2end(args):
                 d_opt.zero_grad()
                 ri = torch.cat([coords, normals], dim=-1)
                 with torch.no_grad():
-                    fi = gen(coords, normals.detach())
+                    styled = gen(coords, normals.detach())
+                    fi = torch.cat(
+                        [coords + styled[:, :, :3], normals + styled[:, :, 3:6]],
+                        dim=-1,
+                    )
                 gp = _gradient_penalty(disc, ri, fi, device)
                 d_loss = -disc(ri).mean() + disc(fi).mean() + lambda_gp * gp
                 d_loss.backward(); d_opt.step()
 
             # Generator (no torch.no_grad — gradients must flow through disc to gen)
             g_opt.zero_grad()
-            fi = gen(coords, normals.detach())
+            styled = gen(coords, normals.detach())
+            fi = torch.cat(
+                [coords + styled[:, :, :3], normals + styled[:, :, 3:6]],
+                dim=-1,
+            )
             g_loss = -disc(fi).mean()
             g_loss.backward(); g_opt.step()
 
@@ -333,6 +379,7 @@ def train_end2end(args):
 
         if (epoch + 1) % 5 == 0:
             print(f"  [E2E] Epoch {epoch+1}/{args.max_epochs}")
+        seg_sched.step()
 
     print("[E2E] End-to-end training complete.")
 
@@ -368,22 +415,33 @@ def main():
     parser.add_argument("--data_dir", type=str, default="./data/synthetic_output")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_points", type=int, default=4096,
-                        help="Max points per scene after subsampling. Full NxN attention matrix fits 8GB at N=4096.")
+                        help="Max points per scene after subsampling. Lower values reduce attention and GAN memory use.")
     parser.add_argument("--max_epochs", type=int, default=50)
     parser.add_argument("--embed_dim", type=int, default=96)
     parser.add_argument("--depths", type=int, nargs=4, default=[2, 2, 6, 2])
     parser.add_argument("--num_heads", type=int, nargs=4, default=[3, 6, 12, 24])
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--optimizer", type=str, default="muon", choices=["muon", "adamw"])
+    parser.add_argument("--backbone", type=str, default="swin3d", choices=["swin3d", "pointmamba"])
+    parser.add_argument("--use_mhc", action="store_true", default=True)
+    parser.add_argument("--no_mhc", action="store_false", dest="use_mhc")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader workers. Set >0 for async loading with pin_memory.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--class_weights", type=str, default=None,
                         help="Path to class weights .pt file for FocalLoss alpha")
+    parser.add_argument("--binary_class_weights", type=str, default=None,
+                        help="Explicit binary class weights as 'bg,disease', e.g. '1.0,2.5'")
     parser.add_argument("--gradient_checkpointing", action="store_true",
                         help="Enable gradient checkpointing to reduce VRAM")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to checkpoint to resume training from")
+    parser.add_argument("--init_from_checkpoint", type=str, default=None,
+                        help="Load model weights only, without restoring optimizer/scheduler state")
+    parser.add_argument("--precision", type=str, default="16-mixed",
+                        choices=["16-mixed", "bf16-mixed", "32-true"],
+                        help="Lightning precision mode")
     parser.add_argument("--lambda_focal", type=float, default=1.0,
                         help="Focal loss weight (default: 1.0)")
     parser.add_argument("--lambda_dice", type=float, default=1.0,
@@ -392,6 +450,8 @@ def main():
                         help="Edge loss weight (default: 0.5)")
     parser.add_argument("--binary", action="store_true",
                         help="Binary mode: collapse 38 classes to background(0) vs disease(1)")
+    parser.add_argument("--binary_threshold", type=float, default=0.5,
+                        help="Disease probability threshold used for binary validation/inference metrics")
     parser.add_argument("--pretrained_binary", type=str, default=None,
                         help="Path to binary checkpoint .ckpt to load backbone weights for 38-class fine-tuning. "
                              "The classifier head (backbone.decode.cls_head) will be reset to 38 classes.")

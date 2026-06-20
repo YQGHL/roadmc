@@ -158,6 +158,7 @@ class Swin3D(nn.Module):
         window_size: int = 64,
         mlp_ratio: float = 4.0,
         use_checkpoint: bool = False,
+        use_mhc: bool = True,
     ):
         super().__init__()
 
@@ -181,6 +182,7 @@ class Swin3D(nn.Module):
                         window_size=window_size,
                         mlp_ratio=mlp_ratio,
                         shift=shift,
+                        use_mhc=use_mhc,
                     )
                 )
 

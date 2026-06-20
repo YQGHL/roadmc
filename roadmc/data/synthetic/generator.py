@@ -16,10 +16,18 @@
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Tuple
 
 import numpy as np
-import torch
+
+if os.environ.get("ROADMC_GENERATOR_NO_TORCH") == "1":
+    torch = None  # type: ignore[assignment]
+    _DatasetBase = object
+else:
+    import torch
+
+    _DatasetBase = torch.utils.data.Dataset
 
 try:
     from .config import (
@@ -154,7 +162,7 @@ LABEL_PRIORITY: Dict[int, int] = {
     37: 8,   # 水泥修补
 }
 
-class SyntheticRoadDataset(torch.utils.data.Dataset):
+class SyntheticRoadDataset(_DatasetBase):
     """JTG 5210-2018 合成道路点云数据集。
 
     使用 :class:`GeneratorConfig` 作为唯一配置入口，组合 config.py 的
@@ -186,6 +194,8 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """生成第 ``idx`` 个场景并返回 torch 张量字典。"""
+        if torch is None:
+            raise RuntimeError("torch is disabled for this generator process")
         scene = self.generate_scene(idx)
         return {
             "points": torch.from_numpy(scene["points"]).float(),
@@ -615,6 +625,8 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
             return "asphalt"
         elif config_type == "concrete":
             return "concrete"
+        elif config_type == "mixed":
+            return str(rng.choice(["asphalt", "concrete"]))
         elif has_asphalt and not has_concrete:
             return "asphalt"
         elif has_concrete and not has_asphalt:
@@ -631,17 +643,33 @@ class SyntheticRoadDataset(torch.utils.data.Dataset):
         disease_probs = self.config.disease.disease_probs
         max_diseases = self.config.disease.max_diseases_per_scene
         severity_ratio = self.config.disease.severity_ratio
+        use_stratified = self.config.disease.use_stratified
 
         if pavement_type == "asphalt":
             available = ASPHALT_DISEASE_KEYS
         else:
             available = ["concrete_damage"]
 
-        selected: List[str] = []
-        for disease in available:
-            prob = disease_probs.get(disease, 0.0)
-            if prob > 0.0 and rng.random() < prob:
-                selected.append(disease)
+        if use_stratified:
+            weighted = [(d, disease_probs.get(d, 0.0)) for d in available]
+            weights = np.array([w for _, w in weighted], dtype=np.float64)
+            valid = weights > 0.0
+            weighted = [item for item, keep in zip(weighted, valid) if keep]
+            weights = weights[valid]
+            if len(weighted) == 0:
+                selected = []
+            else:
+                weights = weights / weights.sum()
+                n_select = min(max_diseases, len(weighted))
+                selected = list(
+                    rng.choice([d for d, _ in weighted], size=n_select, replace=False, p=weights)
+                )
+        else:
+            selected = []
+            for disease in available:
+                prob = disease_probs.get(disease, 0.0)
+                if prob > 0.0 and rng.random() < prob:
+                    selected.append(disease)
 
         if len(selected) > max_diseases:
             selected = list(rng.choice(selected, size=max_diseases, replace=False))

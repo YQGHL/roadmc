@@ -2,346 +2,304 @@
 
 # RoadMC
 
-**物理仿真驱动的路面点云病害检测**
+**物理仿真点云生成 + 路面病害点云分割**
 
-JTG 5210-2018 · 38 类语义分割 · Python 3.12 · PyTorch 2.x
+点云生成理论 · Swin3D / PointMamba · mHC · Muon / AdamW · 二分类到 38 类细分
 
-> [**English**](README.en.md)
+> [English](README.en.md)
 
 </div>
 
 ---
 
-## 系统架构
+## 项目概览
 
-### 系统总体架构
+RoadMC 包含两个同等重要的部分：
+
+1. **点云生成模块**：用路面粗糙度谱、微纹理、病害几何基元和 LiDAR 观测模型生成带标签的路面点云。
+2. **模型训练模块**：用 Swin3D 或 PointMamba 作为点云分割骨干，结合 mHC、Focal/Dice/Edge 损失和 Muon/AdamW 优化器训练逐点病害分割模型。
+
+当前实验路线是先做二分类：背景 `0` 与病害 `1`。二分类 mIoU 稳定后，再用二分类 checkpoint 初始化 backbone，切回 38 类细分。
+
+---
+
+## 方法总览
 
 <p align="center">
-  <img src="readmeimage/architecture.png" alt="RoadMC 系统总体架构" width="80%"/>
+  <img src="readmeimage/model_architecture.png" alt="RoadMC end-to-end method overview" width="96%"/>
 </p>
 
-系统的完整架构包含四个核心阶段：数据生成、Swin3D + mHC 分割网络、GAN 域适应、评估。
-
-### 数据管线
-
-<p align="center">
-  <img src="readmeimage/data_pipeline.png" alt="RoadMC 数据管线" width="95%"/>
-</p>
-
-### 模型架构
-
-<p align="center">
-  <img src="readmeimage/model_architecture.png" alt="RoadMC 模型架构" width="95%"/>
-</p>
-
-### GAN 域适应
-
-<p align="center">
-  <img src="readmeimage/gan_architecture.png" alt="GAN 域适应架构" width="85%"/>
-</p>
-
+图中左侧是点云生成模块，右侧是模型训练模块。生成模块不是简单的数据预处理，而是项目的方法核心之一：它决定了几何形态、标签分布、稀有病害覆盖率和训练数据的上限质量。
 
 ---
 
-## 管线概览
+## 安装
 
-| 阶段 | 核心 | 输出 |
-|:---:|------|------|
-| ① 数据生成 | ISO 8608 PSD 路面 + fBm + 13 病害基元 | `.npz` 点云场景 |
-| ② 核心网络 | Swin3D (31.2M) + mHC 双随机通道混合 | 逐点 logits (B,N,38) |
-| ③ GAN 适配 | DGCNN 生成器 (125K) + WGAN-GP 判别器 (83K) | 风格迁移点云 |
-| ④ 数据加载 | Lightning DataModule + padding collate | 训练/验证/测试 batch |
-| ⑤ 训练评估 | FocalLoss + DiceLoss + EdgeLoss | 38 类分割模型 |
-
-**类别**: 38 个 JTG 5210-2018 标签（20 沥青 + 17 水泥 + 背景）。
-
----
-
-## 数据生成管线
-
-10 步合成流程：
-
-| # | 步骤 | 实现 | 说明 |
-|---|------|------|------|
-| 1 | 路面 PSP 合成 | `primitives.roughness_psd()` | ISO 8608 功率谱密度生成路面轮廓 |
-| 2 | 扫描线重采样 | `primitives.lidar_scanlines()` | 模拟 LiDAR 环形扫描模式 |
-| 3 | fBm 纹理叠加 | `primitives.fBm_surface()` | 分形布朗运动微纹理 |
-| 4 | 病害组合 | `primitives.crack_bezier()` / `pothole()` / `rutting()` 等 | Bézier 裂缝 + 超椭圆坑槽 + 双高斯车辙 |
-| 5 | 曲率计算 | `generator._compute_curvature()` | 局部 PCA 曲率估计 (k=16) |
-| 6 | LiDAR 噪声 | `primitives.lidar_noise()` | 高斯测距噪声 + 角分辨率抖动 |
-| 7 | 标签传递 | 逐点继承病害区域标签 | 背景=0, 裂缝=1..6, 坑槽=7..12, 车辙=13..18... |
-| 8 | 体素下采样 | `generator._voxel_downsample()` | 0.01m³ 体素网格，保留标签众数 |
-| 9 | 归一化 | `generator._normalize()` | 居中 + 缩放至单位球 |
-| 10 | .npz 输出 | `np.savez_compressed()` | 包含 points/labels/feats/normals |
-
-### 病害模型
-
-对齐 JTG 5210-2018 病害分类体系：
-
-| 类型 | 基元函数 | 建模方法 | JTG 标签范围 |
-|------|----------|----------|-------------|
-| 裂缝 | `crack_bezier()`, `crack_perlin()`, `crack_voronoi()` | Bézier 曲线 + Perlin 噪声 + Voronoi 图 | 1–6 |
-| 坑槽 | `pothole()`, `pothole_elliptical()` | 超椭圆凹陷 + 边缘抬升 | 7–12 |
-| 车辙 | `rutting()`, `rutting_sinusoidal()` | 双高斯轮迹 + 正弦纵向调制 | 13–18 |
-| 修补 | `patching()` | 矩形/多边形填充区域 | 19–20 (沥青) |
-| 露骨/剥落 | `exposed_aggregate()`, `spalling()` | 随机顶点位移 + 边缘剥片 | 21–26 (水泥) |
-| 接缝/错台 | `joint_faulting()` | 板间高程差 + 接缝填充 | 27–31 (水泥) |
-| 裂缝(水泥) | — | 同沥青裂缝，参数调为水泥面板 | 32–37 (水泥) |
-
----
-
-## 网络模型架构
-
-### Swin3D 骨干
-
-Swin3D 骨干网络的详细配置如下：
-
-| Stage | 深度 | 通道 | 头数 | 下采样 |
-|-------|------|------|------|--------|
-| S0 | 2 | 96 | 3 | — |
-| S1 | 2 | 192 | 6 | — |
-| S2 | 6 | 384 | 12 | — |
-| S3 | 2 | 768 | 24 | — |
-
-总参数量 ~31.2M。不做空间下采样（保护稀疏裂缝点）。分割头用跳跃连接融合 S0–S3 的多尺度特征。
-
-### mHC（Manifold Hyper-Connection）
-
-mHC 替换标准 Transformer Block 中的 FFN 残差连接。核心操作为 Sinkhorn-Knopp 双随机通道混合：
-
-```
-输入: x (B, N, C)
-M = softplus(W₁) · softplus(W₂ᵀ)          # 亲和矩阵
-H = SinkhornKnopp(M / τ, iters=5)          # 双随机归一化
-y = x + H · x_proj                         # 残差输出
+```powershell
+pip install -e .
 ```
 
-- **训练**: 5 次 Sinkhorn-Knopp 迭代，`τ=0.1`
-- **部署**: `deploy()` 冻结 H 矩阵，零额外开销
-- **效果**: 深层训练更稳定，微弱裂缝信号保留率 +12%
+或使用 `uv`：
 
-```bibtex
-@article{mhc2025,
-  author = {DeepSeek-AI},
-  title = {mHC: Manifold-Constrained Hyper-Connections},
-  journal = {arXiv:2512.24880},
-  year = {2025}
-}
-```
-
-### Transformer Block 伪代码
-
-```
-def forward(x):
-    # Window attention
-    x = x + W-MSA(LN(x))
-    x = x + SW-MSA(LN(x))
-
-    # Replace FFN with mHC
-    x = x + MHC(LN(x))         # Sinkhorn-Knopp channel mixing
-    return x
-```
-
-### 损失函数
-
-```
-L_seg = λ₁ · FocalLoss(γ=2) + λ₂ · DiceLoss + λ₃ · EdgeLoss(Sobel)
-```
-
-- **FocalLoss**: 处理类别不平衡（裂缝点占比通常 <5%）
-- **DiceLoss**: 提升小目标分割质量
-- **EdgeLoss**: Sobel 3×3 边缘检测，仅在裂缝边界区域激活
-
-### GAN 域适应
-
-| 组件 | 架构 | 参数量 |
-|------|------|--------|
-| StyleTransferGen | DGCNN EdgeConv (k=16) 编码器-解码器 | 125K |
-| WGANDiscriminator | PointNet 风格 MLP + max-pool + 1×1 Conv | 83K |
-
-- 生成器以 6 维输入 (xyz + feats) → 输出残差位移
-- 倒角距离约束几何保真
-- WGAN-GP 梯度惩罚训练
-
----
-
-## 快速开始
-
-### 安装
-
-```bash
-uv sync                    # Python >= 3.11
-```
-
-### 自检验证
-
-每个模块有 `if __name__ == "__main__"` 自检块：
-
-```bash
-# 数据管线
-python roadmc/data/synthetic/config.py
-python roadmc/data/synthetic/primitives.py
-python roadmc/data/synthetic/generator.py
-
-# 核心网络
-python roadmc/models/mhc/mhc.py
-python roadmc/models/attention/window_attention.py
-python -m roadmc.models.backbone.swin3d
-python roadmc/models/model_pl.py
-
-# GAN
-python roadmc/models/gan/generator.py
-python roadmc/models/gan/discriminator.py
-
-# 数据加载
-python roadmc/data/dataloader.py
-python roadmc/data/real/dataset.py
-
-# 训练管线（导入+形状检查）
-python roadmc/train.py
-
-# 可视化
-python roadmc/test/test_visualize.py
-```
-
-### 批量生成合成数据
-
-```bash
-python -m roadmc.scripts.generate_synthetic \
-    --train-count 2000 --val-count 500 \
-    --grid-res 0.01 --roughness B
+```powershell
+uv sync
 ```
 
 ---
 
-## 数据格式
+## 点云生成：理论与实现
 
-单个 `.npz` 场景文件字段：
+RoadMC 的合成数据不是随机噪声点云，而是从“路面形貌 + 病害形变 + 传感器观测”的角度构造监督数据。
 
-| 字段 | 形状 | 类型 | 说明 |
-|------|------|------|------|
-| `points` | (N, 3) | float32 | XYZ 坐标 |
-| `labels` | (N,) | int32 | JTG 标签 [0, 37] |
-| `feats` | (N, 3) | float32 | 强度, 曲率, 裂缝边界距离 |
-| `normals` | (N, 3) | float32 | 单位法向量 |
-| `pavement_type` | — | str | `"asphalt"` 或 `"concrete"` |
+### 理论组成
 
-```python
-import numpy as np
-d = np.load("scene_0000.npz", allow_pickle=True)
-pts = d["points"]      # (N, 3)
-lbl = d["labels"]      # (N,)
-fts = d["feats"]       # (N, 3)
+| 组成 | 作用 | 当前实现 |
+| --- | --- | --- |
+| 路面基底 | 给出道路整体高程与粗糙度 | ISO 8608 PSD 粗糙度谱，支持 A-E 等级 |
+| 微纹理 | 叠加局部细节，避免表面过于光滑 | fBm fractal surface、局部曲率、法向量 |
+| 病害基元 | 在几何上生成裂缝、坑槽、车辙、剥落等形态 | `roadmc/data/synthetic/primitives.py` |
+| LiDAR 观测 | 让点云更接近扫描数据而不是规则网格 | scan-line resampling、测距噪声、角度扰动、密度控制 |
+| 标签传播 | 把病害区域转成逐点监督信号 | 38 类 JTG 风格标签，训练时可折叠为二分类 |
+| 场景输出 | 形成可训练的 `.npz` 数据集 | `points`、`labels`、`feats`、`normals`、`pavement_type` |
+
+### 生成新数据集
+
+```powershell
+python roadmc/scripts/generate_synthetic.py `
+  --train-count 2000 `
+  --val-count 500 `
+  --output-dir ./data/synthetic_output `
+  --pavement mixed `
+  --roughness B `
+  --workers 8
 ```
+
+### 扩展已有数据集
+
+扩展脚本适合中断后续跑，会检查已有 `scene_*.npz`，只补足缺失数量。
+
+```powershell
+python roadmc/scripts/expand_synthetic_dataset.py `
+  --output-dir ./data/synthetic_output `
+  --target-total 5000 `
+  --workers 16 `
+  --num-points 8192 `
+  --pavement mixed `
+  --roughness B
+```
+
+当前设备上建议优先使用 `16` workers。此前 `32` workers 容易触发 Windows 页面文件或内存压力。
 
 ---
 
-## 可视化预览
+## 模型训练：结构与策略
 
-运行 `python roadmc/test/test_visualize.py` 输出 13 张诊断图到 `test/output/`：
+训练模块把合成点云作为监督数据，输出逐点 logits。它既可以做二分类，也可以做 38 类细分。
 
-| 文件 | 内容 |
-|------|------|
-| `asphalt_multi_disease_2d_overlay.png` | 沥青路面多病害 2D 俯视图 |
-| `asphalt_rutting_corrugation_3d.png` | 车辙病害 3D 形态 |
-| `label_statistics.png` | 标签分布统计柱状图 |
-| `readmeimage/architecture.png` | 系统总体架构图 |
-| `readmeimage/data_pipeline.png` | 数据管线图 |
-| `readmeimage/model_architecture.png` | 模型架构图 |
-| `readmeimage/gan_architecture.png` | GAN 域适应架构图 |
+### 数据加载
 
----
+`SyntheticPointCloudDataset` 从 `.npz` 文件读取：
 
-## 训练
+- `coords`: 归一化 XYZ 坐标。
+- `feats`: 强度、曲率、裂缝边界距离。
+- `labels`: 38 类标签；二分类时动态折叠为 `labels > 0`。
+- `valid_mask`: padding 后忽略无效点，避免 loss 和 mIoU 被填充点污染。
 
-三种模式，通过 `train.py` 启动：
+采样逻辑会优先保留病害点，降低 batch 中全背景样本过多的问题。
 
-| 模式 | 命令 | 说明 |
-|:----:|------|------|
-| baseline | `python train.py baseline` | 仅合成数据训练分割模型 |
-| gan_enhanced | `python train.py gan_enhanced` | GAN 预训练 + 风格混合 |
-| end2end | `python train.py end2end` | GAN + 分割交替优化 |
+### Backbone 与 mHC
 
-```bash
-python train.py baseline --data_dir ./data/synthetic_output --max_epochs 50
+可选骨干：
+
+| Backbone | 特点 | 适用判断 |
+| --- | --- | --- |
+| `swin3d` | 窗口注意力点云 Transformer | 表达能力强，但显存压力更高 |
+| `pointmamba` | Morton 顺序点序列扫描混合 | 更轻量，适合当前二分类快速实验 |
+
+mHC 默认开启，用 Sinkhorn 风格通道混合增强深层特征流动；消融时可加 `--no_mhc`。
+
+### 损失与优化
+
+当前训练目标：
+
+```text
+Loss = FocalLoss + DiceLoss + Soft EdgeLoss
 ```
 
-优化器: AdamW (lr=1e-4), CosineAnnealingLR。
+- `FocalLoss`: 缓解背景点远多于病害点的问题。
+- `DiceLoss`: 强化小目标、稀有病害区域。
+- `Soft EdgeLoss`: 用可微边缘约束辅助裂缝/边界区域。
+- `val_mIoU`: macro mIoU，排除背景类，与评估报告口径对齐。
+
+优化器默认是 `Muon + AdamW` 混合：
+
+- 二维矩阵参数使用 Muon。
+- bias、norm、标量等一维参数使用 AdamW。
+- 如果当前 PyTorch 环境没有 `torch.optim.Muon`，使用 `--optimizer adamw`。
+
+### 二分类训练
+
+```powershell
+python roadmc/train.py baseline `
+  --data_dir ./data/synthetic_output `
+  --binary `
+  --backbone pointmamba `
+  --optimizer muon `
+  --batch_size 2 `
+  --max_points 2048 `
+  --max_epochs 20 `
+  --num_workers 4 `
+  --precision 16-mixed `
+  --binary_class_weights 1.0,3.0
+```
+
+快速诊断：
+
+```powershell
+python roadmc/scripts/quick_diagnose.py `
+  --binary `
+  --backbone pointmamba `
+  --steps 200 `
+  --batch_size 2 `
+  --max_points 1024 `
+  --binary_class_weights 1.0,3.0
+```
+
+### 切回 38 类
+
+二分类稳定后，用二分类 checkpoint 初始化 backbone，分类头重新训练为 38 类：
+
+```powershell
+python roadmc/train.py baseline `
+  --data_dir ./data/synthetic_output `
+  --pretrained_binary ./lightning_logs/version_X/checkpoints/best.ckpt `
+  --backbone pointmamba `
+  --optimizer muon `
+  --batch_size 2 `
+  --max_points 2048 `
+  --max_epochs 50 `
+  --num_workers 4 `
+  --precision 16-mixed
+```
+
+直接训练 38 类时，去掉 `--binary` 即可：
+
+```powershell
+python roadmc/train.py baseline --data_dir ./data/synthetic_output --backbone pointmamba
+```
 
 ---
 
 ## 评估
 
-逐类 IoU / 召回率 / 精确率，按路面类型分组：
+38 类 checkpoint 可使用：
 
-```bash
-python evaluate.py --checkpoint ./lightning_logs/version_X/checkpoints/best.ckpt
+```powershell
+python roadmc/evaluate.py `
+  --checkpoint ./lightning_logs/version_X/checkpoints/best.ckpt `
+  --data_dir ./data/synthetic_output `
+  --output_json ./eval_report.json
 ```
 
-输出终端表格 + JSON 报告。沥青 [1–20] / 水泥 [21–37] 分开统计。
+二分类阶段主要看训练日志中的 `val_mIoU`，或用 `quick_diagnose.py` 做短跑检查。
+
+---
+
+## 数据格式
+
+每个场景为一个 `.npz` 文件：
+
+| 字段 | 形状 | 说明 |
+| --- | --- | --- |
+| `points` | `(N, 3)` | XYZ 点坐标 |
+| `labels` | `(N,)` | 38 类标签，二分类训练时动态折叠 |
+| `feats` | `(N, 3)` | 强度、曲率、裂缝边界距离 |
+| `normals` | `(N, 3)` | 法向量 |
+| `pavement_type` | 标量 | `asphalt`、`concrete` 或 mixed 生成结果 |
+
+---
+
+## 38 类标签
+
+`0` 为背景。`1-20` 为沥青路面病害，`21-37` 为水泥混凝土路面病害。
+
+| ID | 类别 |
+| --- | --- |
+| 0 | Background |
+| 1-8 | 裂缝类：龟裂、块裂、纵向裂缝、横向裂缝，含轻重程度 |
+| 9-10 | 坑槽 |
+| 11-12 | 松散 |
+| 13-14 | 沉陷 |
+| 15-16 | 车辙 |
+| 17-18 | 波浪拥包 |
+| 19 | 泛油 |
+| 20 | 沥青修补 |
+| 21-22 | 水泥板破碎 |
+| 23-24 | 水泥裂缝 |
+| 25-26 | 板角断裂 |
+| 27-28 | 错台 |
+| 29 | 唧泥 |
+| 30-31 | 边角剥落 |
+| 32-33 | 接缝损坏 |
+| 34 | 坑洞 |
+| 35 | 拱起 |
+| 36 | 露骨 |
+| 37 | 水泥修补 |
 
 ---
 
 ## 项目结构
 
-```
+```text
 roadmc/
-├── data/
-│   ├── synthetic/              # 合成生成器
-│   │   ├── config.py           # GeneratorConfig 数据类
-│   │   ├── primitives.py       # 13 个物理基元 (2020+ 行)
-│   │   └── generator.py        # 10 步管线
-│   └── real/                   # 真实数据加载 (stub)
-├── models/
-│   ├── backbone/swin3d.py      # 4 阶段 Swin3D (~31M)
-│   ├── attention/              # 3D 窗口注意力 + 可变形
-│   ├── mhc/mhc.py              # mHC (Sinkhorn-Knopp)
-│   ├── gan/                    # 风格迁移 GAN
-│   │   ├── generator.py        # DGCNN (125K)
-│   │   └── discriminator.py    # WGAN-GP (83K)
-│   └── model_pl.py             # Lightning + 损失
-├── scripts/
-│   └── generate_synthetic.py   # 批量生成 CLI
-├── test/
-│   └── test_visualize.py       # 13 张诊断 PNG
-├── docs/
-│   ├── data_pipeline.png
-│   ├── model_pipeline.png
-│   └── architecture.png
-├── train.py                    # 训练入口
-├── evaluate.py                 # 评估报告
-├── run.py                      # 交互菜单
-└── pyproject.toml
+  data/
+    dataloader.py
+    real/dataset.py
+    synthetic/
+      config.py
+      generator.py
+      primitives.py
+  models/
+    attention/window_attention.py
+    backbone/
+      swin3d.py
+      pointmamba.py
+    gan/
+      generator.py
+      discriminator.py
+    mhc/
+      mhc.py
+      spectral_analysis.py
+    model_pl.py
+  scripts/
+    generate_synthetic.py
+    expand_synthetic_dataset.py
+    quick_diagnose.py
+    grid_search_binary.py
+  train.py
+  evaluate.py
+readmeimage/
+  model_architecture.png
 ```
 
 ---
 
-## 引用
+## 当前实验路线
 
-```bibtex
-@article{mhc2025,
-  author = {DeepSeek-AI},
-  title = {mHC: Manifold-Constrained Hyper-Connections},
-  journal = {arXiv:2512.24880},
-  year = {2025}
-}
-
-@misc{roadmc2026,
-  author = {YQGHL},
-  title = {RoadMC: 物理仿真驱动的路面点云病害检测系统},
-  year = {2026},
-  howpublished = {\url{https://github.com/YQGHL/roadmc}}
-}
-```
-
-## 许可
-
-MIT © 2026 YQGHL。详见 [LICENSE](LICENSE)。
+1. 扩大合成数据集到约 5000 个场景。
+2. 先把二分类 `val_mIoU` 提升到 `0.7-0.9` 区间。
+3. 对比 `pointmamba` 与 `swin3d`，优先选择显存稳定、收敛更快的骨干。
+4. 二分类稳定后，用 `--pretrained_binary` 迁移到 38 类细分。
+5. 再考虑 GAN 域适配和真实点云加载。
 
 ---
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 <div align="center">
 
-> [**English**](README.en.md)
+> [English](README.en.md)
 
 </div>
