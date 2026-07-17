@@ -23,6 +23,25 @@ RoadMC 包含两个同等重要的部分：
 
 ---
 
+## 最近更新：2026-07-17
+
+### 已完成
+
+- 移除由合成标签派生的 `crack_boundary_dist`，统一合成数据、旧 `.npz`、真实点云和模型 checkpoint 的可观测特征契约：`normalized_intensity`、`pca_curvature`、`signed_local_height_residual`。
+- 修复验证/测试集的抽样偏置，训练集保留病害分层抽样，验证与测试改为可复现的均匀抽样。
+- 新增受控类别预算生成、数据集验证、自动类别权重、二分类到 `4 -> 8 -> 38` 类的迁移接口，以及合成到真实域的密度/强度/几何差异诊断。
+- 在 RTX 5060 Laptop 8 GB 上完成 Swin3D + mHC + Muon/AdamW 的二分类中等规模验证：4,995 个场景、每场景 2,048 点，独立阈值评估 Disease IoU / 支持类 mIoU 为 `0.7235`，bootstrap 95% CI 为 `[0.7070, 0.7391]`。
+- 完成 34 项自动化测试、代码编译检查，以及二分类 checkpoint 向 4/8/38 类模型的 GPU 前向/反向迁移 smoke test。
+
+### 待完成
+
+- 固定二分类 checkpoint 和阈值后，建立真正独立的合成测试集，并进行 Swin3D、PointMamba、mHC 和优化器的可重复消融实验。
+- 以当前二分类 checkpoint 为初始化，逐阶段完成 4 类、8 类和 38 类训练；多分类结果必须单独报告，不能由二分类指标推断。
+- 获取带可靠标签、单位和 JTG 映射的真实道路点云，完成真实域 mIoU 验证。目前下载的 M2S-RoAD 点云只有无标签 PCD，只能用于域差诊断。
+- 针对当前主要域差异校准 LiDAR 强度、点密度和法向倾角，再评估域随机化、无监督适配和 GAN；在真实标签和独立测试协议建立前，不把域适配结果宣称为真实域性能。
+
+---
+
 ## 方法总览
 
 <p align="center">
@@ -90,6 +109,29 @@ python roadmc/scripts/expand_synthetic_dataset.py `
 
 当前设备上建议优先使用 `16` workers。此前 `32` workers 容易触发 Windows 页面文件或内存压力。
 
+### 受控类别预算与数据契约
+
+正式实验应使用类别预算生成，而不是只按文件数扩展数据集。脚本会分别约束每类的强制场景数和有效目标点数，并为每个场景写入 `roadmc.observable_features.v1` 特征契约。
+
+```powershell
+python roadmc/scripts/generate_class_budget.py `
+  --output-dir ./data/credibility_v1_5k `
+  --split both `
+  --target-scenes-per-class 112 `
+  --min-points-per-class 4000 `
+  --grid-res 0.02 `
+  --num-points 2048 `
+  --workers 16 `
+  --pavement mixed `
+  --roughness B
+
+python roadmc/scripts/validate_synthetic_dataset.py `
+  --data-dir ./data/credibility_v1_5k `
+  --split both `
+  --feature-check-scenes 64 `
+  --output-json ./output/data_validation.json
+```
+
 ---
 
 ## 模型训练：结构与策略
@@ -101,11 +143,11 @@ python roadmc/scripts/expand_synthetic_dataset.py `
 `SyntheticPointCloudDataset` 从 `.npz` 文件读取：
 
 - `coords`: 归一化 XYZ 坐标。
-- `feats`: 强度、曲率、裂缝边界距离。
+- `feats`: 归一化强度、PCA 曲率、有符号局部高度残差；全部可由真实点云在推理时计算。PCA 曲率为 `lambda_min / trace(C)`，局部残差是相对 kNN 切平面的有符号正交距离并按邻域半径归一化。
 - `labels`: 38 类标签；二分类时动态折叠为 `labels > 0`。
 - `valid_mask`: padding 后忽略无效点，避免 loss 和 mIoU 被填充点污染。
 
-采样逻辑会优先保留病害点，降低 batch 中全背景样本过多的问题。
+训练集会分层保留病害点，降低 batch 中全背景样本过多的问题；验证和测试集使用由场景索引确定的均匀随机抽样，保留原始病害比例并使 mIoU、ECE 与 bootstrap 可复现。旧 `.npz` 若缺少当前特征 schema，会从 `XYZ + intensity` 重算特征，历史标签派生通道不会进入新训练。
 
 ### Backbone 与 mHC
 
@@ -128,7 +170,7 @@ Loss = FocalLoss + DiceLoss + Soft EdgeLoss
 
 - `FocalLoss`: 缓解背景点远多于病害点的问题。
 - `DiceLoss`: 强化小目标、稀有病害区域。
-- `Soft EdgeLoss`: 用可微边缘约束辅助裂缝/边界区域。
+- `Soft EdgeLoss`: 在全部有效点的 BEV 网格上比较病害边界；标签只作为监督目标，不作为模型输入或筛选掩码。
 - `val_mIoU`: macro mIoU，排除背景类，与评估报告口径对齐。
 
 优化器默认是 `Muon + AdamW` 混合：
@@ -136,21 +178,27 @@ Loss = FocalLoss + DiceLoss + Soft EdgeLoss
 - 二维矩阵参数使用 Muon。
 - bias、norm、标量等一维参数使用 AdamW。
 - 如果当前 PyTorch 环境没有 `torch.optim.Muon`，使用 `--optimizer adamw`。
+- 默认学习率按优化器区分：Muon 为 `1e-2`，AdamW 为 `1e-3`；可用 `--lr` 覆盖。Muon 的二维矩阵更新与 AdamW 的 bias/norm 更新保持分组。
 
 ### 二分类训练
 
 ```powershell
 python roadmc/train.py baseline `
-  --data_dir ./data/synthetic_output `
-  --binary `
-  --backbone pointmamba `
+  --data_dir ./data/credibility_v1_5k `
+  --label_stage binary `
+  --backbone swin3d `
   --optimizer muon `
-  --batch_size 2 `
+  --batch_size 4 `
   --max_points 2048 `
-  --max_epochs 20 `
+  --embed_dim 48 `
+  --depths 1 1 2 1 `
+  --num_heads 3 3 6 6 `
+  --window_size 32 `
+  --max_epochs 5 `
   --num_workers 4 `
   --precision 16-mixed `
-  --binary_class_weights 1.0,3.0
+  --auto_class_weights `
+  --metric_min_support 500
 ```
 
 快速诊断：
@@ -197,8 +245,13 @@ python roadmc/train.py baseline --data_dir ./data/synthetic_output --backbone po
 ```powershell
 python roadmc/evaluate.py `
   --checkpoint ./lightning_logs/version_X/checkpoints/best.ckpt `
-  --data_dir ./data/synthetic_output `
-  --output_json ./eval_report.json
+  --data-dir ./data/credibility_v1_5k `
+  --label-stage binary `
+  --max-points 2048 `
+  --scan-binary-thresholds `
+  --threshold-calibration-scenes 170 `
+  --bootstrap-samples 500 `
+  --output-json ./eval_report.json
 ```
 
 二分类阶段主要看训练日志中的 `val_mIoU`，或用 `quick_diagnose.py` 做短跑检查。
@@ -213,9 +266,10 @@ python roadmc/evaluate.py `
 | --- | --- | --- |
 | `points` | `(N, 3)` | XYZ 点坐标 |
 | `labels` | `(N,)` | 38 类标签，二分类训练时动态折叠 |
-| `feats` | `(N, 3)` | 强度、曲率、裂缝边界距离 |
+| `feats` | `(N, 3)` | 归一化强度、PCA 曲率、有符号局部高度残差（`roadmc.observable_features.v1`） |
 | `normals` | `(N, 3)` | 法向量 |
 | `pavement_type` | 标量 | `asphalt`、`concrete` 或 mixed 生成结果 |
+| `feature_schema` | 标量 | 模型输入特征契约；正式训练必须为 `roadmc.observable_features.v1` |
 
 ---
 
@@ -286,11 +340,11 @@ readmeimage/
 
 ## 当前实验路线
 
-1. 扩大合成数据集到约 5000 个场景。
-2. 先把二分类 `val_mIoU` 提升到 `0.7-0.9` 区间。
-3. 对比 `pointmamba` 与 `swin3d`，优先选择显存稳定、收敛更快的骨干。
-4. 二分类稳定后，用 `--pretrained_binary` 迁移到 38 类细分。
-5. 再考虑 GAN 域适配和真实点云加载。
+1. 冻结当前二分类 checkpoint 与独立阈值，先完成独立合成测试集。
+2. 对 Swin3D、PointMamba、mHC 和 Muon/AdamW 做受控消融，统一使用全局混淆矩阵和 scene-block bootstrap 统计。
+3. 按 `binary -> four -> eight -> full38` 课程迁移训练，并分别记录每一阶段的类别支持度和 per-class IoU。
+4. 用带元数据的真实点云建立可复现的传感器校准与域差基线。
+5. 在真实标签可用后，再验证域随机化、GAN 或无监督域适配是否带来稳定收益。
 
 ---
 

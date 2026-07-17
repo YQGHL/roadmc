@@ -131,8 +131,8 @@ class Swin3D(nn.Module):
     Parameters
     ----------
     in_channels : int
-        Number of input feature channels (default 3: intensity, curvature,
-        crack-boundary distance).
+        Number of input feature channels (default 3: normalized intensity,
+        PCA curvature, signed local-height residual).
     num_classes : int
         Number of JTG pavement disease classes (default 38).
     embed_dim : int
@@ -221,7 +221,7 @@ if __name__ == "__main__":
     B, N = 2, 512
 
     coords = torch.rand(B, N, 3, device=device)
-    feats = torch.rand(B, N, 3, device=device)  # [intensity, curvature, crack_boundary_dist]
+    feats = torch.rand(B, N, 3, device=device)  # [intensity, curvature, local_height_residual]
 
     # Tiny config for fast CPU test
     model = Swin3D(

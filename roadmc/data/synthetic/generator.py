@@ -34,6 +34,13 @@ try:
         NUM_CLASSES,
         GeneratorConfig,
     )
+    from .labels import TargetLabelSpec, target_spec_for_label
+    from ..features import (
+        DEFAULT_GEOMETRY_K_NEIGHBORS,
+        OBSERVABLE_FEATURE_NAMES,
+        OBSERVABLE_FEATURE_SCHEMA,
+        compute_observable_features,
+    )
     from .primitives import (
         generate_road_surface,
         add_micro_texture,
@@ -44,6 +51,7 @@ try:
         add_rutting,
         add_corrugation,
         add_bleeding,
+        add_patching,
         add_concrete_damage,
         simulate_lidar_noise,
         resample_to_lidar_pattern,
@@ -61,6 +69,13 @@ except ImportError:
         NUM_CLASSES,
         GeneratorConfig,
     )
+    from labels import TargetLabelSpec, target_spec_for_label  # type: ignore[no-redef]
+    from roadmc.data.features import (  # type: ignore[no-redef]
+        DEFAULT_GEOMETRY_K_NEIGHBORS,
+        OBSERVABLE_FEATURE_NAMES,
+        OBSERVABLE_FEATURE_SCHEMA,
+        compute_observable_features,
+    )
     from primitives import (  # type: ignore[no-redef]
         generate_road_surface,
         add_micro_texture,
@@ -71,6 +86,7 @@ except ImportError:
         add_rutting,
         add_corrugation,
         add_bleeding,
+        add_patching,
         add_concrete_damage,
         simulate_lidar_noise,
         resample_to_lidar_pattern,
@@ -87,6 +103,7 @@ CONCRETE_DAMAGE_TYPES: List[str] = [
     "pitting",
     "blowup",
     "exposed_aggregate",
+    "patching",
 ]
 
 # 无严重程度区分的混凝土损坏类型（标签直接固定）
@@ -101,6 +118,7 @@ ASPHALT_DISEASE_KEYS: List[str] = [
     "rutting",
     "corrugation",
     "bleeding",
+    "patching",
 ]
 
 # 病害应用的自然顺序（大尺度 → 小尺度）
@@ -111,6 +129,7 @@ DISEASE_APPLY_ORDER: Dict[str, int] = {
     "pothole": 3,
     "crack": 4,
     "bleeding": 5,
+    "patching": 3,
     "raveling": 6,
     "concrete_damage": 0,
 }
@@ -172,7 +191,7 @@ class SyntheticRoadDataset(_DatasetBase):
 
     - **points**: ``(N, 3)`` torch.float32 — 归一化后的点云坐标
     - **labels**: ``(N,)`` torch.int64 — JTG 5210-2018 标签 (0-37)
-    - **feats**: ``(N, 3)`` torch.float32 — [强度反射率, 局部曲率, 裂缝边界距离]
+    - **feats**: ``(N, 3)`` torch.float32 — [归一化强度, PCA 曲率, 有符号局部高度残差]
     - **normals**: ``(N, 3)`` torch.float32 — 表面单位法向量
     - **pavement_type**: str — 'asphalt' | 'concrete'
 
@@ -205,7 +224,7 @@ class SyntheticRoadDataset(_DatasetBase):
             "pavement_type": scene["pavement_type"],
         }
 
-    def generate_scene(self, idx: int) -> Dict:
+    def generate_scene(self, idx: int, target_label: int | None = None) -> Dict:
         """生成一个完整的合成道路场景。
 
         内部流程按以下顺序执行：
@@ -231,6 +250,10 @@ class SyntheticRoadDataset(_DatasetBase):
             包含 points, labels, feats, normals, pavement_type 的字典。
         """
         # 种子管理
+        target_spec: TargetLabelSpec | None = None
+        if target_label is not None:
+            target_spec = target_spec_for_label(target_label)
+
         if self.config.seed is not None:
             scene_seed = self.config.seed + idx
         else:
@@ -241,15 +264,12 @@ class SyntheticRoadDataset(_DatasetBase):
         width = self.config.road.width
         length = self.config.road.length
 
-        # 网格尺寸 — 必须与 generate_road_surface 内部一致
-        # np.arange(0, width, grid_res) 可能截断不同，所以从实际点数推断
-        x_tmp = np.arange(0, width, grid_res)
-        y_tmp = np.arange(0, length, grid_res)
-        nx = len(x_tmp)
-        ny = len(y_tmp)
-
         # 1. 路面类型选择
-        pavement_type = self._select_pavement_type(rng)
+        pavement_type = (
+            target_spec.pavement_type
+            if target_spec is not None
+            else self._select_pavement_type(rng)
+        )
 
         # 2. 路面宏观轮廓 + 微观纹理
         points, normals = generate_road_surface(
@@ -285,13 +305,13 @@ class SyntheticRoadDataset(_DatasetBase):
             if len(scan_idx) > 10:
                 points = points[scan_idx]
                 normals = normals[scan_idx]
-            # 更新网格尺寸（扫描线重采样改变了点数）
-            nx, ny = len(x_tmp), len(y_tmp)  # 网格维度保持不变（后续重建会用）
-
         # 3. 标签初始化 + 病害选择 & 应用
         labels = np.zeros(points.shape[0], dtype=np.int64)
 
-        diseases = self._select_diseases(rng, pavement_type)
+        if target_spec is None:
+            diseases = self._select_diseases(rng, pavement_type)
+        else:
+            diseases = [(target_spec.disease_type, target_spec.severity)]
         # 按自然顺序排序（大尺度 → 小尺度）
         diseases.sort(key=lambda d: DISEASE_APPLY_ORDER.get(d[0], 99))
 
@@ -309,9 +329,14 @@ class SyntheticRoadDataset(_DatasetBase):
             old_labels = labels.copy()
 
             if disease_type == "crack":
-                crack_type = str(rng.choice(self.config.crack.crack_types))
+                crack_type = (
+                    target_spec.variant
+                    if target_spec is not None and target_spec.disease_type == "crack"
+                    else str(rng.choice(self.config.crack.crack_types))
+                )
                 params: dict = {
                     "d_max": 0.010 if severity == "light" else 0.030,
+                    "label_width_floor": grid_res,
                 }
                 points, labels = add_crack(
                     points, labels,
@@ -399,24 +424,50 @@ class SyntheticRoadDataset(_DatasetBase):
                     region_mask=region_mask, seed=seed,
                 )
 
-            elif disease_type == "concrete_damage":
-                damage_type = str(rng.choice(CONCRETE_DAMAGE_TYPES))
-                if damage_type in CONCRETE_NO_SEVERITY:
-                    sev = "-"
-                else:
-                    sev = severity
-                params = {
-                    "slab_length": self.config.concrete_damage.slab_length,
-                    "slab_width": self.config.concrete_damage.slab_width,
-                    "joint_width": self.config.concrete_damage.joint_width,
-                    "x_offset": self.config.concrete_damage.x_offset,
-                    "y_offset": self.config.concrete_damage.y_offset,
-                }
-                points, labels = add_concrete_damage(
-                    points, labels,
-                    damage_type=damage_type, severity=sev,
-                    params=params, seed=seed,
+            elif disease_type == "patching":
+                points, labels = self._apply_patching(
+                    points,
+                    labels,
+                    patch_label=20,
+                    width=width,
+                    length=length,
+                    rng=rng,
                 )
+
+            elif disease_type == "concrete_damage":
+                damage_type = (
+                    target_spec.variant
+                    if target_spec is not None
+                    and target_spec.disease_type == "concrete_damage"
+                    else str(rng.choice(CONCRETE_DAMAGE_TYPES))
+                )
+                if damage_type == "patching":
+                    points, labels = self._apply_patching(
+                        points,
+                        labels,
+                        patch_label=37,
+                        width=width,
+                        length=length,
+                        rng=rng,
+                    )
+                else:
+                    if damage_type in CONCRETE_NO_SEVERITY:
+                        sev = "-"
+                    else:
+                        sev = severity
+                    params = {
+                        "slab_length": self.config.concrete_damage.slab_length,
+                        "slab_width": self.config.concrete_damage.slab_width,
+                        "joint_width": self.config.concrete_damage.joint_width,
+                        "x_offset": self.config.concrete_damage.x_offset,
+                        "y_offset": self.config.concrete_damage.y_offset,
+                        "label_width_floor": grid_res,
+                    }
+                    points, labels = add_concrete_damage(
+                        points, labels,
+                        damage_type=damage_type, severity=sev,
+                        params=params, seed=seed,
+                    )
 
             # P1-3 + Q3 向量化：仅在优先级更高时保留新标签
             changed_mask = labels != old_labels
@@ -534,31 +585,19 @@ class SyntheticRoadDataset(_DatasetBase):
         # P0-4 距离阈值保护：超过 3σ 距离的点回退到背景标签
         # 防止裂缝边缘噪声点携带错误标签到远处
         max_transfer_dist = self.config.lidar_noise.distance_noise_std * 3.0
-        uncertain_mask = nn_dist > max_transfer_dist
+        if max_transfer_dist > 0.0:
+            uncertain_mask = nn_dist > max_transfer_dist
+        else:
+            # The spherical-coordinate round trip has machine-scale error even
+            # when all requested noise terms are zero. It is not uncertainty.
+            uncertain_mask = np.zeros_like(nn_dist, dtype=bool)
         # 对不确定点：仅保留非裂缝标签（标签 > 0 且 <= 8 的裂缝标签降为背景）
         # 但保留松散、车辙、沉陷等大面积病害标签
         crack_mask = (labels >= 1) & (labels <= 8)  # Q1: 布尔掩码替代 set + for
         restore_mask = uncertain_mask & crack_mask
         labels[restore_mask] = 0
 
-        # 10. P2-4: 裂缝边界软标签 + P1-2: 体素下采样
-        # P2-4: 为每个点计算到最近裂缝边界的距离，转换为裂缝概率软标签
-        crack_boundary_dist = np.zeros(len(noisy_points), dtype=np.float32)
-        crack_mask_p2_4 = (labels >= 1) & (labels <= 8)
-        if np.any(crack_mask_p2_4) and np.any(~crack_mask_p2_4):
-            from scipy.spatial import KDTree as _KDTree
-            crack_pts = noisy_points[crack_mask_p2_4]
-            bg_pts = noisy_points[~crack_mask_p2_4]
-            if len(crack_pts) > 1 and len(bg_pts) > 1:
-                crack_tree = _KDTree(crack_pts)
-                bg_dists, _ = crack_tree.query(bg_pts, k=1)
-                bg_tree = _KDTree(bg_pts)
-                crack_dists, _ = bg_tree.query(crack_pts, k=1)
-                crack_boundary_dist[crack_mask_p2_4] = crack_dists
-                crack_boundary_dist[~crack_mask_p2_4] = bg_dists
-                # 距离→概率：exp(-d²/2σ²)，σ 取 3×grid_res
-                sigma = grid_res * 3.0
-        # P1-2: 使用体素下采样替代随机重采样
+        # 10. P1-2: 使用体素下采样替代随机重采样
         if self.config.target_density is not None and self.config.target_density > 0:
             road_area = width * length
             target_count = int(road_area * self.config.target_density)
@@ -573,40 +612,49 @@ class SyntheticRoadDataset(_DatasetBase):
                     voxel_size=effective_voxel_size,
                 )
             )
-            # P2-4: 最近邻传递裂缝边界距离
-            from scipy.spatial import KDTree as _KDTree
-            bd_tree = _KDTree(noisy_points)
-            _, bd_idx = bd_tree.query(points_final, k=1)
-            crack_boundary_dist_final = crack_boundary_dist[bd_idx]
         else:
             # 回退到旧的 num_points 硬重采样
             points_final, labels_final, intensity_final, curvature_final, normals_final = (
                 self._resample_to_target(
                     noisy_points, labels, intensity, curvature, normals,
-                    self.config.num_points, rng,
+                    self.config.num_points, rng, protected_label=target_label,
                 )
             )
-            # P2-4: KDTree 传递裂缝边界距离到重采样后的点
-            from scipy.spatial import KDTree as _KDTree
-            bd_tree = _KDTree(noisy_points)
-            _, bd_idx = bd_tree.query(points_final, k=1)
-            crack_boundary_dist_final = crack_boundary_dist[bd_idx]
 
         # 11. 坐标归一化
+        coordinate_center = np.zeros(3, dtype=np.float32)
+        coordinate_scale = 1.0
+        coordinates_normalized = False
         if self.config.normalize:
-            points_final = self._normalize(points_final)
+            points_final, coordinate_center, coordinate_scale = self._normalize_with_metadata(
+                points_final
+            )
+            coordinates_normalized = True
 
-        # 12. 特征拼接 (P2-4: 增加裂缝边界距离通道)
-        feats = np.stack(
-            [intensity_final, curvature_final, crack_boundary_dist_final], axis=1
-        ).astype(np.float32)
+        # 12. Inference-safe features: all channels are re-derived from the
+        # exact final coordinate array written to disk.  In particular, no
+        # label-derived crack mask or distance is allowed to enter the model
+        # input.  The geometric channels are translation/scale invariant.
+        points_final = points_final.astype(np.float32, copy=False)
+        feats = compute_observable_features(
+            points_final,
+            intensity_final,
+            k_neighbors=DEFAULT_GEOMETRY_K_NEIGHBORS,
+        )
 
         return {
-            "points": points_final.astype(np.float32),
+            "points": points_final,
             "labels": labels_final.astype(np.int64),
-            "feats": feats,          # (N, 3): [intensity, curvature, crack_boundary_dist]
+            "feats": feats,
             "normals": normals_final.astype(np.float32),
             "pavement_type": pavement_type,
+            "target_label": -1 if target_label is None else int(target_label),
+            "feature_schema": OBSERVABLE_FEATURE_SCHEMA,
+            "feature_names": np.asarray(OBSERVABLE_FEATURE_NAMES),
+            "feature_k_neighbors": int(DEFAULT_GEOMETRY_K_NEIGHBORS),
+            "coordinate_center": coordinate_center.astype(np.float32),
+            "coordinate_scale": float(coordinate_scale),
+            "coordinates_normalized": coordinates_normalized,
         }
 
     def _select_pavement_type(self, rng: np.random.Generator) -> str:
@@ -617,7 +665,7 @@ class SyntheticRoadDataset(_DatasetBase):
         disease_probs = self.config.disease.disease_probs
         has_asphalt = any(disease_probs.get(k, 0) > 0 for k in
                          ["crack", "pothole", "raveling", "depression",
-                          "rutting", "corrugation", "bleeding"])
+                          "rutting", "corrugation", "bleeding", "patching"])
         has_concrete = disease_probs.get("concrete_damage", 0) > 0
 
         config_type = self.config.road.pavement_type
@@ -684,6 +732,49 @@ class SyntheticRoadDataset(_DatasetBase):
 
         return result
 
+    def _apply_patching(
+        self,
+        points: np.ndarray,
+        labels: np.ndarray,
+        patch_label: int,
+        width: float,
+        length: float,
+        rng: np.random.Generator,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Sample and apply one physically continuous repair patch."""
+        cfg = self.config.patching
+        max_patch_width = min(cfg.max_width, width * 0.8)
+        max_patch_length = min(cfg.max_length, length * 0.8)
+        min_patch_width = min(cfg.min_width, max_patch_width)
+        min_patch_length = min(cfg.min_length, max_patch_length)
+        patch_width = float(rng.uniform(min_patch_width, max_patch_width))
+        patch_length = float(rng.uniform(min_patch_length, max_patch_length))
+        half_width = patch_width * 0.5 + cfg.edge_width
+        half_length = patch_length * 0.5 + cfg.edge_width
+
+        if width <= 2.0 * half_width:
+            center_x = width * 0.5
+        else:
+            center_x = float(rng.uniform(half_width, width - half_width))
+        if length <= 2.0 * half_length:
+            center_y = length * 0.5
+        else:
+            center_y = float(rng.uniform(half_length, length - half_length))
+
+        elevation = float(rng.uniform(-0.4 * cfg.max_elevation, cfg.max_elevation))
+        angle_rad = float(rng.uniform(-np.pi / 12.0, np.pi / 12.0))
+        return add_patching(
+            points,
+            labels,
+            center=(center_x, center_y),
+            width=patch_width,
+            length=patch_length,
+            label=patch_label,
+            angle_rad=angle_rad,
+            elevation=elevation,
+            edge_width=cfg.edge_width,
+        )
+
     def _compute_intensity(
         self,
         labels: np.ndarray,
@@ -728,6 +819,7 @@ class SyntheticRoadDataset(_DatasetBase):
         normals: np.ndarray,
         target_num: int,
         rng: np.random.Generator,
+        protected_label: int | None = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """重采样到目标点数。多于目标则随机下采样，少于目标则随机重复补齐。"""
         N = points.shape[0]
@@ -735,7 +827,27 @@ class SyntheticRoadDataset(_DatasetBase):
             return points, labels, intensity, curvature, normals
 
         if N > target_num:
-            idx = rng.choice(N, size=target_num, replace=False)
+            if protected_label is None:
+                idx = rng.choice(N, size=target_num, replace=False)
+            else:
+                protected_idx = np.flatnonzero(labels == protected_label)
+                other_idx = np.flatnonzero(labels != protected_label)
+                if len(protected_idx) == 0:
+                    idx = rng.choice(N, size=target_num, replace=False)
+                else:
+                    protected_quota = min(
+                        len(protected_idx), max(1, int(np.ceil(target_num * 0.10)))
+                    )
+                    kept_protected = rng.choice(
+                        protected_idx, size=protected_quota, replace=False
+                    )
+                    remaining = target_num - protected_quota
+                    if len(other_idx) >= remaining:
+                        kept_other = rng.choice(other_idx, size=remaining, replace=False)
+                    else:
+                        available = np.setdiff1d(np.arange(N), kept_protected, assume_unique=False)
+                        kept_other = rng.choice(available, size=remaining, replace=False)
+                    idx = np.concatenate((kept_protected, kept_other))
         else:
             n_extra = target_num - N
             extra_idx = rng.choice(N, size=n_extra, replace=True)
@@ -809,6 +921,20 @@ class SyntheticRoadDataset(_DatasetBase):
         if max_radius > 1e-12:
             centered /= max_radius
         return centered
+
+    @staticmethod
+    def _normalize_with_metadata(
+        points: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Normalize points while retaining the metric inverse transform."""
+        centroid = np.mean(points, axis=0)
+        centered = points - centroid
+        max_radius = float(np.max(np.linalg.norm(centered, axis=1)))
+        if max_radius > 1e-12:
+            centered /= max_radius
+        else:
+            max_radius = 1.0
+        return centered, centroid.astype(np.float32), max_radius
 
 
 def _compute_kdtree_curvature(

@@ -107,6 +107,12 @@ def _save_scene(scene_id: int) -> dict:
             normals=normals.astype(np.float32),
             pavement_type=pavement_type,
             scene_id=scene_id,
+            feature_schema=scene["feature_schema"],
+            feature_names=scene["feature_names"],
+            feature_k_neighbors=scene["feature_k_neighbors"],
+            coordinate_center=scene["coordinate_center"],
+            coordinate_scale=scene["coordinate_scale"],
+            coordinates_normalized=scene["coordinates_normalized"],
         )
         result["ok"] = True
         result["npoints"] = int(len(points))

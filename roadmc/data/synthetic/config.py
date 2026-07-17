@@ -234,6 +234,28 @@ class BleedingConfig:
 
 
 @dataclass
+class PatchingConfig:
+    """Geometric limits for asphalt and concrete repair patches."""
+
+    min_width: float = 0.60
+    max_width: float = 1.80
+    min_length: float = 0.80
+    max_length: float = 2.80
+    edge_width: float = 0.08
+    max_elevation: float = 0.015
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.min_width <= self.max_width:
+            raise ValueError("patch width limits must satisfy 0 < min_width <= max_width")
+        if not 0.0 < self.min_length <= self.max_length:
+            raise ValueError("patch length limits must satisfy 0 < min_length <= max_length")
+        if self.edge_width <= 0.0:
+            raise ValueError("edge_width must be > 0")
+        if self.max_elevation < 0.0:
+            raise ValueError("max_elevation must be >= 0")
+
+
+@dataclass
 class ConcreteDamageConfig:
     """水泥路面损坏生成参数。
 
@@ -320,6 +342,7 @@ class DiseaseConfig:
         "rutting": 0.12,          # 车辙
         "corrugation": 0.05,      # 波浪拥包
         "bleeding": 0.05,         # 泛油
+        "patching": 0.05,         # 修补
         # 水泥路面病害
         "concrete_damage": 0.15,  # 水泥路面损坏（含多种子类型）
     })
@@ -374,6 +397,7 @@ class GeneratorConfig:
     depression: DepressionConfig = field(default_factory=DepressionConfig)
     raveling: RavelingConfig = field(default_factory=RavelingConfig)
     bleeding: BleedingConfig = field(default_factory=BleedingConfig)
+    patching: PatchingConfig = field(default_factory=PatchingConfig)
     concrete_damage: ConcreteDamageConfig = field(default_factory=ConcreteDamageConfig)
     lidar_noise: LidarNoiseConfig = field(default_factory=LidarNoiseConfig)
     lidar_scan: LiDARScanConfig = field(default_factory=LiDARScanConfig)

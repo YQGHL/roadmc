@@ -17,38 +17,73 @@ import torch.nn as nn
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 
+def _load_verified_checkpoint(path: Path, *, context: str):
+    """Load a local checkpoint only after checking its feature contract."""
+
+    from roadmc.data.features import require_observable_checkpoint_schema
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    require_observable_checkpoint_schema(payload, context=context)
+    return payload
+
+
 def train_baseline(args):
     torch.set_float32_matmul_precision('high')
+    from roadmc.data.curriculum import label_lut, num_classes_for_stage
     from roadmc.data.dataloader import RoadMCDataModule
     from roadmc.models.model_pl import RoadMCSegModel
 
-    num_classes = 2 if args.binary else 38
+    if args.binary and args.label_stage not in ("binary", "full38"):
+        raise ValueError("--binary cannot be combined with a non-binary --label_stage")
+    label_stage = "binary" if args.binary else args.label_stage
+    num_classes = num_classes_for_stage(label_stage)
+    print(f"[CURRICULUM] stage={label_stage}, output_classes={num_classes}")
     if args.binary:
         print("[BINARY] 38-class labels → background(0) vs disease(1)")
 
     class_weights = None
-    if args.binary and args.binary_class_weights:
+    if label_stage == "binary" and args.binary_class_weights:
         weights = [float(x) for x in args.binary_class_weights.split(",")]
         if len(weights) != 2:
             raise ValueError("--binary_class_weights must contain exactly two comma-separated values")
         class_weights = torch.tensor(weights, dtype=torch.float32)
         print(f"[CW] Using explicit binary class weights: {weights}")
-    elif args.class_weights:
+    if args.binary_class_weights and label_stage != "binary":
+        raise ValueError("--binary_class_weights is only valid for the binary curriculum stage")
+    if args.class_weights:
         cw_path = Path(args.class_weights)
-        if cw_path.exists():
-            cw = torch.load(cw_path, weights_only=True)
-            if args.binary:
-                # Collapse 38-class weights to binary: bg=weight[0], all diseases=mean(weight[1:])
-                bg_w = cw[0]
-                disease_w = cw[1:].mean()
-                class_weights = torch.tensor([bg_w, disease_w])
-                print(f"[CW] Collapsed 38-class → binary weights: [{bg_w:.4f}, {disease_w:.4f}]")
-            else:
-                class_weights = cw
-                print(f"[CW] Loaded class weights from {cw_path}")
-                print(f"[CW] Shape: {class_weights.shape}, Range: [{class_weights.min():.4f}, {class_weights.max():.4f}]")
+        if not cw_path.exists():
+            raise FileNotFoundError(f"Class weights file not found: {cw_path}")
+        cw = torch.load(cw_path, weights_only=True).float().reshape(-1)
+        if cw.numel() == num_classes:
+            class_weights = cw
+            print(f"[CW] Loaded {num_classes}-class weights from {cw_path}")
+        elif cw.numel() == 38:
+            source_to_target = torch.tensor(label_lut(label_stage), dtype=torch.long)
+            class_weights = torch.stack(
+                [cw[source_to_target == class_id].mean() for class_id in range(num_classes)]
+            )
+            print(f"[CW] Aggregated 38-class weights for stage={label_stage}")
         else:
-            print(f"[CW] WARNING: {cw_path} not found, running without class weights")
+            raise ValueError(
+                f"Class weights at {cw_path} have {cw.numel()} values; expected 38 or {num_classes}"
+            )
+        print(f"[CW] Range: [{class_weights.min():.4f}, {class_weights.max():.4f}]")
+    if args.auto_class_weights:
+        if args.class_weights or args.binary_class_weights:
+            raise ValueError("--auto_class_weights cannot be combined with manual class weights")
+        from roadmc.data.class_balance import effective_number_class_weights, point_class_counts
+
+        counts = point_class_counts(args.data_dir, split="train", label_stage=label_stage)
+        class_weights = torch.from_numpy(
+            effective_number_class_weights(
+                counts,
+                beta=args.class_weight_beta,
+                max_weight=args.class_weight_max,
+            )
+        )
+        print(f"[CW] Effective-number counts for {label_stage}: {counts.tolist()}")
+        print(f"[CW] Auto weights: {[round(float(value), 5) for value in class_weights]}")
 
     model = RoadMCSegModel(
         in_channels=3,
@@ -56,6 +91,7 @@ def train_baseline(args):
         embed_dim=args.embed_dim,
         depths=tuple(args.depths),
         num_heads=tuple(args.num_heads),
+        window_size=args.window_size,
         lr=args.lr,
         weight_decay=args.weight_decay,
         optimizer_name=args.optimizer,
@@ -67,6 +103,11 @@ def train_baseline(args):
         lambda_dice=args.lambda_dice,
         lambda_edge=args.lambda_edge,
         binary_threshold=args.binary_threshold,
+        metric_min_support=args.metric_min_support,
+        validation_bootstrap_samples=args.validation_bootstrap_samples,
+        validation_bootstrap_seed=args.seed,
+        t_max=args.t_max,
+        input_point_count=args.max_points,
     )
 
     datamodule = RoadMCDataModule(
@@ -75,6 +116,7 @@ def train_baseline(args):
         max_points=args.max_points,
         num_workers=args.num_workers,
         binary=args.binary,
+        label_stage=label_stage,
     )
 
     if args.init_from_checkpoint:
@@ -82,7 +124,7 @@ def train_baseline(args):
         if not init_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {init_path}")
         print(f"[INIT] Loading model weights only from: {init_path}")
-        init_state = torch.load(init_path, map_location="cpu", weights_only=False)
+        init_state = _load_verified_checkpoint(init_path, context="--init_from_checkpoint")
         if "state_dict" in init_state:
             init_state = init_state["state_dict"]
         msg = model.load_state_dict(init_state, strict=False)
@@ -90,18 +132,20 @@ def train_baseline(args):
         unexpected = getattr(msg, "unexpected_keys", [])
         print(f"[INIT] missing={len(missing)} unexpected={len(unexpected)}")
 
-    # Load binary pretrained backbone (strip classifier head) for 38-class fine-tuning
+    if args.pretrained_checkpoint and args.pretrained_binary:
+        raise ValueError("Use only one of --pretrained_checkpoint and --pretrained_binary")
+    if args.pretrained_checkpoint:
+        args.pretrained_binary = args.pretrained_checkpoint
+
+    # Load pretrained backbone while reinitializing the task-specific classifier.
     if args.pretrained_binary:
-        if num_classes != 38:
-            print("[PRETRAINED] WARNING: --pretrained_binary is designed for 38-class fine-tuning, "
-                  f"but num_classes={num_classes}. Proceeding anyway.")
         ckpt_path = Path(args.pretrained_binary)
         if not ckpt_path.exists():
             print(f"[PRETRAINED] ERROR: checkpoint not found: {ckpt_path}")
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-        print(f"[PRETRAINED] Loading binary checkpoint: {ckpt_path}")
-        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        print(f"[PRETRAINED] Loading backbone weights from: {ckpt_path}")
+        state_dict = _load_verified_checkpoint(ckpt_path, context="--pretrained_checkpoint")
 
         if "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
@@ -130,19 +174,27 @@ def train_baseline(args):
         print(f"[PRETRAINED] Loaded {loaded} param tensors, skipped {len(skipped)} shape-mismatched keys:")
         for k in skipped:
             print(f"  └─ skipped: {k}")
-        print(f"[PRETRAINED] 38-class classifier head + focal_loss.alpha initialized from scratch.")
+        print(f"[PRETRAINED] Classifier head + focal_loss.alpha initialized from scratch for {label_stage}.")
         del state_dict, stripped
 
     callbacks = [
         ModelCheckpoint(monitor="val_mIoU", mode="max", save_top_k=3, filename="baseline-{epoch}-{val_mIoU:.3f}"),
     ]
 
+    if args.resume_from_checkpoint:
+        resume_path = Path(args.resume_from_checkpoint)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
+        _load_verified_checkpoint(resume_path, context="--resume_from_checkpoint")
+
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
+        default_root_dir=args.run_dir,
         accelerator="auto",
         devices=1,
         precision=args.precision,   # AMP halves VRAM, 1.5-2x speedup
         gradient_clip_val=1.0,      # P1: prevent loss spikes
+        accumulate_grad_batches=args.accumulate_grad_batches,
         callbacks=callbacks,
         log_every_n_steps=10,
         benchmark=True,             # P2: cudnn benchmark for fixed input sizes
@@ -153,11 +205,10 @@ def train_baseline(args):
 
 
 def train_gan_enhanced(args):
-    from roadmc.data.dataloader import RoadMCDataModule, collate_pointcloud_batch
+    from roadmc.data.dataloader import RoadMCDataModule
     from roadmc.models.gan.discriminator import WGANDiscriminator
     from roadmc.models.gan.generator import StyleTransferGen
     from roadmc.models.model_pl import RoadMCSegModel
-    from torch.utils.data import DataLoader
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -303,8 +354,6 @@ def train_end2end(args):
     from roadmc.models.gan.discriminator import WGANDiscriminator
     from roadmc.models.gan.generator import StyleTransferGen
     from roadmc.models.model_pl import RoadMCSegModel
-    from pytorch_lightning import Trainer
-    from pytorch_lightning.callbacks import ModelCheckpoint
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -413,15 +462,26 @@ def main():
     parser.add_argument("mode", type=str, choices=["baseline", "gan_enhanced", "end2end"],
                         help="Training mode")
     parser.add_argument("--data_dir", type=str, default="./data/synthetic_output")
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--max_points", type=int, default=4096,
+    parser.add_argument("--run_dir", type=str, default=None,
+                        help="Optional Lightning output directory for checkpoints and logs")
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--max_points", type=int, default=2048,
                         help="Max points per scene after subsampling. Lower values reduce attention and GAN memory use.")
     parser.add_argument("--max_epochs", type=int, default=50)
     parser.add_argument("--embed_dim", type=int, default=96)
     parser.add_argument("--depths", type=int, nargs=4, default=[2, 2, 6, 2])
     parser.add_argument("--num_heads", type=int, nargs=4, default=[3, 6, 12, 24])
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--window_size", type=int, default=64,
+                        help="Points per local attention window")
+    parser.add_argument("--t_max", type=int, default=50,
+                        help="CosineAnnealingLR period in epochs")
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Learning rate; defaults to 1e-2 for Muon and 1e-3 for AdamW",
+    )
+    parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--optimizer", type=str, default="muon", choices=["muon", "adamw"])
     parser.add_argument("--backbone", type=str, default="swin3d", choices=["swin3d", "pointmamba"])
     parser.add_argument("--use_mhc", action="store_true", default=True)
@@ -433,8 +493,16 @@ def main():
                         help="Path to class weights .pt file for FocalLoss alpha")
     parser.add_argument("--binary_class_weights", type=str, default=None,
                         help="Explicit binary class weights as 'bg,disease', e.g. '1.0,2.5'")
+    parser.add_argument("--auto_class_weights", action="store_true",
+                        help="Compute bounded effective-number weights from every training point")
+    parser.add_argument("--class_weight_beta", type=float, default=0.999999,
+                        help="Effective-number beta for --auto_class_weights")
+    parser.add_argument("--class_weight_max", type=float, default=5.0,
+                        help="Maximum auto class weight before renormalization")
     parser.add_argument("--gradient_checkpointing", action="store_true",
                         help="Enable gradient checkpointing to reduce VRAM")
+    parser.add_argument("--accumulate_grad_batches", type=int, default=1,
+                        help="Accumulate gradients to emulate a larger batch under 8GB VRAM")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to checkpoint to resume training from")
     parser.add_argument("--init_from_checkpoint", type=str, default=None,
@@ -448,14 +516,26 @@ def main():
                         help="Dice loss weight (default: 1.0)")
     parser.add_argument("--lambda_edge", type=float, default=0.5,
                         help="Edge loss weight (default: 0.5)")
+    parser.add_argument("--label_stage", type=str, default="full38",
+                        choices=["binary", "four", "eight", "full38"],
+                        help="Curriculum label space: binary -> four -> eight -> full38")
     parser.add_argument("--binary", action="store_true",
                         help="Binary mode: collapse 38 classes to background(0) vs disease(1)")
     parser.add_argument("--binary_threshold", type=float, default=0.5,
                         help="Disease probability threshold used for binary validation/inference metrics")
+    parser.add_argument("--metric_min_support", type=int, default=1,
+                        help="Minimum target points required for a class to enter val_mIoU")
+    parser.add_argument("--validation_bootstrap_samples", type=int, default=0,
+                        help="Scene-block bootstrap samples per validation epoch; 0 avoids epoch overhead")
     parser.add_argument("--pretrained_binary", type=str, default=None,
-                        help="Path to binary checkpoint .ckpt to load backbone weights for 38-class fine-tuning. "
-                             "The classifier head (backbone.decode.cls_head) will be reset to 38 classes.")
+                        help="Backward-compatible alias for --pretrained_checkpoint")
+    parser.add_argument("--pretrained_checkpoint", type=str, default=None,
+                        help="Checkpoint whose backbone is reused while this stage receives a fresh classifier head")
     args = parser.parse_args()
+
+    if args.lr is None:
+        args.lr = 1e-2 if args.optimizer == "muon" else 1e-3
+        print(f"[OPT] Using default {args.optimizer} learning rate: {args.lr:g}")
 
     torch.manual_seed(args.seed)
 

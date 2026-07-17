@@ -628,6 +628,7 @@ def add_crack(
 
     width_mean = params.get("width_mean", 0.005)
     width_std = params.get("width_std", 0.3)
+    label_width_floor = params.get("label_width_floor", 0.0)
 
     if crack_type in ("longitudinal", "transverse"):
         x_min, x_max = float(np.min(xy[:, 0])), float(np.max(xy[:, 0]))
@@ -703,12 +704,16 @@ def add_crack(
         p_param = 2.0  # 高斯槽 (p=2)
 
         # 裂缝区域掩码
-        crack_mask = min_dist <= half_width
-        if np.any(crack_mask):
-            depth_ratio = min_dist[crack_mask] / np.clip(lambda_param[crack_mask], 1e-12, None)
+        physical_mask = min_dist <= half_width
+        if np.any(physical_mask):
+            depth_ratio = min_dist[physical_mask] / np.clip(lambda_param[physical_mask], 1e-12, None)
             depth = d_max * np.exp(-(depth_ratio ** p_param))
-            pts[crack_mask, 2] -= depth
-            lbl[crack_mask] = label_val
+            pts[physical_mask, 2] -= depth
+
+        label_half_width = np.maximum(half_width, label_width_floor * 0.5)
+        label_mask = min_dist <= label_half_width
+        if np.any(label_mask):
+            lbl[label_mask] = label_val
 
     # 龟裂 / 块状裂缝 (Voronoi 图)
     elif crack_type in ("alligator", "block"):
@@ -772,13 +777,17 @@ def add_crack(
 
         # 裂缝宽度
         half_width_crack = width_crack / 2.0
-        crack_mask = min_dist_ridge <= half_width_crack
+        physical_mask = min_dist_ridge <= half_width_crack
 
-        if np.any(crack_mask):
-            t = min_dist_ridge[crack_mask] / max(half_width_crack, 1e-12)
+        if np.any(physical_mask):
+            t = min_dist_ridge[physical_mask] / max(half_width_crack, 1e-12)
             depth = d_max * np.exp(-(t ** 2.0))
-            pts[crack_mask, 2] -= depth
-            lbl[crack_mask] = label_val
+            pts[physical_mask, 2] -= depth
+
+        label_half_width = max(half_width_crack, label_width_floor * 0.5)
+        label_mask = min_dist_ridge <= label_half_width
+        if np.any(label_mask):
+            lbl[label_mask] = label_val
 
     return pts, lbl
 
@@ -1267,6 +1276,65 @@ def add_bleeding(
 # 1.1.10 — 水泥路面损坏 (Concrete Damage)
 
 
+def add_patching(
+    points: np.ndarray,
+    labels: np.ndarray,
+    center: Tuple[float, float],
+    width: float,
+    length: float,
+    label: int,
+    angle_rad: float = 0.0,
+    elevation: float = 0.0,
+    edge_width: float = 0.08,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Insert a finite-width repair patch with a smooth geometric transition.
+
+    The patch is a rounded rectangle in the local road tangent plane. Its
+    height is blended to a least-squares reference plane with a cubic smoothstep
+    over ``edge_width``. This gives a continuous height field instead of a
+    label-only rectangle, while preserving nearby road roughness outside the
+    repair boundary.
+    """
+    if width <= 0.0 or length <= 0.0:
+        raise ValueError("patch width and length must be positive")
+    if edge_width <= 0.0:
+        raise ValueError("patch edge_width must be positive")
+
+    pts = points.copy()
+    lbl = labels.copy()
+    x = pts[:, 0]
+    y = pts[:, 1]
+    cx, cy = center
+
+    cos_a = np.cos(angle_rad)
+    sin_a = np.sin(angle_rad)
+    local_x = cos_a * (x - cx) + sin_a * (y - cy)
+    local_y = -sin_a * (x - cx) + cos_a * (y - cy)
+
+    half_width = width * 0.5
+    half_length = length * 0.5
+    corner_radius = min(half_width, half_length, max(edge_width, 0.02))
+    qx = np.abs(local_x) - half_width + corner_radius
+    qy = np.abs(local_y) - half_length + corner_radius
+    outside = np.hypot(np.maximum(qx, 0.0), np.maximum(qy, 0.0))
+    signed_distance = outside + np.minimum(np.maximum(qx, qy), 0.0) - corner_radius
+
+    support = signed_distance <= edge_width
+    core = signed_distance <= 0.0
+    if not np.any(core):
+        return pts, lbl
+
+    design = np.column_stack((x, y, np.ones_like(x)))
+    plane, *_ = np.linalg.lstsq(design, pts[:, 2], rcond=None)
+    target_height = design @ plane + elevation
+
+    t = np.clip(1.0 - np.maximum(signed_distance, 0.0) / edge_width, 0.0, 1.0)
+    blend = t * t * (3.0 - 2.0 * t)
+    pts[support, 2] += blend[support] * (target_height[support] - pts[support, 2])
+    lbl[core] = label
+    return pts, lbl
+
+
 def add_concrete_damage(
     points: np.ndarray,
     labels: np.ndarray,
@@ -1426,26 +1494,25 @@ def add_concrete_damage(
     elif damage_type == "slab_crack":
         # 通过板体的直线裂缝，边缘更尖锐
         angle = rng.uniform(0, np.pi)
-        x_span = x_max - x_min
-        y_span = y_max - y_min
-        intercept = rng.uniform(
-            min(x_min, y_min) + 0.1 * min(x_span, y_span),
-            max(x_max, y_max) - 0.1 * max(x_span, y_span),
-        )
-
-        cos_a, sin_a = np.cos(angle), np.sin(angle)
-        dist_to_line = np.abs(cos_a * y - sin_a * x + intercept) / np.sqrt(cos_a ** 2 + sin_a ** 2 + 1e-12)
+        x_center = (x_min + x_max) * 0.5
+        y_center = (y_min + y_max) * 0.5
+        normal_x, normal_y = np.cos(angle), np.sin(angle)
+        dist_to_line = np.abs(normal_x * (x - x_center) + normal_y * (y - y_center))
 
         crack_width_joint = joint_w * 2
-        crack_mask = dist_to_line < crack_width_joint
+        physical_mask = dist_to_line < crack_width_joint
 
-        if np.any(crack_mask):
+        if np.any(physical_mask):
             d_max_crack = params.get("d_max", 0.015 if severity == "light" else 0.040)
-            t = dist_to_line[crack_mask] / crack_width_joint
+            t = dist_to_line[physical_mask] / crack_width_joint
             # 更尖锐的剖面 (p=1 近似 V 形)
             depth_crack = d_max_crack * np.exp(-(t ** 1.0))
-            pts[crack_mask, 2] -= depth_crack
-            lbl[crack_mask] = label_val
+            pts[physical_mask, 2] -= depth_crack
+
+        label_width_floor = params.get("label_width_floor", 0.0)
+        label_mask = dist_to_line < max(crack_width_joint, label_width_floor * 0.5)
+        if np.any(label_mask):
+            lbl[label_mask] = label_val
 
     # 3) 板角断裂 (Corner Break)
     elif damage_type == "corner_break":
@@ -1500,10 +1567,11 @@ def add_concrete_damage(
     # 4) 错台 (Faulting)
     elif damage_type == "faulting":
         # 接缝两侧高度差
-        if len(trans_joints) > 2:
-            joint_y = trans_joints[rng.integers(1, len(trans_joints) - 1)]
+        interior_trans = trans_joints[(trans_joints > y_min) & (trans_joints < y_max)]
+        if len(interior_trans):
+            joint_y = float(rng.choice(interior_trans))
         else:
-            joint_y = trans_joints[min(1, len(trans_joints) - 1)]
+            joint_y = (y_min + y_max) * 0.5
 
         fault_offset = params.get("d_max", 0.005 if severity == "light" else 0.015)
 

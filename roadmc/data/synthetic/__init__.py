@@ -16,6 +16,7 @@ from .config import (  # noqa: F401
     DepressionConfig,
     RavelingConfig,
     BleedingConfig,
+    PatchingConfig,
     ConcreteDamageConfig,
     NUM_CLASSES,
     LABEL_MAP,
@@ -35,6 +36,7 @@ from .primitives import (  # noqa: F401
     add_rutting,
     add_corrugation,
     add_bleeding,
+    add_patching,
     add_concrete_damage,
     simulate_lidar_noise,
 )

@@ -10,6 +10,14 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from typing import Optional, Tuple
 
+from roadmc.metrics import (
+    CalibrationAccumulator,
+    bootstrap_scene_confidence_intervals,
+    confusion_matrix_from_predictions,
+    metrics_from_confusion,
+)
+from roadmc.data.features import OBSERVABLE_FEATURE_SCHEMA, require_observable_checkpoint_schema
+
 
 class HybridMuonAdamW(torch.optim.Optimizer):
     """Wrap Muon and AdamW so matrix params can use Muon while 1D params use AdamW."""
@@ -134,20 +142,25 @@ class DiceLoss(nn.Module):
 
 
 class EdgeLoss(nn.Module):
-    """Edge-aware loss: Sobel edge detection on predicted vs target labels.
+    """Supervised BEV boundary loss without label-derived model inputs.
 
-    Converts per-point labels to a 2D BEV (bird's eye view) grid,
-    applies Sobel 3×3 kernel to detect edges, then computes L1 on edge magnitudes.
-    Only computed where crack_boundary_dist < threshold in feats.
-
-    This enforces sharper crack boundary predictions.
+    Predictions and ground truth are rasterized from all valid points.  The
+    target labels are used only as the ordinary training target, while a
+    dilated target-edge map increases the weight around road-damage boundaries.
+    This remains available for every curriculum stage and for every damage
+    family; no crack-only privileged distance is involved.
     """
 
-    def __init__(self, grid_size: int = 200, sigma: float = 2.0):
+    def __init__(
+        self,
+        grid_size: int = 200,
+        boundary_dilation: int = 2,
+        boundary_weight: float = 2.0,
+    ):
         super().__init__()
         self.grid_size = grid_size
-        self.sigma = sigma
-        self.threshold = sigma  # crack_boundary_dist threshold
+        self.boundary_dilation = boundary_dilation
+        self.boundary_weight = boundary_weight
 
         sobel_x = torch.tensor(
             [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32
@@ -221,56 +234,44 @@ class EdgeLoss(nn.Module):
         logits: torch.Tensor,
         targets: torch.Tensor,
         coords: torch.Tensor,
-        crack_boundary_dist: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute edge loss with optional valid_mask. Returns 0 if no crack data.
-        """
+        """Compute a differentiable damage-boundary loss for valid point sets."""
         B = logits.shape[0]
 
         if valid_mask is not None:
             logits_list = [logits[b][valid_mask[b]] for b in range(B)]
             targets_list = [targets[b][valid_mask[b]] for b in range(B)]
             coords_list = [coords[b][valid_mask[b]] for b in range(B)]
-            if crack_boundary_dist is not None:
-                cbd_list = [crack_boundary_dist[b][valid_mask[b]] for b in range(B)]
         else:
             logits_list = [logits[b] for b in range(B)]
             targets_list = [targets[b] for b in range(B)]
             coords_list = [coords[b] for b in range(B)]
-            if crack_boundary_dist is not None:
-                cbd_list = [crack_boundary_dist[b] for b in range(B)]
 
-        total_loss = 0.0
-        count = 0
+        losses = []
 
         for b in range(B):
-            # Determine which points are near cracks
-            if crack_boundary_dist is not None:
-                cbd = cbd_list[b] if valid_mask is not None else crack_boundary_dist[b]
-                near_crack = cbd < self.threshold
-                if not near_crack.any():
-                    continue
-                mask_coords = coords_list[b][near_crack]
-                mask_probs = F.softmax(logits_list[b][near_crack], dim=-1)
-                crack_prob = mask_probs[..., 1:9].sum(dim=-1).float()
-                mask_targets = (targets_list[b][near_crack] > 0).float()
-            else:
+            if len(coords_list[b]) < 4:
                 continue
 
-            pred_grid = self._scatter_to_bev(crack_prob, mask_coords)
-            target_grid = self._scatter_to_bev(mask_targets, mask_coords)
+            probabilities = F.softmax(logits_list[b], dim=-1)
+            damage_probability = (1.0 - probabilities[..., 0]).float()
+            damage_target = (targets_list[b] != 0).float()
+            pred_grid = self._scatter_to_bev(damage_probability, coords_list[b])
+            target_grid = self._scatter_to_bev(damage_target, coords_list[b])
 
             pred_edge = self._sobel_edge(pred_grid)
             target_edge = self._sobel_edge(target_grid)
+            boundary = (target_edge > 1e-3).float().unsqueeze(0).unsqueeze(0)
+            if self.boundary_dilation > 0:
+                kernel = 2 * self.boundary_dilation + 1
+                boundary = F.max_pool2d(boundary, kernel_size=kernel, stride=1, padding=self.boundary_dilation)
+            weights = 1.0 + self.boundary_weight * boundary.squeeze(0).squeeze(0)
+            losses.append(((pred_edge - target_edge).abs() * weights).sum() / weights.sum().clamp_min(1.0))
 
-            total_loss = total_loss + F.l1_loss(pred_edge, target_edge)
-            count += 1
-
-        if count == 0:
-            return torch.tensor(0.0, device=logits.device, requires_grad=False)
-
-        return total_loss / count
+        if not losses:
+            return logits.new_zeros(())
+        return torch.stack(losses).mean()
 
 
 class RoadMCSegModel(pl.LightningModule):
@@ -297,13 +298,22 @@ class RoadMCSegModel(pl.LightningModule):
         lambda_dice: float = 1.0,
         lambda_edge: float = 0.5,
         class_weights: Optional[torch.Tensor] = None,
-        crack_dist_feat_idx: int = 2,  # L4: index of crack_boundary_dist in feats
+        crack_dist_feat_idx: Optional[int] = None,
+        feature_schema: str = OBSERVABLE_FEATURE_SCHEMA,
+        input_point_count: Optional[int] = None,
         t_max: int = 50,  # Cosine annealing period
         use_checkpoint: bool = False,  # gradient checkpointing to reduce VRAM
         use_mhc: bool = True,
         binary_threshold: float = 0.5,
+        metric_min_support: int = 1,
+        validation_bootstrap_samples: int = 0,
+        validation_bootstrap_seed: int = 42,
     ):
         super().__init__()
+        if feature_schema != OBSERVABLE_FEATURE_SCHEMA:
+            raise ValueError(
+                f"RoadMCSegModel requires {OBSERVABLE_FEATURE_SCHEMA}, got {feature_schema!r}"
+            )
         self.save_hyperparameters()
 
         backbone_name = backbone_name.lower()
@@ -340,14 +350,38 @@ class RoadMCSegModel(pl.LightningModule):
         self.weight_decay = weight_decay
         self.optimizer_name = optimizer_name.lower()
         self.backbone_name = backbone_name
-        self.crack_dist_feat_idx = crack_dist_feat_idx  # L4
+        # Retain this legacy argument solely so checkpoints created before the
+        # observable-feature migration can still be loaded.  It is ignored.
+        self.crack_dist_feat_idx = crack_dist_feat_idx
+        self.feature_schema = feature_schema
+        self.input_point_count = input_point_count
         self.t_max = t_max  # L2: now settable via constructor
         self.binary_threshold = binary_threshold
+        self.metric_min_support = metric_min_support
+        self.validation_bootstrap_samples = validation_bootstrap_samples
+        self.validation_bootstrap_seed = validation_bootstrap_seed
+        self.register_buffer(
+            "_val_confusion", torch.zeros(num_classes, num_classes, dtype=torch.long),
+            persistent=False,
+        )
+        self._val_scene_confusions = []
+        self._val_calibration = CalibrationAccumulator()
+        self.last_validation_summary = {}
 
     def forward(self, coords: torch.Tensor, feats: torch.Tensor) -> torch.Tensor:
         """Forward pass through backbone.
         """
         return self.backbone(coords, feats)
+
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        """Persist the input contract outside hyperparameters for independent audit."""
+
+        checkpoint["roadmc_feature_schema"] = self.feature_schema
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """Prevent accidental reuse of a checkpoint trained with privileged inputs."""
+
+        require_observable_checkpoint_schema(checkpoint, context="checkpoint")
 
     def training_step(self, batch, batch_idx):
         """Training step. Accepts both dict batches (DataLoader) and tuple batches (self-test).
@@ -363,7 +397,7 @@ class RoadMCSegModel(pl.LightningModule):
 
         fl = self.focal_loss(logits, labels, valid_mask)
         dl = self.dice_loss(logits, labels, valid_mask)
-        el = self.edge_loss(logits, labels, coords, feats[:, :, self.crack_dist_feat_idx], valid_mask)
+        el = self.edge_loss(logits, labels, coords, valid_mask)
 
         loss = self.lambda_focal * fl + self.lambda_dice * dl + self.lambda_edge * el
 
@@ -387,23 +421,74 @@ class RoadMCSegModel(pl.LightningModule):
 
         fl = self.focal_loss(logits, labels, valid_mask)
         dl = self.dice_loss(logits, labels, valid_mask)
-        el = self.edge_loss(logits, labels, coords, feats[:, :, self.crack_dist_feat_idx], valid_mask)
+        el = self.edge_loss(logits, labels, coords, valid_mask)
 
         loss = self.lambda_focal * fl + self.lambda_dice * dl + self.lambda_edge * el
 
         preds = self._prediction_from_logits(logits)
-        miou, per_class_iou, per_class_recall, per_class_precision = self.compute_miou(
+        batch_confusion = confusion_matrix_from_predictions(
             preds, labels, self.num_classes, valid_mask
         )
+        self._val_confusion += batch_confusion.to(self._val_confusion.device)
 
+        probabilities = torch.softmax(logits, dim=-1)
+        for scene_index in range(preds.shape[0]):
+            scene_mask = valid_mask[scene_index] if valid_mask is not None else None
+            scene_confusion = confusion_matrix_from_predictions(
+                preds[scene_index], labels[scene_index], self.num_classes, scene_mask
+            )
+            self._val_scene_confusions.append(scene_confusion.detach().cpu())
+            self._val_calibration.update(
+                probabilities[scene_index], labels[scene_index], scene_mask
+            )
+
+        # Retain the batch figure only as a diagnostic.  Checkpoints use the
+        # epoch-global val_mIoU logged in on_validation_epoch_end.
+        batch_metrics = metrics_from_confusion(
+            batch_confusion, min_support=self.metric_min_support
+        )
         self.log("val_loss", loss, prog_bar=True)
-        self.log("val_mIoU", miou, prog_bar=True)
-        for c in range(1, min(self.num_classes, 10)):
-            if per_class_iou[c] > 0 or per_class_recall[c] > 0:
-                self.log(f"val_IoU_{c}", per_class_iou[c])
-                self.log(f"val_recall_{c}", per_class_recall[c])
-                self.log(f"val_precision_{c}", per_class_precision[c])
+        self.log("val_batch_mIoU", batch_metrics["supported_miou"], prog_bar=False)
         return loss
+
+    def on_validation_epoch_start(self) -> None:
+        self._val_confusion.zero_()
+        self._val_scene_confusions = []
+        self._val_calibration = CalibrationAccumulator()
+
+    def on_validation_epoch_end(self) -> None:
+        """Log one statistically valid metric from the complete validation set."""
+        summary = metrics_from_confusion(
+            self._val_confusion, min_support=self.metric_min_support
+        )
+        calibration = self._val_calibration.as_dict()
+        self.last_validation_summary = {
+            "metrics": summary,
+            "calibration": calibration,
+        }
+        self.log("val_mIoU", summary["supported_miou"], prog_bar=True, sync_dist=True)
+        self.log("val_foreground_iou", summary["foreground_iou"], prog_bar=True, sync_dist=True)
+        self.log("val_ece", calibration["ece"], prog_bar=False, sync_dist=True)
+        self.log("val_brier", calibration["brier"], prog_bar=False, sync_dist=True)
+
+        for item in summary["per_class"]:
+            class_id = item["class_id"]
+            if class_id == 0 or not item["supported"]:
+                continue
+            self.log(f"val_IoU_{class_id}", item["iou"], prog_bar=False, sync_dist=True)
+            self.log(f"val_recall_{class_id}", item["recall"], prog_bar=False, sync_dist=True)
+            self.log(
+                f"val_precision_{class_id}", item["precision"], prog_bar=False, sync_dist=True
+            )
+
+        if self.validation_bootstrap_samples > 0:
+            bootstrap = bootstrap_scene_confidence_intervals(
+                self._val_scene_confusions,
+                n_bootstrap=self.validation_bootstrap_samples,
+                seed=self.validation_bootstrap_seed,
+                min_support=self.metric_min_support,
+            )
+            self.last_validation_summary["bootstrap"] = bootstrap
 
     def _prediction_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """Apply calibrated binary threshold when requested, otherwise argmax."""
