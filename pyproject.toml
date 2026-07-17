@@ -19,15 +19,6 @@ dependencies = [
     "ipykernel>=7.2.0",
 ]
 
-[project.optional-dependencies]
-real = [
-    "laspy[lazrs]>=2.5",
-    "plyfile>=1.1",
-]
-pcd = [
-    "open3d>=0.19",
-]
-
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
