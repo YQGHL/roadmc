@@ -82,9 +82,9 @@ GPU training requires a PyTorch build compatible with the local CUDA driver. The
 
 RoadMC represents a pavement scene as a continuous surface followed by a discrete sensor observation. A useful abstraction is:
 
-\[
+$$
 z(x,y) = z_{\text{rough}}(x,y) + z_{\text{texture}}(x,y) + \Delta z_{\text{damage}}(x,y).
-\]
+$$
 
 | Layer | Meaning | Implementation |
 | --- | --- | --- |

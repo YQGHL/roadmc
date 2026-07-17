@@ -82,9 +82,9 @@ GPU 训练需要与本机 CUDA 驱动匹配的 PyTorch。当前实验使用 RTX 
 
 RoadMC 将路面场景表示为连续表面与离散观测的组合。可将路面高程写成：
 
-\[
+$$
 z(x,y) = z_{\text{rough}}(x,y) + z_{\text{texture}}(x,y) + \Delta z_{\text{damage}}(x,y).
-\]
+$$
 
 其中：
 
