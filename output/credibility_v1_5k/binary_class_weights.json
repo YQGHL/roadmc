@@ -1,0 +1,20 @@
+{
+  "data_dir": "data\\credibility_v1_5k",
+  "split": "train",
+  "label_stage": "binary",
+  "beta": 0.999999,
+  "max_weight": 5.0,
+  "counts": [
+    7711430,
+    775482
+  ],
+  "weights": [
+    0.7010962963104248,
+    1.2989037036895752
+  ],
+  "supported_classes": [
+    0,
+    1
+  ],
+  "total_points": 8486912
+}

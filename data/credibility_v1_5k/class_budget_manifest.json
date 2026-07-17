@@ -1,0 +1,937 @@
+{
+  "generated_at": "2026-07-16T02:14:05.536476",
+  "elapsed_sec": 2184.643321990967,
+  "arguments": {
+    "output_dir": "data\\credibility_v1_5k",
+    "split": "both",
+    "labels": "all",
+    "target_scenes_per_class": 112,
+    "min_points_per_class": 4000,
+    "val_ratio": 0.2,
+    "max_attempts_per_class": 0,
+    "wave_size": 4,
+    "workers": 16,
+    "seed": 20260716,
+    "grid_res": 0.02,
+    "num_points": 2048,
+    "pavement": "mixed",
+    "roughness": "B",
+    "dry_run": false
+  },
+  "target_labels": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37
+  ],
+  "workers": 16,
+  "reports": {
+    "train": {
+      "split": "train",
+      "dry_run": false,
+      "generated": 4144,
+      "failed": 8,
+      "failure_examples": [
+        {
+          "ok": false,
+          "skipped": false,
+          "scene_id": 80,
+          "target_label": 21,
+          "target_points": 0,
+          "error": "RuntimeError('forced label 21 was absent after synthesis')"
+        },
+        {
+          "ok": false,
+          "skipped": false,
+          "scene_id": 823,
+          "target_label": 21,
+          "target_points": 0,
+          "error": "RuntimeError('forced label 21 was absent after synthesis')"
+        },
+        {
+          "ok": false,
+          "skipped": false,
+          "scene_id": 1116,
+          "target_label": 21,
+          "target_points": 0,
+          "error": "RuntimeError('forced label 21 was absent after synthesis')"
+        },
+        {
+          "ok": false,
+          "skipped": false,
+          "scene_id": 1710,
+          "target_label": 21,
+          "target_points": 0,
+          "error": "RuntimeError('forced label 21 was absent after synthesis')"
+        },
+        {
+          "ok": false,
+          "skipped": false,
+          "scene_id": 2303,
+          "target_label": 21,
+          "target_points": 0,
+          "error": "RuntimeError('forced label 21 was absent after synthesis')"
+        },
+        {
+          "ok": false,
+          "skipped": false,
+          "scene_id": 2910,
+          "target_label": 25,
+          "target_points": 0,
+          "error": "RuntimeError('forced label 25 was absent after synthesis')"
+        },
+        {
+          "ok": false,
+          "skipped": false,
+          "scene_id": 3490,
+          "target_label": 22,
+          "target_points": 0,
+          "error": "RuntimeError('forced label 22 was absent after synthesis')"
+        },
+        {
+          "ok": false,
+          "skipped": false,
+          "scene_id": 3929,
+          "target_label": 21,
+          "target_points": 0,
+          "error": "RuntimeError('forced label 21 was absent after synthesis')"
+        }
+      ],
+      "initial_coverage": {
+        "1": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "2": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "3": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "4": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "5": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "6": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "7": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "8": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "9": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "10": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "11": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "12": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "13": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "14": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "15": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "16": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "17": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "18": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "19": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "20": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "21": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "22": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "23": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "24": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "25": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "26": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "27": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "28": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "29": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "30": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "31": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "32": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "33": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "34": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "35": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "36": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "37": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        }
+      },
+      "coverage": {
+        "1": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "2": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "3": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "4": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "5": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 20746
+        },
+        "6": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 20508
+        },
+        "7": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "8": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "9": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 10494
+        },
+        "10": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22760
+        },
+        "11": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "12": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "13": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "14": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "15": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "16": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "17": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 24803
+        },
+        "18": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "19": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "20": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "21": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 15713
+        },
+        "22": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 15355
+        },
+        "23": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "24": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "25": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 13677
+        },
+        "26": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 12157
+        },
+        "27": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "28": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "29": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "30": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "31": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "32": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "33": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "34": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 8925
+        },
+        "35": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 13384
+        },
+        "36": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        },
+        "37": {
+          "scene_count": 112,
+          "instance_count": 112,
+          "point_count": 22960
+        }
+      },
+      "unmet_labels": [],
+      "feature_contract_schema": "roadmc.observable_features.v1",
+      "feature_contract_errors": [],
+      "complete": true,
+      "target_scenes_per_class": 112,
+      "min_points_per_class": 4000,
+      "max_attempts_per_class": 336
+    },
+    "val": {
+      "split": "val",
+      "dry_run": false,
+      "generated": 851,
+      "failed": 4,
+      "failure_examples": [
+        {
+          "ok": false,
+          "skipped": false,
+          "scene_id": 82,
+          "target_label": 21,
+          "target_points": 0,
+          "error": "RuntimeError('forced label 21 was absent after synthesis')"
+        },
+        {
+          "ok": false,
+          "skipped": false,
+          "scene_id": 233,
+          "target_label": 22,
+          "target_points": 0,
+          "error": "RuntimeError('forced label 22 was absent after synthesis')"
+        },
+        {
+          "ok": false,
+          "skipped": false,
+          "scene_id": 378,
+          "target_label": 21,
+          "target_points": 0,
+          "error": "RuntimeError('forced label 21 was absent after synthesis')"
+        },
+        {
+          "ok": false,
+          "skipped": false,
+          "scene_id": 802,
+          "target_label": 21,
+          "target_points": 0,
+          "error": "RuntimeError('forced label 21 was absent after synthesis')"
+        }
+      ],
+      "initial_coverage": {
+        "1": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "2": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "3": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "4": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "5": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "6": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "7": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "8": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "9": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "10": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "11": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "12": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "13": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "14": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "15": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "16": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "17": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "18": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "19": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "20": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "21": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "22": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "23": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "24": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "25": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "26": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "27": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "28": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "29": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "30": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "31": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "32": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "33": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "34": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "35": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "36": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        },
+        "37": {
+          "scene_count": 0,
+          "instance_count": 0,
+          "point_count": 0
+        }
+      },
+      "coverage": {
+        "1": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "2": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "3": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "4": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "5": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4209
+        },
+        "6": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4311
+        },
+        "7": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "8": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "9": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 2366
+        },
+        "10": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4655
+        },
+        "11": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "12": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "13": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "14": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "15": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "16": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "17": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "18": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "19": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "20": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "21": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 3365
+        },
+        "22": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 3100
+        },
+        "23": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "24": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "25": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 2922
+        },
+        "26": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 2478
+        },
+        "27": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "28": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "29": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "30": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "31": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "32": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "33": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "34": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 1606
+        },
+        "35": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 2897
+        },
+        "36": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        },
+        "37": {
+          "scene_count": 23,
+          "instance_count": 23,
+          "point_count": 4715
+        }
+      },
+      "unmet_labels": [],
+      "feature_contract_schema": "roadmc.observable_features.v1",
+      "feature_contract_errors": [],
+      "complete": true,
+      "target_scenes_per_class": 23,
+      "min_points_per_class": 800,
+      "max_attempts_per_class": 336
+    }
+  }
+}

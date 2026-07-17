@@ -1,0 +1,41 @@
+{
+  "elapsed_sec": 41.256808199999796,
+  "records": [
+    {
+      "step": 0,
+      "loss": 0.46868932247161865,
+      "iou_05": 0.19400855920114124,
+      "positive_probability": 0.5068871974945068,
+      "negative_probability": 0.5055107474327087
+    },
+    {
+      "step": 25,
+      "loss": 0.36457207798957825,
+      "iou_05": 0.0,
+      "positive_probability": 0.3166646957397461,
+      "negative_probability": 0.30398210883140564
+    },
+    {
+      "step": 50,
+      "loss": 0.35616451501846313,
+      "iou_05": 0.0,
+      "positive_probability": 0.3118661940097809,
+      "negative_probability": 0.28645843267440796
+    },
+    {
+      "step": 100,
+      "loss": 0.14878255128860474,
+      "iou_05": 0.6964285714285714,
+      "positive_probability": 0.7081095576286316,
+      "negative_probability": 0.0802847295999527
+    },
+    {
+      "step": 200,
+      "loss": null,
+      "iou_05": 0.7104072398190046,
+      "positive_probability": 0.7791956663131714,
+      "negative_probability": 0.07552094012498856
+    }
+  ],
+  "target_points": 205
+}

@@ -1,0 +1,48 @@
+backbone_name: swin3d
+binary_threshold: 0.5
+class_weights: !!python/object/apply:torch._utils._rebuild_tensor_v2
+- !!python/object/apply:torch.storage._load_from_bytes
+  - !!binary |
+    gAKKCmz8nEb5IGqoUBkugAJN6QMugAJ9cQAoWBAAAABwcm90b2NvbF92ZXJzaW9ucQFN6QNYDQAA
+    AGxpdHRsZV9lbmRpYW5xAohYCgAAAHR5cGVfc2l6ZXNxA31xBChYBQAAAHNob3J0cQVLAlgDAAAA
+    aW50cQZLBFgEAAAAbG9uZ3EHSwR1dS6AAihYBwAAAHN0b3JhZ2VxAGN0b3JjaApGbG9hdFN0b3Jh
+    Z2UKcQFYDQAAADIxNTMzMDM5NDYwOTZxAlgDAAAAY3B1cQNLAk50cQRRLoACXXEAWA0AAAAyMTUz
+    MzAzOTQ2MDk2cQFhLgIAAAAAAAAADHszP3pCpj8=
+- 0
+- !!python/tuple
+  - 2
+- !!python/tuple
+  - 1
+- false
+- !!python/object/apply:collections.OrderedDict
+  - []
+crack_dist_feat_idx: null
+depths: !!python/tuple
+- 1
+- 1
+- 2
+- 1
+embed_dim: 48
+feature_schema: roadmc.observable_features.v1
+in_channels: 3
+input_point_count: 2048
+lambda_dice: 1.0
+lambda_edge: 0.1
+lambda_focal: 1.0
+lr: 0.01
+metric_min_support: 500
+mlp_ratio: 4.0
+num_classes: 2
+num_heads: !!python/tuple
+- 3
+- 3
+- 6
+- 6
+optimizer_name: muon
+t_max: 5
+use_checkpoint: false
+use_mhc: true
+validation_bootstrap_samples: 0
+validation_bootstrap_seed: 20260716
+weight_decay: 0.01
+window_size: 32

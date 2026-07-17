@@ -1,0 +1,228 @@
+{"kind":"deck","id":"pr/fkg7gh","name":"Deck"}
+{"kind":"layout","layoutId":"/ppt/slideMasters/slideMaster1.xml","name":"Master","type":"master"}
+{"kind":"layout","layoutId":"/ppt/slideLayouts/slideLayout1.xml","name":"Title Slide","type":"title"}
+{"kind":"slide","id":"sl/2x4nap4r","slide":1,"title":"RoadMC","textShapes":15}
+{"kind":"shape","id":"sh/u18jqh0f","slide":1,"name":"矩形 18","bbox":[0,0,1280,720]}
+{"kind":"textbox","id":"sh/cvixczed","slide":1,"name":"矩形 1","text":"RoadMC","textPreview":"RoadMC","textChars":6,"textLines":1,"bbox":[62,68,440,84]}
+{"kind":"textbox","id":"sh/5gbq1ory","slide":1,"name":"矩形 2","text":"物理仿真点云生成与路面病害分割训练","textPreview":"物理仿真点云生成与路面病害分割训练","textChars":17,"textLines":1,"bbox":[66,164,790,42]}
+{"kind":"shape","id":"sh/udg7adsj","slide":1,"name":"矩形 3","bbox":[66,238,210,1.2]}
+{"kind":"textbox","id":"sh/nyd0z610","slide":1,"name":"矩形 4","text":"给导师汇报用","textPreview":"给导师汇报用","textChars":6,"textLines":1,"bbox":[66,268,260,28]}
+{"kind":"textbox","id":"sh/cj6tovah","slide":1,"name":"矩形 5","text":"核心不是单个网络，而是一套从可控数据生成到稳定训练的闭环方案。","textPreview":"核心不是单个网络，而是一套从可控数据生成到稳定训练的闭环方案。","textChars":31,"textLines":1,"bbox":[66,500,740,76]}
+{"kind":"shape","id":"sh/54zidony","slide":1,"name":"矩形: 圆角 6","bbox":[865,86,300,430]}
+{"kind":"textbox","id":"sh/u9knih4b","slide":1,"name":"矩形 7","text":"汇报主线","textPreview":"汇报主线","textChars":4,"textLines":1,"bbox":[900,125,220,32]}
+{"kind":"textbox","id":"sh/judg7ads","slide":1,"name":"矩形 8","text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[900,187,24,26]}
+{"kind":"textbox","id":"sh/nyd0z610","slide":1,"name":"矩形 9","text":"为什么要生成点云","textPreview":"为什么要生成点云","textChars":8,"textLines":1,"bbox":[928,186,192,42]}
+{"kind":"textbox","id":"sh/udg7adsj","slide":1,"name":"矩形 10","text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[900,247,24,26]}
+{"kind":"textbox","id":"sh/54zidony","slide":1,"name":"矩形 11","text":"点云如何生成","textPreview":"点云如何生成","textChars":6,"textLines":1,"bbox":[928,246,192,42]}
+{"kind":"textbox","id":"sh/cj6tovah","slide":1,"name":"矩形 12","text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[900,307,24,26]}
+{"kind":"textbox","id":"sh/nap4r65w","slide":1,"name":"矩形 13","text":"模型如何训练","textPreview":"模型如何训练","textChars":6,"textLines":1,"bbox":[928,306,192,42]}
+{"kind":"textbox","id":"sh/upwb2hwf","slide":1,"name":"矩形 14","text":"•","textPreview":"•","textChars":1,"textLines":1,"bbox":[900,367,24,26]}
+{"kind":"textbox","id":"sh/5gbq1ory","slide":1,"name":"矩形 15","text":"当前结果与下一步","textPreview":"当前结果与下一步","textChars":8,"textLines":1,"bbox":[928,366,192,42]}
+{"kind":"textbox","id":"sh/cvixczed","slide":1,"name":"矩形 16","text":"2026-07","textPreview":"2026-07","textChars":7,"textLines":1,"bbox":[66,626,200,28]}
+{"kind":"textbox","id":"sh/jm1cfa9w","slide":1,"name":"矩形 17","text":"01","textPreview":"01","textChars":2,"textLines":1,"bbox":[1180,662,46,24]}
+{"kind":"notes","id":"nt/2x4nap4r","slide":1,"text":"开场先说项目定位：不是单纯换一个分割网络，而是建立生成、训练、验证的闭环。\n强调这份 PPT 不是论文答辩，而是先把技术路线讲清楚。"}
+{"kind":"slide","id":"sl/pg3ex0nu","slide":2,"title":"问题背景","textShapes":14}
+{"kind":"shape","id":"sh/36hcrmhk","slide":2,"name":"矩形 21","bbox":[0,0,1280,720]}
+{"kind":"textbox","id":"sh/5o7qpg3e","slide":2,"name":"矩形 1","text":"问题背景","textPreview":"问题背景","textChars":4,"textLines":1,"bbox":[54,36,520,28]}
+{"kind":"textbox","id":"sh/g3ex0nux","slide":2,"name":"矩形 2","text":"直接训练路面病害点云模型，很容易卡在数据和长尾上","textPreview":"直接训练路面病害点云模型，很容易卡在数据和长尾上","textChars":24,"textLines":1,"bbox":[54,74,1110,72]}
+{"kind":"textbox","id":"sh/r65wjudg","slide":2,"name":"矩形 3","text":"真实点云不是不能用，而是很难在早期形成稳定的大规模监督。","textPreview":"真实点云不是不能用，而是很难在早期形成稳定的大规模监督。","textChars":28,"textLines":1,"bbox":[58,154,980,36]}
+{"kind":"shape","id":"sh/ylc7u54z","slide":2,"name":"矩形: 圆角 4","bbox":[64,230,500,124]}
+{"kind":"textbox","id":"sh/9cvixcze","slide":2,"name":"矩形 5","text":"标注贵","textPreview":"标注贵","textChars":3,"textLines":1,"bbox":[88,252,452,34]}
+{"kind":"textbox","id":"sh/gr2p8nqx","slide":2,"name":"矩形 6","text":"点级标签需要逐点确认，真实病害边界尤其难标。","textPreview":"点级标签需要逐点确认，真实病害边界尤其难标。","textChars":22,"textLines":1,"bbox":[88,298,452,38]}
+{"kind":"shape","id":"sh/rytsvu9k","slide":2,"name":"矩形: 圆角 7","bbox":[624,230,500,124]}
+{"kind":"shape","id":"sh/yd0z6103","slide":2,"name":"矩形 8","bbox":[624,230,6,124]}
+{"kind":"textbox","id":"sh/wb2hwfyx","slide":2,"name":"矩形 9","text":"类别长尾","textPreview":"类别长尾","textChars":4,"textLines":1,"bbox":[648,252,452,34]}
+{"kind":"textbox","id":"sh/lwval87e","slide":2,"name":"矩形 10","text":"38 类病害分布极不均衡，冷启动容易塌到背景。","textPreview":"38 类病害分布极不均衡，冷启动容易塌到背景。","textChars":23,"textLines":1,"bbox":[648,298,452,38]}
+{"kind":"shape","id":"sh/e9cvixcz","slide":2,"name":"矩形: 圆角 11","bbox":[64,400,500,124]}
+{"kind":"shape","id":"sh/3q5o7qpg","slide":2,"name":"矩形 12","bbox":[64,400,6,124]}
+{"kind":"textbox","id":"sh/w3m94fu1","slide":2,"name":"矩形 13","text":"目标细薄","textPreview":"目标细薄","textChars":4,"textLines":1,"bbox":[88,422,452,34]}
+{"kind":"textbox","id":"sh/loj2t83i","slide":2,"name":"矩形 14","text":"裂缝、剥落等目标占比低，边界模糊且稀疏。","textPreview":"裂缝、剥落等目标占比低，边界模糊且稀疏。","textChars":20,"textLines":1,"bbox":[88,468,452,38]}
+{"kind":"shape","id":"sh/ex0nuxc3","slide":2,"name":"矩形: 圆角 15","bbox":[624,400,500,124]}
+{"kind":"textbox","id":"sh/3itgfmlk","slide":2,"name":"矩形 16","text":"采集差异","textPreview":"采集差异","textChars":4,"textLines":1,"bbox":[648,422,452,34]}
+{"kind":"textbox","id":"sh/szqtcj6t","slide":2,"name":"矩形 17","text":"点密度、噪声、扫描角度会改变输入分布。","textPreview":"点密度、噪声、扫描角度会改变输入分布。","textChars":19,"textLines":1,"bbox":[648,468,452,38]}
+{"kind":"textbox","id":"sh/lkjm1cfa","slide":2,"name":"矩形 18","text":"判断","textPreview":"判断","textChars":2,"textLines":1,"bbox":[78,602,70,26]}
+{"kind":"textbox","id":"sh/lc7u54zi","slide":2,"name":"矩形 19","text":"当前问题不只是模型结构，而是数据、训练路线和评估口径一起影响结果。","textPreview":"当前问题不只是模型结构，而是数据、训练路线和评估口径一起影响结果。","textChars":33,"textLines":1,"bbox":[142,598,930,38]}
+{"kind":"textbox","id":"sh/wra5gbq1","slide":2,"name":"矩形 20","text":"02","textPreview":"02","textChars":2,"textLines":1,"bbox":[1180,662,46,24]}
+{"kind":"notes","id":"nt/pg3ex0nu","slide":2,"text":"这一页先让导师接受：直接训 38 类很难，不是因为代码不努力，而是任务本身难。\n用这页引出为什么我们要先做生成数据和二分类稳定化。"}
+{"kind":"slide","id":"sl/s72x4nap","slide":3,"title":"总体方案","textShapes":11}
+{"kind":"shape","id":"sh/d4vmtwra","slide":3,"name":"矩形 11","bbox":[-1,0,1280,720]}
+{"kind":"textbox","id":"sh/o7qpg3ex","slide":3,"name":"矩形 1","text":"总体方案","textPreview":"总体方案","textChars":4,"textLines":1,"bbox":[54,36,520,28]}
+{"kind":"textbox","id":"sh/dsji5sne","slide":3,"name":"矩形 2","text":"先把监督数据做可控，再把模型训练做稳定","textPreview":"先把监督数据做可控，再把模型训练做稳定","textChars":19,"textLines":1,"bbox":[54,74,1060,72]}
+{"kind":"shape","id":"sh/6dcbulwv","slide":3,"name":"矩形: 圆角 3","bbox":[72,225,430,210]}
+{"kind":"shape","id":"sh/vy90je9c","slide":3,"name":"矩形 4","bbox":[72,225,6,210]}
+{"kind":"textbox","id":"sh/oj2t83it","slide":3,"name":"矩形 5","text":"点云生成模块","textPreview":"点云生成模块","textChars":6,"textLines":1,"bbox":[100,250,380,34]}
+{"kind":"textbox","id":"sh/d4vmtwra","slide":3,"name":"矩形 6","text":"用路面粗糙度、微纹理、病害原语和 LiDAR 观测模型，生成带标签点云。","textPreview":"用路面粗糙度、微纹理、病害原语和 LiDAR 观测模型，生成带标签点云。","textChars":36,"textLines":1,"bbox":[100,298,360,116]}
+{"kind":"shape","id":"sh/6hcrmhk3","slide":3,"name":"矩形: 圆角 7","bbox":[778,225,430,210]}
+{"kind":"shape","id":"sh/z25kb6xk","slide":3,"name":"矩形 8","bbox":[772,225,6,210]}
+{"kind":"textbox","id":"sh/vy90je9c","slide":3,"name":"矩形 9","text":"模型训练模块","textPreview":"模型训练模块","textChars":6,"textLines":1,"bbox":[806,250,374,34]}
+{"kind":"textbox","id":"sh/6dcbulwv","slide":3,"name":"矩形 10","text":"用 Swin3D / PointMamba + mHC 训练分割模型，先二分类稳定，再迁移到多类别。","textPreview":"用 Swin3D / PointMamba + mHC 训练分割模型，先二分类稳定，再迁移到多类别。","textChars":50,"textLines":1,"bbox":[806,298,360,116]}
+{"kind":"shape","id":"sh/7y1kre1w","slide":3,"name":"直接箭头连接符 29","bbox":[502,330,270,0]}
+{"kind":"textbox","id":"sh/oj2t83it","slide":3,"name":"矩形 12","text":"闭环","textPreview":"闭环","textChars":2,"textLines":1,"bbox":[593,282,94,38]}
+{"kind":"textbox","id":"sh/vmtwra5g","slide":3,"name":"矩形 13","text":"生成 -> 训练 -> 评估 -> 校准 -> 再生成","textPreview":"生成 -> 训练 -> 评估 -> 校准 -> 再生成","textChars":27,"textLines":1,"bbox":[482,334,328,28]}
+{"kind":"shape","id":"sh/61032lsz","slide":3,"name":"矩形: 圆角 14","bbox":[120,504,1040,86]}
+{"kind":"textbox","id":"sh/dsji5sne","slide":3,"name":"矩形 15","text":"关键区别","textPreview":"关键区别","textChars":4,"textLines":1,"bbox":[156,528,120,28]}
+{"kind":"textbox","id":"sh/o7qpg3ex","slide":3,"name":"矩形 16","text":"点云生成不是前处理脚本，它决定几何形态、类别覆盖和监督上限。","textPreview":"点云生成不是前处理脚本，它决定几何形态、类别覆盖和监督上限。","textChars":30,"textLines":1,"bbox":[296,524,820,38]}
+{"kind":"textbox","id":"sh/vahoza1g","slide":3,"name":"矩形 17","text":"03","textPreview":"03","textChars":2,"textLines":1,"bbox":[1180,662,46,24]}
+{"kind":"notes","id":"nt/s72x4nap","slide":3,"text":"这一页是整套汇报的中心：左右两块不是先后附属关系，而是同等重要。\n导师如果问创新在哪里，可以说在于把可控生成和训练闭环放在一起设计。"}
+{"kind":"slide","id":"sl/val87ed8","slide":4,"title":"点云生成","textShapes":26}
+{"kind":"shape","id":"sh/hk3q5o7q","slide":4,"name":"矩形 28","bbox":[0,0,1280,720]}
+{"kind":"textbox","id":"sh/qtcj6tov","slide":4,"name":"矩形 1","text":"点云生成","textPreview":"点云生成","textChars":4,"textLines":1,"bbox":[54,36,520,28]}
+{"kind":"textbox","id":"sh/je9cvixc","slide":4,"name":"矩形 2","text":"合成点云来自一条物理和几何流水线","textPreview":"合成点云来自一条物理和几何流水线","textChars":16,"textLines":1,"bbox":[54,74,900,72]}
+{"kind":"textbox","id":"sh/87ed8bat","slide":4,"name":"矩形 3","text":"不是随机造点，而是按“路面形貌 + 病害形变 + LiDAR 观测”生成监督样本。","textPreview":"不是随机造点，而是按“路面形貌 + 病害形变 + LiDAR 观测”生成监督样本。","textChars":41,"textLines":1,"bbox":[58,146,950,34]}
+{"kind":"shape","id":"sh/xs72x4na","slide":4,"name":"矩形: 圆角 4","bbox":[58,238,160,168]}
+{"kind":"textbox","id":"sh/q1orytsv","slide":4,"name":"矩形 5","text":"01","textPreview":"01","textChars":2,"textLines":1,"bbox":[74,254,40,24]}
+{"kind":"textbox","id":"sh/fmlkjm1c","slide":4,"name":"矩形 6","text":"路面类型","textPreview":"路面类型","textChars":4,"textLines":1,"bbox":[74,284,128,30]}
+{"kind":"textbox","id":"sh/8jqh0fep","slide":4,"name":"矩形 7","text":"沥青 / 水泥","textPreview":"沥青 / 水泥","textChars":7,"textLines":1,"bbox":[74,322,128,74]}
+{"kind":"shape","id":"sh/x4nap4r6","slide":4,"name":"矩形: 圆角 8","bbox":[256,238,160,168]}
+{"kind":"textbox","id":"sh/1w7mp0bi","slide":4,"name":"矩形 9","text":"02","textPreview":"02","textChars":2,"textLines":1,"bbox":[272,254,40,24]}
+{"kind":"textbox","id":"sh/8bat47y1","slide":4,"name":"矩形 10","text":"ISO 8608","textPreview":"ISO 8608","textChars":8,"textLines":1,"bbox":[272,284,128,30]}
+{"kind":"textbox","id":"sh/jqh0fepk","slide":4,"name":"矩形 11","text":"宏观粗糙度","textPreview":"宏观粗糙度","textChars":5,"textLines":1,"bbox":[272,322,128,74]}
+{"kind":"shape","id":"sh/q5o7qpg3","slide":4,"name":"矩形: 圆角 12","bbox":[454,238,160,168]}
+{"kind":"textbox","id":"sh/18jqh0fe","slide":4,"name":"矩形 13","text":"03","textPreview":"03","textChars":2,"textLines":1,"bbox":[470,254,40,24]}
+{"kind":"textbox","id":"sh/8nqxs72x","slide":4,"name":"矩形 14","text":"微纹理","textPreview":"微纹理","textChars":3,"textLines":1,"bbox":[470,284,128,30]}
+{"kind":"textbox","id":"sh/j2t83itg","slide":4,"name":"矩形 15","text":"fBm 细节","textPreview":"fBm 细节","textChars":6,"textLines":1,"bbox":[470,322,128,74]}
+{"kind":"shape","id":"sh/qh0fepkz","slide":4,"name":"矩形: 圆角 16","bbox":[652,238,160,168]}
+{"kind":"textbox","id":"sh/1cfa9w3m","slide":4,"name":"矩形 17","text":"04","textPreview":"04","textChars":2,"textLines":1,"bbox":[668,254,40,24]}
+{"kind":"textbox","id":"sh/crmhk3q5","slide":4,"name":"矩形 18","text":"病害原语","textPreview":"病害原语","textChars":4,"textLines":1,"bbox":[668,284,128,30]}
+{"kind":"textbox","id":"sh/sfil0rqd","slide":4,"name":"矩形 19","text":"裂缝、坑槽等","textPreview":"裂缝、坑槽等","textChars":6,"textLines":1,"bbox":[668,322,128,74]}
+{"kind":"shape","id":"sh/h0fepkzu","slide":4,"name":"矩形: 圆角 20","bbox":[850,238,160,168]}
+{"kind":"textbox","id":"sh/a9w3m94f","slide":4,"name":"矩形 21","text":"05","textPreview":"05","textChars":2,"textLines":1,"bbox":[866,254,40,24]}
+{"kind":"textbox","id":"sh/zupwb2hw","slide":4,"name":"矩形 22","text":"LiDAR 观测","textPreview":"LiDAR 观测","textChars":8,"textLines":1,"bbox":[866,284,128,30]}
+{"kind":"textbox","id":"sh/orytsvu9","slide":4,"name":"矩形 23","text":"扫描线与噪声","textPreview":"扫描线与噪声","textChars":6,"textLines":1,"bbox":[866,322,128,74]}
+{"kind":"shape","id":"sh/hcrmhk3q","slide":4,"name":"矩形: 圆角 24","bbox":[1048,238,160,168]}
+{"kind":"textbox","id":"sh/al87ed8b","slide":4,"name":"矩形 25","text":"06","textPreview":"06","textChars":2,"textLines":1,"bbox":[1064,254,40,24]}
+{"kind":"textbox","id":"sh/z61032ls","slide":4,"name":"矩形 26","text":".npz 输出","textPreview":".npz 输出","textChars":7,"textLines":1,"bbox":[1064,284,128,30]}
+{"kind":"textbox","id":"sh/oza1gvy9","slide":4,"name":"矩形 27","text":"点、标签、特征","textPreview":"点、标签、特征","textChars":7,"textLines":1,"bbox":[1064,322,128,74]}
+{"kind":"shape","id":"sh/tsvu9kni","slide":4,"name":"直接箭头连接符 68","bbox":[218,322,38,0]}
+{"kind":"shape","id":"sh/m1cfa9w3","slide":4,"name":"直接箭头连接符 69","bbox":[416,322,38,0]}
+{"kind":"shape","id":"sh/bm58z25k","slide":4,"name":"直接箭头连接符 70","bbox":[614,322,38,0]}
+{"kind":"shape","id":"sh/4byhgn29","slide":4,"name":"直接箭头连接符 71","bbox":[812,322,38,0]}
+{"kind":"shape","id":"sh/twra5gbq","slide":4,"name":"直接箭头连接符 72","bbox":[1010,322,38,0]}
+{"kind":"shape","id":"sh/7adsji5s","slide":4,"name":"矩形: 圆角 33","bbox":[74,488,520,104]}
+{"kind":"textbox","id":"sh/epkzupwb","slide":4,"name":"矩形 34","text":"讲解重点","textPreview":"讲解重点","textChars":4,"textLines":1,"bbox":[104,508,160,28]}
+{"kind":"textbox","id":"sh/pg3ex0nu","slide":4,"name":"矩形 35","text":"病害先在几何层面形成，再映射成点级标签；这比直接贴标签更自然。","textPreview":"病害先在几何层面形成，再映射成点级标签；这比直接贴标签更自然。","textChars":31,"textLines":1,"bbox":[104,543,450,38]}
+{"kind":"shape","id":"sh/wval87ed","slide":4,"name":"矩形: 圆角 36","bbox":[666,488,520,104]}
+{"kind":"textbox","id":"sh/36hcrmhk","slide":4,"name":"矩形 37","text":"代码落点","textPreview":"代码落点","textChars":4,"textLines":1,"bbox":[696,508,160,28]}
+{"kind":"textbox","id":"sh/eloj2t83","slide":4,"name":"矩形 38","text":"generator.py 负责调度；primitives.py 提供 11 类物理/几何基元。","textPreview":"generator.py 负责调度；primitives.py 提供 11 类物理/几何基元。","textChars":47,"textLines":1,"bbox":[696,543,450,38]}
+{"kind":"textbox","id":"sh/yhgn29gr","slide":4,"name":"矩形 39","text":"04","textPreview":"04","textChars":2,"textLines":1,"bbox":[1180,662,46,24]}
+{"kind":"notes","id":"nt/val87ed8","slide":4,"text":"这里要讲清楚：点云生成模块是项目的重要部分，不是临时造数据。\n如果导师追问，可以展开 ISO 8608、病害原语、LiDAR 重采样三层。"}
+{"kind":"slide","id":"sl/mlkjm1cf","slide":5,"title":"模型训练","textShapes":19}
+{"kind":"shape","id":"sh/2x4nap4r","slide":5,"name":"矩形 19","bbox":[0,0,1280,720]}
+{"kind":"textbox","id":"sh/ovahoza1","slide":5,"name":"矩形 1","text":"模型训练","textPreview":"模型训练","textChars":4,"textLines":1,"bbox":[54,36,520,28]}
+{"kind":"textbox","id":"sh/dg7adsji","slide":5,"name":"矩形 2","text":"训练路线先解决“会不会学到病害”，再解决“分成哪一类”","textPreview":"训练路线先解决“会不会学到病害”，再解决“分成哪一类”","textChars":27,"textLines":1,"bbox":[54,74,1080,78]}
+{"kind":"shape","id":"sh/6hcrmhk3","slide":5,"name":"矩形: 圆角 3","bbox":[84,216,220,150]}
+{"kind":"textbox","id":"sh/z25kb6xk","slide":5,"name":"矩形 4","text":"01","textPreview":"01","textChars":2,"textLines":1,"bbox":[100,232,40,24]}
+{"kind":"textbox","id":"sh/onyd0z61","slide":5,"name":"矩形 5","text":"二分类","textPreview":"二分类","textChars":3,"textLines":1,"bbox":[100,266,188,30]}
+{"kind":"textbox","id":"sh/d8v6psfi","slide":5,"name":"矩形 6","text":"背景 / 病害","textPreview":"背景 / 病害","textChars":7,"textLines":1,"bbox":[100,304,188,52]}
+{"kind":"shape","id":"sh/6dcbulwv","slide":5,"name":"矩形: 圆角 7","bbox":[356,216,220,150]}
+{"kind":"textbox","id":"sh/vy90je9c","slide":5,"name":"矩形 8","text":"02","textPreview":"02","textChars":2,"textLines":1,"bbox":[372,232,40,24]}
+{"kind":"textbox","id":"sh/nuxc3ylc","slide":5,"name":"矩形 9","text":"阈值校准","textPreview":"阈值校准","textChars":4,"textLines":1,"bbox":[372,266,188,30]}
+{"kind":"textbox","id":"sh/y90je9cv","slide":5,"name":"矩形 10","text":"约 0.44","textPreview":"约 0.44","textChars":6,"textLines":1,"bbox":[372,304,188,52]}
+{"kind":"shape","id":"sh/5wjudg7a","slide":5,"name":"矩形: 圆角 11","bbox":[628,216,220,150]}
+{"kind":"textbox","id":"sh/gbq1oryt","slide":5,"name":"矩形 12","text":"03","textPreview":"03","textChars":2,"textLines":1,"bbox":[644,232,40,24]}
+{"kind":"textbox","id":"sh/n29gr2p8","slide":5,"name":"矩形 13","text":"迁移骨干","textPreview":"迁移骨干","textChars":4,"textLines":1,"bbox":[644,266,188,30]}
+{"kind":"textbox","id":"sh/yhgn29gr","slide":5,"name":"矩形 14","text":"复用 backbone","textPreview":"复用 backbone","textChars":11,"textLines":1,"bbox":[644,304,188,52]}
+{"kind":"shape","id":"sh/58z25kb6","slide":5,"name":"矩形: 圆角 15","bbox":[900,216,220,150]}
+{"kind":"textbox","id":"sh/gn29gr2p","slide":5,"name":"矩形 16","text":"04","textPreview":"04","textChars":2,"textLines":1,"bbox":[916,232,40,24]}
+{"kind":"textbox","id":"sh/neloj2t8","slide":5,"name":"矩形 17","text":"38 类细分","textPreview":"38 类细分","textChars":6,"textLines":1,"bbox":[916,266,188,30]}
+{"kind":"textbox","id":"sh/ytsvu9kn","slide":5,"name":"矩形 18","text":"分阶段推进","textPreview":"分阶段推进","textChars":5,"textLines":1,"bbox":[916,304,188,52]}
+{"kind":"shape","id":"sh/ed8v6psf","slide":5,"name":"直接箭头连接符 50","bbox":[304,291,52,0]}
+{"kind":"shape","id":"sh/p4r65wju","slide":5,"name":"直接箭头连接符 51","bbox":[576,291,52,0]}
+{"kind":"shape","id":"sh/wjudg7ad","slide":5,"name":"直接箭头连接符 52","bbox":[848,291,52,0]}
+{"kind":"shape","id":"sh/donyd0z6","slide":5,"name":"矩形: 圆角 22","bbox":[86,444,532,138]}
+{"kind":"shape","id":"sh/6psfil0r","slide":5,"name":"矩形 23","bbox":[86,444,6,138]}
+{"kind":"textbox","id":"sh/val87ed8","slide":5,"name":"矩形 24","text":"结构选择","textPreview":"结构选择","textChars":4,"textLines":1,"bbox":[116,466,470,34]}
+{"kind":"textbox","id":"sh/kre1w7mp","slide":5,"name":"矩形 25","text":"Swin3D 是当前更稳的精度基线；PointMamba-inspired 更轻量，适合继续做速度和结构探索。","textPreview":"Swin3D 是当前更稳的精度基线；PointMamba-inspired 更轻量，适合继续做速度和结构探索。","textChars":55,"textLines":1,"bbox":[116,506,470,58]}
+{"kind":"shape","id":"sh/dcbulwva","slide":5,"name":"矩形: 圆角 26","bbox":[668,444,532,138]}
+{"kind":"shape","id":"sh/2lszqtcj","slide":5,"name":"矩形 27","bbox":[668,444,6,138]}
+{"kind":"textbox","id":"sh/v6psfil0","slide":5,"name":"矩形 28","text":"训练配方","textPreview":"训练配方","textChars":4,"textLines":1,"bbox":[698,466,470,34]}
+{"kind":"textbox","id":"sh/h4byhgn2","slide":5,"name":"矩形 29","text":"mHC 做通道混合；Focal + Dice + Edge 对应长尾、小目标和边界；Muon + AdamW 提供混合优化。","textPreview":"mHC 做通道混合；Focal + Dice + Edge 对应长尾、小目标和边界；Muon + AdamW 提供混合优化。","textChars":62,"textLines":1,"bbox":[698,506,470,58]}
+{"kind":"textbox","id":"sh/sji5snel","slide":5,"name":"矩形 30","text":"05","textPreview":"05","textChars":2,"textLines":1,"bbox":[1180,662,46,24]}
+{"kind":"notes","id":"nt/mlkjm1cf","slide":5,"text":"这页要强调为什么不是直接硬训 38 类。\n二分类阶段先把前景边界学稳，再迁移到更细粒度类别，这比冷启动更合理。"}
+{"kind":"slide","id":"sl/58z25kb6","slide":6,"title":"扩展支线","textShapes":18}
+{"kind":"shape","id":"sh/94fu18jq","slide":6,"name":"矩形 20","bbox":[0,0,1280,720]}
+{"kind":"textbox","id":"sh/ylc7u54z","slide":6,"name":"矩形 1","text":"扩展支线","textPreview":"扩展支线","textChars":4,"textLines":1,"bbox":[54,36,520,28]}
+{"kind":"textbox","id":"sh/r65wjudg","slide":6,"name":"矩形 2","text":"GAN 和 end2end 是通向真实域适配的支线","textPreview":"GAN 和 end2end 是通向真实域适配的支线","textChars":25,"textLines":1,"bbox":[54,74,900,72]}
+{"kind":"textbox","id":"sh/g3ex0nux","slide":6,"name":"矩形 3","text":"它们不是当前最稳结果来源，但解释了项目后续如何从合成走向真实。","textPreview":"它们不是当前最稳结果来源，但解释了项目后续如何从合成走向真实。","textChars":31,"textLines":1,"bbox":[58,146,910,34]}
+{"kind":"shape","id":"sh/5o7qpg3e","slide":6,"name":"矩形: 圆角 4","bbox":[96,238,200,136]}
+{"kind":"textbox","id":"sh/yxobm58z","slide":6,"name":"矩形 5","text":"01","textPreview":"01","textChars":2,"textLines":1,"bbox":[112,254,40,24]}
+{"kind":"textbox","id":"sh/nih4byhg","slide":6,"name":"矩形 6","text":"合成点云","textPreview":"合成点云","textChars":4,"textLines":1,"bbox":[112,284,168,30]}
+{"kind":"textbox","id":"sh/g7adsji5","slide":6,"name":"矩形 7","text":"points + normals","textPreview":"points + normals","textChars":16,"textLines":1,"bbox":[112,322,168,42]}
+{"kind":"shape","id":"sh/9s36hcrm","slide":6,"name":"矩形: 圆角 8","bbox":[394,238,240,136]}
+{"kind":"textbox","id":"sh/d8v6psfi","slide":6,"name":"矩形 9","text":"02","textPreview":"02","textChars":2,"textLines":1,"bbox":[410,254,40,24]}
+{"kind":"textbox","id":"sh/onyd0z61","slide":6,"name":"矩形 10","text":"StyleTransferGen","textPreview":"StyleTransferGen","textChars":16,"textLines":1,"bbox":[410,284,208,30]}
+{"kind":"textbox","id":"sh/z25kb6xk","slide":6,"name":"矩形 11","text":"预测坐标和法向残差","textPreview":"预测坐标和法向残差","textChars":9,"textLines":1,"bbox":[410,322,208,42]}
+{"kind":"shape","id":"sh/6hcrmhk3","slide":6,"name":"矩形: 圆角 12","bbox":[732,238,240,136]}
+{"kind":"textbox","id":"sh/dg7adsji","slide":6,"name":"矩形 13","text":"03","textPreview":"03","textChars":2,"textLines":1,"bbox":[748,254,40,24]}
+{"kind":"textbox","id":"sh/ovahoza1","slide":6,"name":"矩形 14","text":"WGAN 判别器","textPreview":"WGAN 判别器","textChars":8,"textLines":1,"bbox":[748,284,208,30]}
+{"kind":"textbox","id":"sh/vahoza1g","slide":6,"name":"矩形 15","text":"判断风格是否更真实","textPreview":"判断风格是否更真实","textChars":9,"textLines":1,"bbox":[748,322,208,42]}
+{"kind":"shape","id":"sh/6tovahoz","slide":6,"name":"矩形: 圆角 16","bbox":[732,438,240,118]}
+{"kind":"textbox","id":"sh/dsji5sne","slide":6,"name":"矩形 17","text":"04","textPreview":"04","textChars":2,"textLines":1,"bbox":[748,454,40,24]}
+{"kind":"textbox","id":"sh/o7qpg3ex","slide":6,"name":"矩形 18","text":"分割模型","textPreview":"分割模型","textChars":4,"textLines":1,"bbox":[748,484,208,30]}
+{"kind":"textbox","id":"sh/kjm1cfa9","slide":6,"name":"矩形 19","text":"在风格化点云上训练","textPreview":"在风格化点云上训练","textChars":9,"textLines":1,"bbox":[748,522,208,24]}
+{"kind":"shape","id":"sh/gvy90je9","slide":6,"name":"矩形: 圆角 23","bbox":[96,592,876,58]}
+{"kind":"textbox","id":"sh/9gr2p8nq","slide":6,"name":"矩形 24","text":"定位","textPreview":"定位","textChars":2,"textLines":1,"bbox":[126,611,90,28]}
+{"kind":"textbox","id":"sh/2p8nqxs7","slide":6,"name":"矩形 25","text":"当前主结果仍来自 baseline；GAN / end2end 后续承担域适配验证。","textPreview":"当前主结果仍来自 baseline；GAN / end2end 后续承担域适配验证。","textChars":42,"textLines":1,"bbox":[216,610,720,30]}
+{"kind":"textbox","id":"sh/ra5gbq1o","slide":6,"name":"矩形 26","text":"06","textPreview":"06","textChars":2,"textLines":1,"bbox":[1180,662,46,24]}
+{"kind":"shape","id":"sh/kzupwb2h","slide":6,"bbox":[0,0,0,0]}
+{"kind":"shape","id":"sh/9knih4by","slide":6,"bbox":[0,0,0,0]}
+{"kind":"shape","id":"sh/fa9w3m94","slide":6,"bbox":[0,0,0,0]}
+{"kind":"notes","id":"nt/58z25kb6","slide":6,"text":"这页回应代码里 GAN 和 end2end 的存在：它们不是乱放的，而是域适配支线。\n同时要诚实说明当前主结论仍来自 baseline，不要把支线说成已成熟成果。"}
+{"kind":"slide","id":"sl/0z61032l","slide":7,"title":"阶段结果","textShapes":17}
+{"kind":"shape","id":"sh/l0rqd4vm","slide":7,"name":"矩形 27","bbox":[0,0,1280,720]}
+{"kind":"textbox","id":"sh/x4nap4r6","slide":7,"name":"矩形 1","text":"阶段结果","textPreview":"阶段结果","textChars":4,"textLines":1,"bbox":[54,36,520,28]}
+{"kind":"textbox","id":"sh/8jqh0fep","slide":7,"name":"矩形 2","text":"当前结果说明路线可行，但还不是最终泛化结论","textPreview":"当前结果说明路线可行，但还不是最终泛化结论","textChars":21,"textLines":1,"bbox":[54,74,1080,72]}
+{"kind":"shape","id":"sh/fa9w3m94","slide":7,"name":"矩形: 圆角 3","bbox":[74,188,232,148]}
+{"kind":"textbox","id":"sh/qpg3ex0n","slide":7,"name":"矩形 4","text":"0.7319","textPreview":"0.7319","textChars":6,"textLines":1,"bbox":[92,206,196,56]}
+{"kind":"textbox","id":"sh/xczed8v6","slide":7,"name":"矩形 5","text":"Swin3D + mHC\n校准后全局点级 mIoU","textPreview":"Swin3D + mHC | 校准后全局点级 mIoU","textChars":25,"textLines":2,"bbox":[92,268,196,58]}
+{"kind":"shape","id":"sh/8v6psfil","slide":7,"name":"矩形: 圆角 6","bbox":[320,188,206,148]}
+{"kind":"textbox","id":"sh/je9cvixc","slide":7,"name":"矩形 7","text":"0.7052","textPreview":"0.7052","textChars":6,"textLines":1,"bbox":[338,206,170,56]}
+{"kind":"textbox","id":"sh/qtcj6tov","slide":7,"name":"矩形 8","text":"disease IoU","textPreview":"disease IoU","textChars":11,"textLines":1,"bbox":[338,268,170,58]}
+{"kind":"shape","id":"sh/svu9knih","slide":7,"name":"矩形: 圆角 9","bbox":[540,188,206,148]}
+{"kind":"textbox","id":"sh/hgn29gr2","slide":7,"name":"矩形 10","text":"0.9039","textPreview":"0.9039","textChars":6,"textLines":1,"bbox":[558,206,170,56]}
+{"kind":"textbox","id":"sh/ap4r65wj","slide":7,"name":"矩形 11","text":"precision","textPreview":"precision","textChars":9,"textLines":1,"bbox":[558,268,170,58]}
+{"kind":"shape","id":"sh/za1gvy90","slide":7,"name":"矩形: 圆角 12","bbox":[760,188,206,148]}
+{"kind":"textbox","id":"sh/s36hcrmh","slide":7,"name":"矩形 13","text":"0.7624","textPreview":"0.7624","textChars":6,"textLines":1,"bbox":[778,206,170,56]}
+{"kind":"textbox","id":"sh/hoza1gvy","slide":7,"name":"矩形 14","text":"recall","textPreview":"recall","textChars":6,"textLines":1,"bbox":[778,268,170,58]}
+{"kind":"shape","id":"sh/a1gvy90j","slide":7,"name":"矩形: 圆角 15","bbox":[980,188,200,148]}
+{"kind":"textbox","id":"sh/zidonyd0","slide":7,"name":"矩形 16","text":"0.5671","textPreview":"0.5671","textChars":6,"textLines":1,"bbox":[998,206,164,56]}
+{"kind":"textbox","id":"sh/s72x4nap","slide":7,"name":"矩形 17","text":"PointMamba + mHC\n二分类短跑 mIoU","textPreview":"PointMamba + mHC | 二分类短跑 mIoU","textChars":27,"textLines":2,"bbox":[998,268,164,58]}
+{"kind":"shape","id":"sh/lszqtcj6","slide":7,"name":"矩形: 圆角 18","bbox":[86,418,534,150]}
+{"kind":"shape","id":"sh/pg3ex0nu","slide":7,"name":"矩形 19","bbox":[86,418,6,150]}
+{"kind":"textbox","id":"sh/wval87ed","slide":7,"name":"矩形 20","text":"必须主动说明的限制","textPreview":"必须主动说明的限制","textChars":9,"textLines":1,"bbox":[116,442,480,34]}
+{"kind":"textbox","id":"sh/7adsji5s","slide":7,"name":"矩形 21","text":"当前结果主要来自生成的小型验证集；大量快速诊断只用少量验证 batch，容易在极少 batch 上出现过拟合。","textPreview":"当前结果主要来自生成的小型验证集；大量快速诊断只用少量验证 batch，容易在极少 batch 上出现过拟合。","textChars":55,"textLines":1,"bbox":[116,488,470,62]}
+{"kind":"shape","id":"sh/epkzupwb","slide":7,"name":"矩形: 圆角 22","bbox":[664,418,534,150]}
+{"kind":"shape","id":"sh/psfil0rq","slide":7,"name":"矩形 23","bbox":[664,418,6,150]}
+{"kind":"textbox","id":"sh/w7mp0bi9","slide":7,"name":"矩形 24","text":"对导师的稳妥表述","textPreview":"对导师的稳妥表述","textChars":8,"textLines":1,"bbox":[694,442,480,34]}
+{"kind":"textbox","id":"sh/7mp0bi9s","slide":7,"name":"矩形 25","text":"这些分数证明技术路线成立，但下一步需要在扩容数据集上重新验证稳定性和泛化。","textPreview":"这些分数证明技术路线成立，但下一步需要在扩容数据集上重新验证稳定性和泛化。","textChars":37,"textLines":1,"bbox":[694,488,470,62]}
+{"kind":"textbox","id":"sh/e1w7mp0b","slide":7,"name":"矩形 26","text":"07","textPreview":"07","textChars":2,"textLines":1,"bbox":[1180,662,46,24]}
+{"kind":"notes","id":"nt/0z61032l","slide":7,"text":"这页要主动讲限制，避免导师追问时显得被动。\n重点不是夸分数，而是说分数说明路线有效，正式结论要等扩容后复验。"}
+{"kind":"slide","id":"sl/fu18jqh0","slide":8,"title":"下一步","textShapes":20}
+{"kind":"shape","id":"sh/obm58z25","slide":8,"name":"矩形 27","bbox":[0,0,1280,720]}
+{"kind":"textbox","id":"sh/u9knih4b","slide":8,"name":"矩形 1","text":"下一步","textPreview":"下一步","textChars":3,"textLines":1,"bbox":[54,36,520,28]}
+{"kind":"textbox","id":"sh/judg7ads","slide":8,"name":"矩形 2","text":"下一阶段先扩大验证，再推进 38 类和真实域适配","textPreview":"下一阶段先扩大验证，再推进 38 类和真实域适配","textChars":24,"textLines":1,"bbox":[54,74,1080,72]}
+{"kind":"shape","id":"sh/c7u54zid","slide":8,"name":"矩形: 圆角 3","bbox":[74,220,190,236]}
+{"kind":"textbox","id":"sh/1orytsvu","slide":8,"name":"矩形 4","text":"01","textPreview":"01","textChars":2,"textLines":1,"bbox":[90,236,40,24]}
+{"kind":"textbox","id":"sh/u18jqh0f","slide":8,"name":"矩形 5","text":"扩容数据","textPreview":"扩容数据","textChars":4,"textLines":1,"bbox":[90,266,158,30]}
+{"kind":"textbox","id":"sh/jm1cfa9w","slide":8,"name":"矩形 6","text":"目标约 5000 个合成场景，补齐可恢复生成。","textPreview":"目标约 5000 个合成场景，补齐可恢复生成。","textChars":23,"textLines":1,"bbox":[90,304,158,142]}
+{"kind":"shape","id":"sh/cvixczed","slide":8,"name":"矩形: 圆角 7","bbox":[312,220,190,236]}
+{"kind":"textbox","id":"sh/5gbq1ory","slide":8,"name":"矩形 8","text":"02","textPreview":"02","textChars":2,"textLines":1,"bbox":[328,236,40,24]}
+{"kind":"textbox","id":"sh/18jqh0fe","slide":8,"name":"矩形 9","text":"统一评估","textPreview":"统一评估","textChars":4,"textLines":1,"bbox":[328,266,158,30]}
+{"kind":"textbox","id":"sh/8nqxs72x","slide":8,"name":"矩形 10","text":"同时输出 global mIoU 与 batch mean mIoU。","textPreview":"同时输出 global mIoU 与 batch mean mIoU。","textChars":35,"textLines":1,"bbox":[328,304,158,142]}
+{"kind":"shape","id":"sh/j2t83itg","slide":8,"name":"矩形: 圆角 11","bbox":[550,220,190,236]}
+{"kind":"textbox","id":"sh/qh0fepkz","slide":8,"name":"矩形 12","text":"03","textPreview":"03","textChars":2,"textLines":1,"bbox":[566,236,40,24]}
+{"kind":"textbox","id":"sh/1w7mp0bi","slide":8,"name":"矩形 13","text":"重验二分类","textPreview":"重验二分类","textChars":5,"textLines":1,"bbox":[566,266,158,30]}
+{"kind":"textbox","id":"sh/8bat47y1","slide":8,"name":"矩形 14","text":"复验 Swin3D 与 PointMamba 的稳定性。","textPreview":"复验 Swin3D 与 PointMamba 的稳定性。","textChars":28,"textLines":1,"bbox":[566,304,158,142]}
+{"kind":"shape","id":"sh/jqh0fepk","slide":8,"name":"矩形: 圆角 15","bbox":[788,220,190,236]}
+{"kind":"textbox","id":"sh/q5o7qpg3","slide":8,"name":"矩形 16","text":"04","textPreview":"04","textChars":2,"textLines":1,"bbox":[804,236,40,24]}
+{"kind":"textbox","id":"sh/1kre1w7m","slide":8,"name":"矩形 17","text":"分阶段多类","textPreview":"分阶段多类","textChars":5,"textLines":1,"bbox":[804,266,158,30]}
+{"kind":"textbox","id":"sh/c3ylc7u5","slide":8,"name":"矩形 18","text":"二分类 -> 4/8 类 -> 高频子类 -> 38 类。","textPreview":"二分类 -> 4/8 类 -> 高频子类 -> 38 类。","textChars":29,"textLines":1,"bbox":[804,304,158,142]}
+{"kind":"shape","id":"sh/orytsvu9","slide":8,"name":"矩形: 圆角 19","bbox":[1026,220,190,236]}
+{"kind":"textbox","id":"sh/hcrmhk3q","slide":8,"name":"矩形 20","text":"05","textPreview":"05","textChars":2,"textLines":1,"bbox":[1042,236,40,24]}
+{"kind":"textbox","id":"sh/al87ed8b","slide":8,"name":"矩形 21","text":"接回 GAN","textPreview":"接回 GAN","textChars":6,"textLines":1,"bbox":[1042,266,158,30]}
+{"kind":"textbox","id":"sh/z61032ls","slide":8,"name":"矩形 22","text":"在 baseline 稳定后做合成到真实风格适配。","textPreview":"在 baseline 稳定后做合成到真实风格适配。","textChars":25,"textLines":1,"bbox":[1042,304,158,142]}
+{"kind":"shape","id":"sh/sfil0rqd","slide":8,"name":"矩形: 圆角 23","bbox":[74,546,1134,70]}
+{"kind":"textbox","id":"sh/h0fepkzu","slide":8,"name":"矩形 24","text":"结论","textPreview":"结论","textChars":2,"textLines":1,"bbox":[106,567,80,26]}
+{"kind":"textbox","id":"sh/a9w3m94f","slide":8,"name":"矩形 25","text":"这不是推翻重来，而是沿着已经验证的主线，把数据规模、评估口径和多类别迁移补稳。","textPreview":"这不是推翻重来，而是沿着已经验证的主线，把数据规模、评估口径和多类别迁移补稳。","textChars":39,"textLines":1,"bbox":[198,563,930,34]}
+{"kind":"textbox","id":"sh/zupwb2hw","slide":8,"name":"矩形 26","text":"08","textPreview":"08","textChars":2,"textLines":1,"bbox":[1180,662,46,24]}
+{"kind":"notes","id":"nt/fu18jqh0","slide":8,"text":"收尾要落在计划上：先扩容和统一评估，再做多类别迁移，最后接真实域适配。\n这页可以作为导师讨论的起点，问对方是否认可这个推进顺序。"}
