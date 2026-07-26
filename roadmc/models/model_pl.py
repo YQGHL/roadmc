@@ -478,6 +478,12 @@ class RoadMCSegModel(pl.LightningModule):
         self._val_scene_confusions = []
         self._val_calibration = CalibrationAccumulator()
 
+    def on_train_epoch_end(self) -> None:
+        # 变形状窗口注意力的分配器碎片化保险：不清理时长训练显存
+        # 单调爬升（0.9→6.5GB）直至 Windows sysmem fallback 假死。
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def on_validation_epoch_end(self) -> None:
         """Log one statistically valid metric from the complete validation set."""
         summary = metrics_from_confusion(

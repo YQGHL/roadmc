@@ -29,6 +29,18 @@ def _load_verified_checkpoint(path: Path, *, context: str):
 
 def train_baseline(args):
     torch.set_float32_matmul_precision('high')
+    # Blackwell (sm_120) 笔记本 GPU 平台加固：cuDNN 与 mem-efficient
+    # 两个 fused SDPA 后端都对逐步变化形状的 float attn_mask 出现过
+    # 异步非法内存访问（各在 step ~195/389 崩溃；CUDA_LAUNCH_BLOCKING=1
+    # 下同一配置可完整复跑，显存健康，索引路径有 allclose 等价测试
+    # ——判定为新架构上 fused 内核的竞态缺陷）。训练固定走 math 后端
+    # （组合算子，约 1.3-2× 慢但数值等价且稳定）；驱动/torch 更新后
+    # 可重新评估放开。
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
     from roadmc.data.curriculum import label_lut, num_classes_for_stage
     from roadmc.data.dataloader import RoadMCDataModule
     from roadmc.models.model_pl import RoadMCSegModel

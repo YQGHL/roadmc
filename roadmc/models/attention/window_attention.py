@@ -114,6 +114,11 @@ def _window_attention_sdpa(
     offsets = torch.cumsum(counts, dim=0) - counts
     slot = torch.arange(B * N, device=device) - offsets[w_of]
 
+    # M 桶化到 32 的倍数：逐步各异的 (W,H,M,M) mask 形状会让 CUDA
+    # 缓存分配器持续碎片化（长训练中显存从 0.9GB 爬到 6.5GB 后触发
+    # Windows sysmem fallback 假死）；把形状收敛到少数几档使块可复用。
+    M = ((M + 31) // 32) * 32
+
     def pad(t: torch.Tensor) -> torch.Tensor:
         # t: (B, H, N, D) -> (W, H, M, D)，padding 为 0
         t_flat = t.permute(0, 2, 1, 3).reshape(B * N, H, -1)[order]
@@ -131,7 +136,11 @@ def _window_attention_sdpa(
 
     valid = torch.zeros(W, M, dtype=torch.bool, device=device)
     valid[w_of, slot] = True
-    attn_mask = bias.masked_fill(~valid[:, None, None, :], float("-inf"))
+    # 用有限大负值而非 -inf：fp16/低精度 SDPA 内核对 -inf mask 的
+    # 处理在部分后端（尤其新架构 GPU 的 cuDNN 路径）不稳定；
+    # softmax(-0.5·finfo.min) 数值上同样为零权重。
+    neg_fill = torch.finfo(bias.dtype).min / 2
+    attn_mask = bias.masked_fill(~valid[:, None, None, :], neg_fill)
 
     out_pad = F.scaled_dot_product_attention(q_pad, k_pad, v_pad, attn_mask=attn_mask)
 

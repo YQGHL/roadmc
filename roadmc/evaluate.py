@@ -170,6 +170,14 @@ def evaluate(args: argparse.Namespace) -> dict:
             f"requires {num_classes}"
         )
 
+    # 与 train.py 相同的 Blackwell (sm_120) 平台加固：fused SDPA 后端
+    # 存在异步非法访问，固定 math 后端保证评估可复现完成。
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+
     model = RoadMCSegModel.load_from_checkpoint(checkpoint, map_location=device)
     if model.num_classes != num_classes:
         raise ValueError(
