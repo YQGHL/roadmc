@@ -247,9 +247,12 @@ class RoadMCDataModule(pl.LightningDataModule):
                 self.data_dir, "val", self.max_points, augment=False,
                 binary=self.binary, label_stage=self.label_stage,
             )
-        if stage in (None, "test"):
+        if stage == "test":
+            # 独立 test split：目录缺失时直接报错，绝不静默回退到 val
+            # ——回退会让"独立测试集"的声明在无人察觉的情况下失效。
+            # （stage=None 只建 fit 数据集，旧的双目录数据集仍可训练。）
             self.test_dataset = SyntheticPointCloudDataset(
-                self.data_dir, "val", self.max_points, augment=False,
+                self.data_dir, "test", self.max_points, augment=False,
                 binary=self.binary, label_stage=self.label_stage,
             )
 

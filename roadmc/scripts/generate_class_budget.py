@@ -290,9 +290,12 @@ def _budget_split(
             "unmet_labels": _unmet_labels(coverage, target_scenes, min_points),
         }
 
+    # 各 split 使用不相交的种子段，保证 train/val/test 场景来自
+    # 互不重叠的随机序列（独立测试集声明的前提）。
+    _SEED_SEGMENT = {"train": 0, "val": 100_000, "test": 200_000}
     pool_config = config
-    if split == "val" and config.seed is not None:
-        pool_config = replace(config, seed=config.seed + 100000)
+    if config.seed is not None and _SEED_SEGMENT.get(split, 0):
+        pool_config = replace(config, seed=config.seed + _SEED_SEGMENT[split])
 
     with mp.Pool(workers, initializer=_init_worker, initargs=(pool_config, str(split_dir))) as pool:
         while True:
@@ -355,7 +358,14 @@ def _auto_workers() -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default="./data/class_budget_output")
-    parser.add_argument("--split", choices=("train", "val", "both"), default="both")
+    parser.add_argument(
+        "--split", choices=("train", "val", "test", "both", "all"), default="both",
+        help="'both'=train+val；'all'=train+val+test（独立测试集，种子段 +200000）",
+    )
+    parser.add_argument(
+        "--test-ratio", type=float, default=0.2,
+        help="test split 的配额缩放比（相对 train 配额），与 --val-ratio 同语义",
+    )
     parser.add_argument("--labels", default="all", help="all, 1-37, or comma/range syntax such as 1-8,20,37")
     parser.add_argument("--target-scenes-per-class", type=int, default=20)
     parser.add_argument("--min-points-per-class", type=int, default=1000)
@@ -418,15 +428,28 @@ def main() -> None:
         num_points=args.num_points,
     )
     config.validate_parallel_budget(workers, args.max_parallel_memory_mib)
+    if not 0.0 < args.test_ratio < 1.0:
+        raise ValueError("--test-ratio must be in (0, 1)")
     output_dir = Path(args.output_dir)
-    selected_splits = ("train", "val") if args.split == "both" else (args.split,)
+    if args.split == "both":
+        selected_splits: tuple[str, ...] = ("train", "val")
+    elif args.split == "all":
+        selected_splits = ("train", "val", "test")
+    else:
+        selected_splits = (args.split,)
     started = time.time()
     reports: dict[str, dict[str, Any]] = {}
 
     for split in selected_splits:
-        if split == "val" and args.split == "both":
-            target_scenes = max(1, int(np.ceil(args.target_scenes_per_class * args.val_ratio)))
-            min_points = max(1, int(np.ceil(args.min_points_per_class * args.val_ratio)))
+        ratio = None
+        if args.split in ("both", "all"):
+            if split == "val":
+                ratio = args.val_ratio
+            elif split == "test":
+                ratio = args.test_ratio
+        if ratio is not None:
+            target_scenes = max(1, int(np.ceil(args.target_scenes_per_class * ratio)))
+            min_points = max(1, int(np.ceil(args.min_points_per_class * ratio)))
         else:
             target_scenes = args.target_scenes_per_class
             min_points = args.min_points_per_class

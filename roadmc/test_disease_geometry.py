@@ -166,6 +166,104 @@ class CorrugationEnvelopeTests(unittest.TestCase):
         self.assertLess(max(fracs), 0.5)
 
 
+class CornerBreakChordTests(unittest.TestCase):
+    """板角断裂 = 弦线切割的三角块，裂缝不通过角点。"""
+
+    def test_labeled_region_is_corner_triangle(self) -> None:
+        pts = _flat_grid(4.0, 6.0, 0.02)
+        labels = np.zeros(len(pts), dtype=np.int64)
+        out_pts, out_lbl = add_concrete_damage(
+            pts, labels, damage_type="corner_break", severity="severe",
+            params={"slab_length": 3.0, "slab_width": 4.0,
+                    "chord_frac_x": 0.4, "chord_frac_y": 0.4, "d_max": 0.015},
+            seed=7,
+        )
+        labeled = out_lbl > 0
+        self.assertGreater(int(labeled.sum()), 20)
+        # 标注区应能被某个板角的 0.4/0.4 弦线三角形（含槽带边距）覆盖
+        lx, ly = pts[labeled, 0], pts[labeled, 1]
+        corners = [(cx, cy) for cx in (0.0, 4.0) for cy in (0.0, 3.0, 6.0)]
+        margin = 0.08
+        best_cover = 0.0
+        for cx, cy in corners:
+            sx = 1.0 if cx == 0.0 else -1.0
+            sy = 1.0 if cy in (0.0, 3.0) else -1.0
+            # 三角形: |x-cx|/(0.4·4) + |y-cy|/(0.4·3) ≤ 1（加边距）
+            u = np.abs(lx - cx) / (0.4 * 4.0 + margin)
+            v = np.abs(ly - cy) / (0.4 * 3.0 + margin)
+            inside = (u + v <= 1.0 + margin) & (sx * (lx - cx) >= -margin) & (
+                sy * (ly - cy) >= -margin
+            )
+            best_cover = max(best_cover, float(inside.mean()))
+        self.assertGreater(best_cover, 0.9)
+        # 三角块整体沉降：标注点位移非零且量级 = d_max 的一半以上
+        dz = pts[labeled, 2] - out_pts[labeled, 2]
+        self.assertGreater(float(np.median(dz)), 0.005)
+        del sx, sy
+
+
+class AlligatorLocalizationTests(unittest.TestCase):
+    """龟裂是局部 patch，不再撒满全场。"""
+
+    def test_alligator_confined_to_region(self) -> None:
+        pts = _flat_grid(7.0, 5.0, 0.03)
+        labels = np.zeros(len(pts), dtype=np.int64)
+        _, lbl = add_crack(
+            pts, labels, crack_type="alligator", severity="severe",
+            params={"label_width_floor": 0.03, "region_center": (2.0, 2.0),
+                    "region_width": 1.0, "region_length": 3.0},
+            seed=5,
+        )
+        labeled = lbl > 0
+        self.assertGreater(int(labeled.sum()), 10)
+        lx, ly = pts[labeled, 0], pts[labeled, 1]
+        self.assertGreater(float(lx.min()), 2.0 - 0.5 - 0.15)
+        self.assertLess(float(lx.max()), 2.0 + 0.5 + 0.15)
+        self.assertGreater(float(ly.min()), 2.0 - 1.5 - 0.15)
+        self.assertLess(float(ly.max()), 2.0 + 1.5 + 0.15)
+        self.assertLess(float(labeled.mean()), 0.25)
+
+
+class WheelPathPriorTests(unittest.TestCase):
+    def test_samples_concentrate_on_wheel_paths(self) -> None:
+        from roadmc.data.synthetic.generator import SyntheticRoadDataset
+        rng = np.random.default_rng(0)
+        xs = np.array([
+            SyntheticRoadDataset._sample_wheelpath_x(rng, 7.0) for _ in range(500)
+        ])
+        dist_to_path = np.minimum(np.abs(xs - (3.5 - 0.9)), np.abs(xs - (3.5 + 0.9)))
+        self.assertLess(float(np.median(dist_to_path)), 0.3)
+        self.assertGreater(float((dist_to_path < 0.6).mean()), 0.85)
+
+
+class GeometricOcclusionTests(unittest.TestCase):
+    """深窄裂缝内部点被遮挡，宽坑槽内部可见。"""
+
+    def test_narrow_trench_occluded_wide_bowl_visible(self) -> None:
+        from roadmc.data.synthetic.primitives import (
+            geometric_occlusion_keep_mask,
+            local_depression_depth,
+        )
+        pts = _flat_grid(5.0, 5.0, 0.01)
+        # 窄槽：x=2.50 单列下凹 30mm（开口 ~1cm）
+        trench = np.abs(pts[:, 0] - 2.50) < 0.004
+        pts[trench, 2] = -0.030
+        # 宽碗：以 (1.0, 1.0) 为心、半径 0.3 的盘下凹 30mm
+        bowl = np.hypot(pts[:, 0] - 1.0, pts[:, 1] - 1.0) < 0.3
+        pts[bowl, 2] = -0.030
+
+        depth = local_depression_depth(pts)
+        rng = np.random.default_rng(3)
+        keep = geometric_occlusion_keep_mask(
+            pts, np.array([2.5, -1.0, 2.0]), depth, rng
+        )
+        trench_keep = float(keep[trench].mean())
+        bowl_core = bowl & (np.hypot(pts[:, 0] - 1.0, pts[:, 1] - 1.0) < 0.2)
+        bowl_keep = float(keep[bowl_core].mean())
+        self.assertLess(trench_keep, 0.5)
+        self.assertGreater(bowl_keep, 0.85)
+
+
 class RuttingObservabilityTests(unittest.TestCase):
     """车辙标签边界必须几何可观测（≥2 mm），带宽受物理约束。"""
 

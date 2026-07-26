@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -54,6 +54,8 @@ try:
         add_concrete_damage,
         simulate_lidar_noise,
         resample_to_lidar_pattern,
+        local_depression_depth,
+        geometric_occlusion_keep_mask,
     )
 except ImportError:
     # Fallback for standalone / -m execution
@@ -88,6 +90,8 @@ except ImportError:
         add_concrete_damage,
         simulate_lidar_noise,
         resample_to_lidar_pattern,
+        local_depression_depth,
+        geometric_occlusion_keep_mask,
     )
 
 CONCRETE_DAMAGE_TYPES: List[str] = [
@@ -330,20 +334,42 @@ class SyntheticRoadDataset(_DatasetBase):
             else:
                 non_raveling_diseases.append(d)
 
+        # 机理相关放置先验：疲劳类病害（龟裂、纵缝、坑槽）集中在轮迹
+        # 带；坑槽的主要成因链是 龟裂→水侵→剥落→坑槽，故若本场景有
+        # 龟裂/块裂 patch，坑槽以 p=0.5 落在该 patch 内。旧实现所有
+        # 病害独立均匀撒点，俯视图一眼可辨合成痕迹。
+        planned_crack_type: str | None = None
+        if any(d[0] == "crack" for d in non_raveling_diseases):
+            planned_crack_type = (
+                target_spec.variant
+                if target_spec is not None and target_spec.disease_type == "crack"
+                else str(rng.choice(self.config.crack.crack_types))
+            )
+        alligator_region: tuple[float, float] | None = None
+        if planned_crack_type in ("alligator", "block"):
+            alligator_region = (
+                self._sample_wheelpath_x(rng, width),
+                float(rng.uniform(0.8, max(length - 0.8, 0.9))),
+            )
+        pothole_cooccurs = alligator_region is not None and rng.random() < 0.5
+
         for disease_type, severity in non_raveling_diseases:
             seed = int(rng.integers(0, 2 ** 31))
             old_labels = labels.copy()
 
             if disease_type == "crack":
-                crack_type = (
-                    target_spec.variant
-                    if target_spec is not None and target_spec.disease_type == "crack"
-                    else str(rng.choice(self.config.crack.crack_types))
-                )
+                crack_type = planned_crack_type or str(rng.choice(self.config.crack.crack_types))
                 params: dict = {
                     "d_max": 0.010 if severity == "light" else 0.030,
                     "label_width_floor": grid_res,
                 }
+                if crack_type == "longitudinal":
+                    # 纵缝先验：轮迹带边缘（带中心 ±0.3m 摆动）
+                    params["x_center"] = self._sample_wheelpath_x(rng, width) + float(
+                        rng.normal(0.0, 0.15)
+                    )
+                elif alligator_region is not None:
+                    params["region_center"] = alligator_region
                 points, labels = add_crack(
                     points, labels,
                     crack_type=crack_type, severity=severity,
@@ -351,8 +377,16 @@ class SyntheticRoadDataset(_DatasetBase):
                 )
 
             elif disease_type == "pothole":
-                cx = float(rng.uniform(0.5, width - 0.5))
-                cy = float(rng.uniform(0.5, length - 0.5))
+                if pothole_cooccurs and alligator_region is not None:
+                    cx = float(np.clip(
+                        rng.normal(alligator_region[0], 0.3), 0.5, width - 0.5
+                    ))
+                    cy = float(np.clip(
+                        rng.normal(alligator_region[1], 0.6), 0.5, length - 0.5
+                    ))
+                else:
+                    cx = self._sample_wheelpath_x(rng, width)
+                    cy = float(rng.uniform(0.5, length - 0.5))
                 # JTG 5210-2018 坑槽轻/重仅按深度 (25mm) 分级；平面半径
                 # 与严重度解耦采样——旧实现按严重度硬切半径区间，使
                 # 轻/重可被平面尺寸这一非规范线索 100% 分离。
@@ -565,11 +599,27 @@ class SyntheticRoadDataset(_DatasetBase):
         if points.shape[0] == 0:
             raise RuntimeError("Empty point cloud after NaN filtering.")
 
+        # 6.5 几何遮挡：深窄凹陷（裂缝槽）内部点按开口半宽/深度/入射角
+        # 概率丢弃——真实窄裂缝是"点缺失的线"，不是被完整采样的深沟。
+        sensor_origin = self._sensor_pose()
+        depression_depth = local_depression_depth(points)
+        occl_keep = geometric_occlusion_keep_mask(
+            points, sensor_origin, depression_depth, rng
+        )
+        if not np.all(occl_keep):
+            if not np.any(occl_keep):
+                raise RuntimeError("Geometric occlusion removed every point.")
+            points = points[occl_keep]
+            labels = labels[occl_keep]
+            normals = normals[occl_keep]
+            curvature = curvature[occl_keep]
+            depression_depth = depression_depth[occl_keep]
+
         # 7. 辐射强度计算（在松散标签应用之后）：I ∝ ρ·cosθ/R²，
         # 同时得到接收功率代理，供 σ_r 与丢点共用（统一辐射预算）。
-        sensor_origin = self._sensor_pose()
         intensity, received_power = self._compute_intensity(
-            points, normals, labels, pavement_type, sensor_origin, rng
+            points, normals, labels, pavement_type, sensor_origin, rng,
+            depression_depth=depression_depth,
         )
 
         # 8. LiDAR 噪声仿真
@@ -895,6 +945,17 @@ class SyntheticRoadDataset(_DatasetBase):
             edge_width=cfg.edge_width,
         )
 
+    @staticmethod
+    def _sample_wheelpath_x(rng: np.random.Generator, width: float) -> float:
+        """轮迹带横向先验：车道中心 ±0.9 m 的双峰高斯混合（σ=0.25 m）。
+
+        疲劳类病害（龟裂、纵缝、坑槽、车辙）机理上集中在轮迹带；
+        双轮迹间距取 RuttingConfig 的 1.8 m 口径。
+        """
+        center = width / 2.0
+        offset = 0.9 if rng.random() < 0.5 else -0.9
+        return float(np.clip(rng.normal(center + offset, 0.25), 0.3, max(width - 0.3, 0.31)))
+
     def _sensor_pose(self) -> np.ndarray:
         """整条观测管线共用的传感器位姿 (x, y, z)，米制路面坐标。"""
         pose = self.config.lidar_scan.sensor_pose
@@ -911,6 +972,7 @@ class SyntheticRoadDataset(_DatasetBase):
         pavement_type: str,
         sensor_origin: np.ndarray,
         rng: np.random.Generator,
+        depression_depth: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """辐射强度模型：I ∝ ρ(x,y)·cosθ / R²，加斑点噪声与 8-bit 量化。
 
@@ -974,20 +1036,10 @@ class SyntheticRoadDataset(_DatasetBase):
         rho_field = np.exp(0.25 * interp(points[:, :2]))
         rho = np.clip(base * mult * rho_field, 0.02, 0.95)
 
-        # --- 几何遮蔽：相对局部参考面的凹陷深度 ---
-        cell = 0.08  # m
-        ix = np.clip(((points[:, 0] - x_min) / cell).astype(np.int64), 0, None)
-        iy = np.clip(((points[:, 1] - y_min) / cell).astype(np.int64), 0, None)
-        cell_id = ix * (iy.max() + 1) + iy
-        order = np.argsort(cell_id, kind="stable")
-        sorted_ids = cell_id[order]
-        boundaries = np.flatnonzero(np.diff(sorted_ids)) + 1
-        groups = np.split(order, boundaries)
-        z_ref = np.empty(N, dtype=np.float64)
-        for g in groups:
-            z_ref[g] = np.median(points[g, 2])
-        depth = np.maximum(z_ref - points[:, 2], 0.0)
-        shading = 0.25 + 0.75 * np.exp(-depth / 0.012)
+        # --- 几何遮蔽：相对局部参考面的凹陷深度（与遮挡模型共用） ---
+        if depression_depth is None:
+            depression_depth = local_depression_depth(points)
+        shading = 0.25 + 0.75 * np.exp(-depression_depth / 0.012)
 
         # --- 几何项与接收功率 ---
         d = points - sensor_origin[None, :]

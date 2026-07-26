@@ -728,10 +728,11 @@ def add_crack(
             control_pts = np.array(params["bezier_control_points"], dtype=np.float64)
         else:
             if crack_type == "longitudinal":
-                # 纵向裂缝：沿 y 方向
+                # 纵向裂缝：沿 y 方向。x_center 可由调用方传入（生成器
+                # 提供轮迹带边缘先验——真实纵缝多在轮迹带边缘或施工缝）。
                 y_vals = np.linspace(y_min + 0.1 * (y_max - y_min),
                                      y_max - 0.1 * (y_max - y_min), 4)
-                x_center = (x_min + x_max) * 0.5
+                x_center = float(params.get("x_center", (x_min + x_max) * 0.5))
                 # 略微偏移控制点模拟真实裂缝弯曲
                 offsets = rng.normal(0, 0.05 * (x_max - x_min), 4)
                 offsets[0] = offsets[0] * 0.5
@@ -841,23 +842,45 @@ def add_crack(
 
     # 龟裂 / 块状裂缝 (Voronoi 图)
     elif crack_type in ("alligator", "block"):
-        x_min, x_max = float(np.min(xy[:, 0])), float(np.max(xy[:, 0]))
-        y_min, y_max = float(np.min(xy[:, 1])), float(np.max(xy[:, 1]))
-        area = (x_max - x_min) * (y_max - y_min)
+        scene_x_min, scene_x_max = float(np.min(xy[:, 0])), float(np.max(xy[:, 0]))
+        scene_y_min, scene_y_max = float(np.min(xy[:, 1])), float(np.max(xy[:, 1]))
 
+        # 龟裂是**局部**疲劳损坏（轮迹带内数米的 patch），不是整条路
+        # 的裂缝网——旧实现把 Voronoi 种子撒满全场（7×5m 场景 136/140
+        # 个 0.5m 瓦片含龟裂标注）。patch 中心可由调用方传入（生成器
+        # 给轮迹带先验），尺寸：龟裂 ~1-4m × 0.6-1.2m，块裂更大。
         if crack_type == "alligator":
-            # 龟裂：块度 0.2m (重) 或 0.5m (轻)；JTG 轻度判据为
-            # "缝细" (~≤2mm)，重度缝宽且块度小——缝宽随严重度变化。
             block_size = 0.2 if severity == "severe" else 0.5
             width_crack = params.get(
                 "width_mean", 0.0015 if severity == "light" else 0.005
             )
+            region_w = float(params.get("region_width", rng.uniform(0.6, 1.2)))
+            region_l = float(params.get("region_length", rng.uniform(1.0, 4.0)))
         else:
-            # 块状裂缝：块度 > 1m；缝宽按 3mm 判据取侧。
             block_size = 1.0 if severity == "light" else 0.6
             width_crack = params.get(
                 "width_mean", 0.002 if severity == "light" else 0.005
             )
+            region_w = float(params.get("region_width", rng.uniform(1.5, 3.0)))
+            region_l = float(params.get("region_length", rng.uniform(2.0, 4.5)))
+
+        region_center = params.get("region_center")
+        if region_center is None:
+            region_center = (
+                rng.uniform(scene_x_min, scene_x_max),
+                rng.uniform(scene_y_min, scene_y_max),
+            )
+        x_min = max(scene_x_min, float(region_center[0]) - region_w / 2.0)
+        x_max = min(scene_x_max, float(region_center[0]) + region_w / 2.0)
+        y_min = max(scene_y_min, float(region_center[1]) - region_l / 2.0)
+        y_max = min(scene_y_max, float(region_center[1]) + region_l / 2.0)
+        if x_max - x_min < block_size or y_max - y_min < block_size:
+            # patch 被场景边界裁剪得过小：扩到最小可用尺寸。
+            x_min = max(scene_x_min, x_max - max(region_w, 2 * block_size))
+            x_max = min(scene_x_max, x_min + max(region_w, 2 * block_size))
+            y_min = max(scene_y_min, y_max - max(region_l, 2 * block_size))
+            y_max = min(scene_y_max, y_min + max(region_l, 2 * block_size))
+        area = max((x_max - x_min) * (y_max - y_min), block_size ** 2)
 
         num_seeds = max(int(area / (block_size ** 2)), 4)
 
@@ -904,9 +927,14 @@ def add_crack(
             dists = _point_to_segment_distance(xy, seg[0], seg[1])
             min_dist_ridge = np.minimum(min_dist_ridge, dists)
 
-        # 裂缝宽度
+        # 裂缝宽度；形变与标签都限制在 patch 边界（+10cm 边距）内，
+        # 防止跨越边缘单元的长脊线把标注拖出局部损坏区。
+        in_region = (
+            (xy[:, 0] >= x_min - 0.1) & (xy[:, 0] <= x_max + 0.1)
+            & (xy[:, 1] >= y_min - 0.1) & (xy[:, 1] <= y_max + 0.1)
+        )
         half_width_crack = width_crack / 2.0
-        physical_mask = min_dist_ridge <= half_width_crack
+        physical_mask = (min_dist_ridge <= half_width_crack) & in_region
 
         if np.any(physical_mask):
             t = min_dist_ridge[physical_mask] / max(half_width_crack, 1e-12)
@@ -914,7 +942,7 @@ def add_crack(
             pts[physical_mask, 2] -= depth
 
         label_half_width = max(half_width_crack, label_width_floor * 0.5)
-        label_mask = min_dist_ridge <= label_half_width
+        label_mask = (min_dist_ridge <= label_half_width) & in_region
         if np.any(label_mask):
             lbl[label_mask] = label_val
 
@@ -1678,44 +1706,58 @@ def add_concrete_damage(
         slab_idx = np.where(slab_mask)[0]
 
         if len(slab_idx) > 0:
+            # 板角断裂的定义（JTG/PCA 口径）：一条弦线分别与横缝和纵缝
+            # 相交（交点距角点均小于半板边长），把板角切下一个三角形块，
+            # 该块整体断裂并沉降/倾斜——裂缝**不通过角点**。旧实现是
+            # "过角点的射线带 + 圆形沉降盘"，形态与真实病害不同。
             slab_x = x[slab_idx]
             slab_y = y[slab_idx]
             x_s_min, x_s_max = np.min(slab_x), np.max(slab_x)
             y_s_min, y_s_max = np.min(slab_y), np.max(slab_y)
+            slab_w_local = max(x_s_max - x_s_min, 1e-6)
+            slab_l_local = max(y_s_max - y_s_min, 1e-6)
 
-            # 选一个角
+            # 选一个角及指向板内的方向
             corner_x = x_s_min if rng.random() < 0.5 else x_s_max
             corner_y = y_s_min if rng.random() < 0.5 else y_s_max
+            sx = 1.0 if corner_x == x_s_min else -1.0
+            sy = 1.0 if corner_y == y_s_min else -1.0
 
-            # 斜向裂缝方向
-            diag_angle = np.arctan2(
-                y_s_max - y_s_min if rng.random() < 0.5 else y_s_min - y_s_max,
-                x_s_max - x_s_min if rng.random() < 0.5 else x_s_min - x_s_max,
+            # 弦线端点：沿两条相邻接缝各取一个交点（0.2-0.5 倍边长，
+            # 测试可通过 params 固定）。
+            frac_a = float(params.get("chord_frac_x", rng.uniform(0.2, 0.5)))
+            frac_b = float(params.get("chord_frac_y", rng.uniform(0.2, 0.5)))
+            p_a = np.array([corner_x + sx * frac_a * slab_w_local, corner_y])
+            p_b = np.array([corner_x, corner_y + sy * frac_b * slab_l_local])
+
+            # 三角形内部 = 弦线的角点侧半平面（限于本板）。
+            chord = p_b - p_a
+            rel_pts = np.stack([slab_x - p_a[0], slab_y - p_a[1]], axis=1)
+            cross_pts = chord[0] * rel_pts[:, 1] - chord[1] * rel_pts[:, 0]
+            cross_corner = chord[0] * (corner_y - p_a[1]) - chord[1] * (corner_x - p_a[0])
+            triangle = cross_pts * np.sign(cross_corner) >= 0.0
+
+            chord_len = float(np.linalg.norm(chord))
+            dist_chord = np.abs(cross_pts) / max(chord_len, 1e-9)
+
+            d_max_corner = params.get("d_max", 0.006 if severity == "light" else 0.015)
+            if np.any(triangle):
+                # 三角块整体沉降 + 向角点方向的线性倾斜（断裂块转动）。
+                dist_to_corner = np.sqrt(
+                    (slab_x - corner_x) ** 2 + (slab_y - corner_y) ** 2
+                )
+                reach = float(dist_to_corner[triangle].max()) or 1.0
+                tilt = 0.5 + 0.5 * (1.0 - dist_to_corner[triangle] / reach)
+                pts[slab_idx[triangle], 2] -= d_max_corner * tilt
+                lbl[slab_idx[triangle]] = label_val
+
+            # 沿弦线刻 V 槽（裂缝本体），标签同类。
+            groove = (dist_chord < joint_w * 3) & (
+                cross_pts * np.sign(cross_corner) >= -joint_w * 3 * chord_len
             )
-
-            # 从角出发的斜线
-            dx_corner = slab_x - corner_x
-            dy_corner = slab_y - corner_y
-            cos_da, sin_da = np.cos(diag_angle), np.sin(diag_angle)
-            dist_diag = np.abs(cos_da * dy_corner - sin_da * dx_corner)
-
-            dist_to_corner = np.sqrt(dx_corner ** 2 + dy_corner ** 2)
-
-            # 裂缝区域
-            corner_fracture = (dist_diag < joint_w * 3) & (dist_to_corner < slab_len * 0.6)
-            if np.any(corner_fracture):
-                d_max_corner = params.get("d_max", 0.015 if severity == "light" else 0.040)
-                # 越靠近角沉降越大
-                settle = d_max_corner * (1.0 - dist_to_corner[corner_fracture] / (slab_len * 0.6))
-                pts[slab_idx[corner_fracture], 2] -= np.clip(settle, 0, d_max_corner)
-                lbl[slab_idx[corner_fracture]] = label_val
-
-            # 板角整体轻微沉降
-            corner_region = dist_to_corner < slab_len * 0.3
-            corner_settle = params.get("d_max", 0.005 if severity == "light" else 0.015)
-            settle_factor = 1.0 - dist_to_corner[corner_region] / (slab_len * 0.3)
-            pts[slab_idx[corner_region], 2] -= corner_settle * np.clip(settle_factor, 0, 1)
-            lbl[slab_idx[corner_region]] = label_val
+            if np.any(groove):
+                pts[slab_idx[groove], 2] -= 0.5 * d_max_corner
+                lbl[slab_idx[groove]] = label_val
 
     # 4) 错台 (Faulting)
     elif damage_type == "faulting":
@@ -1863,6 +1905,70 @@ def add_concrete_damage(
         raise ValueError(f"Unknown concrete damage type: {damage_type}")
 
     return pts, lbl
+
+
+# 1.1.10b — 局部凹陷深度与几何遮挡
+
+
+def local_depression_depth(points: np.ndarray, cell: float = 0.08) -> np.ndarray:
+    """每点相对局部参考面（0.08 m 粗网格中位数）的凹陷深度 (≥0, m)。
+
+    供强度遮蔽（凹陷内回波弱）与几何遮挡共用同一个"低于周边路表
+    多少"的量。
+    """
+    n = points.shape[0]
+    x_min = points[:, 0].min()
+    y_min = points[:, 1].min()
+    ix = np.clip(((points[:, 0] - x_min) / cell).astype(np.int64), 0, None)
+    iy = np.clip(((points[:, 1] - y_min) / cell).astype(np.int64), 0, None)
+    cell_id = ix * (iy.max() + 1) + iy
+    order = np.argsort(cell_id, kind="stable")
+    sorted_ids = cell_id[order]
+    boundaries = np.flatnonzero(np.diff(sorted_ids)) + 1
+    z_ref = np.empty(n, dtype=np.float64)
+    for group in np.split(order, boundaries):
+        z_ref[group] = np.median(points[group, 2])
+    return np.maximum(z_ref - points[:, 2], 0.0)
+
+
+def geometric_occlusion_keep_mask(
+    points: np.ndarray,
+    sensor_origin: np.ndarray,
+    depth: np.ndarray,
+    rng: np.random.Generator,
+    min_depth: float = 0.004,
+    transition: float = 0.003,
+) -> np.ndarray:
+    """深窄凹陷内部点的几何遮挡掩码（True = 保留）。
+
+    对光束入射角 θ（自竖直），深度 d 处的点可见当且仅当凹陷开口
+    半宽 w_half 满足 :math:`d \\le d_{vis} = w_{half}/\\tan\\theta`
+    （审计 F5.8：深 30 mm、开口 5 mm 的裂缝物理上不可能被完整
+    回波——真实数据中窄裂缝表现为点缺失的线，而非被完整采样的
+    深沟）。w_half 用点到最近非凹陷 (rim) 点的水平距离近似：
+    裂缝内 w_half ≈ 半缝宽 → 深处被遮挡；宽坑槽 w_half 可达半径
+    → 几乎全可见。遮挡概率随 (d - d_vis) 平滑上升，上限 0.95。
+    """
+    n = points.shape[0]
+    keep = np.ones(n, dtype=bool)
+    deep = depth > min_depth
+    if not np.any(deep) or np.all(deep):
+        return keep
+
+    rim_xy = points[~deep][:, :2]
+    tree = spatial.cKDTree(rim_xy)
+    w_half, _ = tree.query(points[deep][:, :2], k=1)
+
+    origin = np.asarray(sensor_origin, dtype=np.float64).reshape(3)
+    d_vec = points[deep] - origin[None, :]
+    horiz = np.hypot(d_vec[:, 0], d_vec[:, 1])
+    vert = np.maximum(origin[2] - points[deep, 2], 1e-3)
+    # tanθ = 水平距离 / 垂直高差；d_vis = w_half / tanθ
+    d_vis = w_half * vert / np.maximum(horiz, 1e-6)
+
+    p_occ = np.clip((depth[deep] - d_vis) / max(transition, 1e-6), 0.0, 0.95)
+    keep[deep] = rng.random(int(deep.sum())) > p_occ
+    return keep
 
 
 # 1.1.11 — LiDAR 噪声仿真

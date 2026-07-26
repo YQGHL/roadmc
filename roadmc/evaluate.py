@@ -316,7 +316,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="RoadMC global, calibrated evaluation")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to Lightning checkpoint")
     parser.add_argument("--data-dir", type=str, default="./data/synthetic_output")
-    parser.add_argument("--split", choices=["train", "val"], default="val")
+    parser.add_argument(
+        "--split", choices=["train", "val", "test"], default="val",
+        help="test 为独立测试集：阈值必须在 val 上冻结后单次评估，不做扫描",
+    )
     parser.add_argument("--max-points", type=int, default=8192)
     parser.add_argument(
         "--allow-input-point-mismatch",
