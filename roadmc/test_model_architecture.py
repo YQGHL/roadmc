@@ -262,6 +262,52 @@ class EmaScanTests(unittest.TestCase):
         self.assertLess(float(jumps.mean()), 0.35)
 
 
+class LossBoundTests(unittest.TestCase):
+    """损失对越界标签的防护（CUDA gather 无边界检查 → 真实非法访存）。"""
+
+    def test_focal_and_dice_ignore_out_of_range_labels(self) -> None:
+        from roadmc.models.model_pl import DiceLoss, FocalLoss
+        logits = torch.randn(2, 16, 2, requires_grad=True)
+        targets = torch.zeros(2, 16, dtype=torch.long)
+        targets[0, :4] = 37   # 38 类标签喂进 2 类头（跨阶段错配场景）
+        targets[0, 4:6] = -1  # padding
+        for loss_fn in (FocalLoss(), DiceLoss()):
+            with self.subTest(loss=type(loss_fn).__name__):
+                loss = loss_fn(logits, targets)
+                self.assertTrue(torch.isfinite(loss))
+                self.assertGreaterEqual(float(loss), 0.0)
+
+    def test_all_labels_out_of_range_returns_zero(self) -> None:
+        from roadmc.models.model_pl import FocalLoss
+        logits = torch.randn(1, 8, 2, requires_grad=True)
+        targets = torch.full((1, 8), 37, dtype=torch.long)
+        loss = FocalLoss()(logits, targets)
+        self.assertEqual(float(loss), 0.0)
+
+
+class BiasBudgetTests(unittest.TestCase):
+    """退化窗口占用必须给出可诊断报错，而不是在算子内 OOM。"""
+
+    def test_degenerate_occupancy_raises_before_allocating(self) -> None:
+        import roadmc.models.attention.window_attention as wa
+        # 所有点重合 → 单窗口吞下全部点 → M = N。生产维度
+        # (embed 48 → pos_hidden 12, heads 3) 下需要约 4.0 GiB，
+        # 预检必须在分配前报错而不是让算子 OOM。
+        coords = torch.zeros(2, 4096, 3)
+        attn = wa.WindowAttention3D(dim=48, num_heads=3, window_size=32)
+        x = torch.randn(2, 4096, 48)
+        with self.assertRaises(RuntimeError) as ctx:
+            attn(coords, x)
+        self.assertIn("degenerate window occupancy", str(ctx.exception))
+
+    def test_normal_cloud_passes_budget(self) -> None:
+        import roadmc.models.attention.window_attention as wa
+        coords = _road_cloud(2, 2048, seed=21)
+        attn = wa.WindowAttention3D(dim=32, num_heads=2, window_size=32)
+        out = attn(coords, torch.randn(2, 2048, 32))
+        self.assertEqual(out.shape, (2, 2048, 32))
+
+
 class OptimizerRoutingTests(unittest.TestCase):
     def test_muon_excludes_head_embed_and_dscm(self) -> None:
         from roadmc.models.model_pl import RoadMCSegModel

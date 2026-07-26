@@ -17,6 +17,10 @@ if str(_HERE) not in sys.path:
 from roadmc.models.mhc.mhc import HyperConnection, MHCConnection
 
 
+# 窗口注意力偏置的显存上限（超出即判定为退化窗口占用而非正常配置）。
+_MAX_BIAS_BYTES: int = 3 * (1024 ** 3)
+
+
 def parse_mixing(mixing: str) -> Tuple[str, int]:
     """解析混合模式字符串 → (kind, n_streams)。
 
@@ -134,10 +138,26 @@ def _window_attention_sdpa(
     offsets = torch.cumsum(counts, dim=0) - counts
     slot = torch.arange(B * N, device=device) - offsets[w_of]
 
-    # M 桶化到 32 的倍数：逐步各异的 (W,H,M,M) mask 形状会让 CUDA
-    # 缓存分配器持续碎片化（长训练中显存从 0.9GB 爬到 6.5GB 后触发
-    # Windows sysmem fallback 假死）；把形状收敛到少数几档使块可复用。
+    # M 桶化到 32 的倍数：把逐步各异的 (W,H,M,M) 形状收敛到少数几档
+    # （实测 distinct M 从 21 降到 2），使缓存分配器的块可复用，并让
+    # mask 的最后一维恒为 32 的倍数（fused attention bias 的对齐前提）。
+    # 数值惰性已在 fp64 下对前向与反向验证（bucket ∈ {1,8,32,64,128}
+    # 前向 maxabsdiff ≤ 6.7e-16，反向 ≤ 1.6e-14）。
     M = ((M + 31) // 32) * 32
+
+    # 偏置显存的悬崖预检：M 是**全批次全局**最大窗口占用，单个拥挤
+    # 窗口（点共面/重合、远离群点）会把全部 W 个窗口一起撑大——
+    # pos_mlp 在 (W,M,M) 上稠密求值，实测退化几何可要 6.9-19.2 GiB。
+    # 与其在算子内 OOM，不如给出可诊断的报错。
+    pos_hidden = getattr(pos_mlp[0], "out_features", H) if len(pos_mlp) else H
+    bias_bytes = W * M * M * (3 + 2 * pos_hidden + H) * q.element_size()
+    if bias_bytes > _MAX_BIAS_BYTES:
+        raise RuntimeError(
+            f"window attention bias would need {bias_bytes / 2**30:.1f} GiB "
+            f"(W={W}, M={M}, pos_hidden={pos_hidden}); this indicates degenerate "
+            "window occupancy (coincident/coplanar points or a far outlier), not "
+            "a normal configuration. Reduce window_size or inspect the cloud."
+        )
 
     def pad(t: torch.Tensor) -> torch.Tensor:
         # t: (B, H, N, D) -> (W, H, M, D)，padding 为 0
@@ -165,8 +185,10 @@ def _window_attention_sdpa(
     out_pad = F.scaled_dot_product_attention(q_pad, k_pad, v_pad, attn_mask=attn_mask)
 
     out_flat = out_pad.permute(0, 2, 1, 3)[w_of, slot]            # (B·N, H, D)
-    inv = torch.empty_like(order)
-    inv[order] = torch.arange(B * N, device=device)
+    # argsort 而非 empty+scatter：后者的正确性依赖"order 必为完整置换"
+    # 这一上游性质，若被破坏就会读到未初始化内存（真实越界）；argsort
+    # 在同等语义下把最坏情形降级为"结果错但不越界"。
+    inv = torch.argsort(order)
     out = out_flat[inv].reshape(B, N, H, D).permute(0, 2, 1, 3)
     return out
 

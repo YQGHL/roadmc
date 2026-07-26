@@ -170,8 +170,9 @@ def evaluate(args: argparse.Namespace) -> dict:
             f"requires {num_classes}"
         )
 
-    # 与 train.py 相同的 Blackwell (sm_120) 平台加固：fused SDPA 后端
-    # 存在异步非法访问，固定 math 后端保证评估可复现完成。
+    # 与 train.py 相同的 Blackwell (sm_120) 平台加固（根因未确证，
+    # 详见 train.py 的说明）：固定 math 后端保证评估可复现完成，
+    # 且与训练使用同一注意力实现路径。
     if torch.cuda.is_available():
         torch.backends.cuda.enable_cudnn_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)

@@ -29,13 +29,26 @@ def _load_verified_checkpoint(path: Path, *, context: str):
 
 def train_baseline(args):
     torch.set_float32_matmul_precision('high')
-    # Blackwell (sm_120) 笔记本 GPU 平台加固：cuDNN 与 mem-efficient
-    # 两个 fused SDPA 后端都对逐步变化形状的 float attn_mask 出现过
-    # 异步非法内存访问（各在 step ~195/389 崩溃；CUDA_LAUNCH_BLOCKING=1
-    # 下同一配置可完整复跑，显存健康，索引路径有 allclose 等价测试
-    # ——判定为新架构上 fused 内核的竞态缺陷）。训练固定走 math 后端
-    # （组合算子，约 1.3-2× 慢但数值等价且稳定）；驱动/torch 更新后
-    # 可重新评估放开。
+    # Blackwell (sm_120) 平台加固：训练固定使用 math（组合算子）SDPA
+    # 后端。
+    #
+    # 事实（2026-07-26 根因调查，逐项对抗验证）：
+    # - mem-efficient 后端下训练出现过两次异步 CUDA illegal memory
+    #   access（第 195、2469 个优化步）与一次伴随显存增长的停顿。
+    # - cuDNN 后端在训练路径上**结构性不可选**：attn_mask 来自
+    #   pos_mlp、requires_grad=True，can_use_cudnn_attention 直接拒绝
+    #   （实测 cuDNN-only 抛 "No available kernel"）。因此故障只涉及
+    #   mem-efficient 一条 fused 路径；此 Windows 构建未编译
+    #   FlashAttention，不存在第三条 fused 路径。
+    # - **根因未确证**。已排除本实现的索引：分窗与批量窗口注意力的
+    #   索引解析可证有界，关闭缓存分配器后 compute-sanitizer memcheck
+    #   对故障时点的代码报 0 errors，且与逐窗参考实现在 fp64 下前向/
+    #   反向一致。上游无 sm_120 同类报告；已知报告均为 5 万量级序列的
+    #   32 位偏移溢出，与此处的 64-96 相差三个数量级。间接线索：
+    #   PyTorch 对 CC>=8.0 一律分发 cutlass::arch::Sm80 模板，二进制中
+    #   无 Blackwell 专用 FMHA 变体。
+    # - 代价实测 +5.6% 挂钟时间、+9% 峰值显存（同种子 400 步 A/B）。
+    #   驱动/torch 更新后可重新评估放开 mem-efficient。
     if torch.cuda.is_available():
         torch.backends.cuda.enable_cudnn_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)

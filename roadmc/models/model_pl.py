@@ -77,7 +77,12 @@ class FocalLoss(nn.Module):
         无 valid_mask 路径下的 -1 padding 若不过滤，gather(-1) 会回绕到
         最后一类、alpha[-1] 同样回绕——契约声明与实现必须一致。
         """
-        keep = targets >= 0
+        # 上界同样必须检查：CUDA release 构建的 gather/index_select 不做
+        # 边界检查，label >= num_classes 是一次真正的越界读（illegal
+        # memory access）。curriculum LUT 下不可达，但跨阶段加载
+        # (--pretrained_checkpoint + 错配 --label_stage) 会把 38 类标签
+        # 喂进 2 类头——课程迁移实验中这条路径是可达的。
+        keep = (targets >= 0) & (targets < logits.shape[-1])
         if valid_mask is not None:
             keep = keep & valid_mask
         logits = logits[keep]
@@ -125,7 +130,7 @@ class DiceLoss(nn.Module):
         """Compute dice loss. -1 targets are ignored unconditionally
         (F.one_hot(-1) raises; the docstring contract is now enforced).
         """
-        keep = targets >= 0
+        keep = (targets >= 0) & (targets < logits.shape[-1])
         if valid_mask is not None:
             keep = keep & valid_mask
         logits = logits[keep]
