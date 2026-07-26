@@ -150,6 +150,60 @@ class DscmTests(unittest.TestCase):
         self.assertLess(float((y1 - y2).norm() / y2.norm()), 0.05)
 
 
+class HyperConnectionTests(unittest.TestCase):
+    """文献口径 n 流 mHC（消融对照，xHC 语境下的必答题）。"""
+
+    def test_identity_init_is_bit_exact_standard_residual(self) -> None:
+        """恒等初始化下 HC 骨干必须与标准残差骨干逐值一致。"""
+        coords = _road_cloud(2, 256, seed=11)
+        feats = torch.rand(2, 256, 3)
+        for mixing in ("hc2", "hc4"):
+            with self.subTest(mixing=mixing):
+                m_hc = Swin3D(embed_dim=32, depths=(1, 1, 2, 1), num_heads=(2, 2, 4, 4),
+                              window_size=32, mixing=mixing).eval()
+                m_ref = Swin3D(embed_dim=32, depths=(1, 1, 2, 1), num_heads=(2, 2, 4, 4),
+                               window_size=32, mixing="none").eval()
+                shared = {k: v for k, v in m_hc.state_dict().items()
+                          if "hc_attn" not in k and "hc_ffn" not in k}
+                m_ref.load_state_dict(shared, strict=False)
+                with torch.no_grad():
+                    a, b = m_ref(coords, feats), m_hc(coords, feats)
+                rel = float((a - b).norm() / a.norm())
+                self.assertLess(rel, 1e-5, f"{mixing} identity init broken: {rel}")
+
+    def test_stream_mixing_is_doubly_stochastic_and_learnable(self) -> None:
+        from roadmc.models.mhc.mhc import HyperConnection
+        for n in (2, 4):
+            hc = HyperConnection(64, n_streams=n)
+            d = hc.diagnostics()
+            self.assertLess(d["row_sum_err"], 1e-3)
+            self.assertLess(d["col_sum_err"], 1e-3)
+            self.assertLessEqual(d["spectral_norm"], 1.0 + 1e-3)
+            self.assertLess(d["dist_to_identity"], 1e-2)
+            h = HyperConnection.expand(torch.randn(2, 8, 64), n)
+            hc.write(h, torch.randn(2, 8, 64)).square().sum().backward()
+            self.assertGreater(float(hc.log_kernel.grad.norm()), 1e-8)
+
+    def test_all_mixing_modes_forward_backward(self) -> None:
+        coords = _road_cloud(2, 256, seed=12)
+        feats = torch.rand(2, 256, 3)
+        for mixing in ("none", "dscm", "hc2", "hc4"):
+            with self.subTest(mixing=mixing):
+                m = Swin3D(embed_dim=32, depths=(1, 1, 1, 1), num_heads=(2, 2, 4, 4),
+                           window_size=32, mixing=mixing)
+                out = m(coords, feats)
+                self.assertEqual(out.shape, (2, 256, 38))
+                self.assertTrue(torch.isfinite(out).all())
+                out.sum().backward()
+                no_grad = [n for n, p in m.named_parameters()
+                           if p.requires_grad and p.grad is None]
+                self.assertEqual(no_grad, [])
+
+    def test_ema_backbone_rejects_hc(self) -> None:
+        with self.assertRaises(ValueError):
+            PointMambaBackbone(embed_dim=32, depths=(1, 1, 1, 1), mixing="hc2")
+
+
 class HierarchyTests(unittest.TestCase):
     def test_swin3d_stage_sizes_and_output(self) -> None:
         torch.manual_seed(4)

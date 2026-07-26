@@ -125,6 +125,92 @@ class MHCConnection(nn.Module):
             }
 
 
+class HyperConnection(nn.Module):
+    """Faithful n-stream Hyper-Connections with Birkhoff-constrained mixing (mHC).
+
+    这是文献口径的 mHC（Zhu et al. 2024 的 Hyper-Connections + 流形约束
+    变体），与本模块的 DSCM 是**不同的轴**：HC 混合的是 n 条并行残差流
+    (n×n)，DSCM 混合的是通道 (C×C)。提供本类是为了让论文的消融矩阵能
+    给出 DSCM vs 真 mHC(n=2/4) 的受控对照——xHC (arXiv 2607.14530) 之后
+    这是必答题。
+
+    层更新（静态 HC + 双随机残差混合）::
+
+        x_in  = w_pre · h                       # (n,) 读出，聚合 n 条流
+        out   = F(x_in)                         # 分支（注意力 / FFN）
+        h'    = H_res h + w_post ⊗ out          # H_res ∈ Birkhoff 多胞体
+
+    **恒等初始化是 bit-exact 的**：h 各流初始化为输入的副本，
+    w_pre = 1/n·1（读出 = x），H_res = I，w_post = 1（每条流都加上
+    分支输出）——此时 n 条流恒等且整网严格等价于标准 pre-norm 残差
+    网络，训练从已知良好解出发（HC 论文的 identity-init 原则）。
+
+    Args:
+        channels: 通道数（仅用于诊断/记录，混合不作用在通道上）。
+        n_streams: 残差流数 n。n=1 时退化为标准残差（可作对照）。
+        sinkhorn_iters / temp / init_gamma: 同 :class:`MHCConnection`。
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        n_streams: int = 2,
+        sinkhorn_iters: int = 20,
+        temp: float = 1.0,
+        init_gamma: float = 10.0,
+    ) -> None:
+        super().__init__()
+        if n_streams < 1:
+            raise ValueError(f"n_streams must be >= 1, got {n_streams}")
+        self.channels = channels
+        self.n_streams = n_streams
+        self.sinkhorn_iters = sinkhorn_iters
+        self.temp = temp
+
+        log_kernel = init_gamma * torch.eye(n_streams) + 0.01 * torch.randn(n_streams, n_streams)
+        self.log_kernel = nn.Parameter(log_kernel)
+        self.w_pre = nn.Parameter(torch.full((n_streams,), 1.0 / n_streams))
+        self.w_post = nn.Parameter(torch.ones(n_streams))
+
+    def current_H(self) -> torch.Tensor:
+        """n×n 双随机残差混合矩阵（可微）。"""
+        return sinkhorn_log(self.log_kernel / self.temp, iters=self.sinkhorn_iters)
+
+    def read(self, h: torch.Tensor) -> torch.Tensor:
+        """(B, N, n, C) -> (B, N, C)：按 w_pre 聚合各流作为分支输入。"""
+        return torch.einsum("s,bnsc->bnc", self.w_pre.to(h.dtype), h)
+
+    def write(self, h: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
+        """h' = H_res·h + w_post ⊗ branch，形状 (B, N, n, C)。"""
+        H = self.current_H().to(h.dtype)
+        mixed = torch.einsum("ts,bnsc->bntc", H, h)
+        return mixed + self.w_post.to(h.dtype).view(1, 1, -1, 1) * branch.unsqueeze(-2)
+
+    @staticmethod
+    def expand(x: torch.Tensor, n_streams: int) -> torch.Tensor:
+        """(B, N, C) -> (B, N, n, C)：复制为 n 条相同的流。"""
+        return x.unsqueeze(-2).expand(-1, -1, n_streams, -1).contiguous()
+
+    @staticmethod
+    def contract(h: torch.Tensor) -> torch.Tensor:
+        """(B, N, n, C) -> (B, N, C)：流维取均值（与 expand 互逆于恒等初始化）。"""
+        return h.mean(dim=-2)
+
+    def diagnostics(self) -> dict:
+        with torch.no_grad():
+            H = self.current_H()
+            n = self.n_streams
+            return {
+                "n_streams": n,
+                "dist_to_identity": float((H - torch.eye(n, device=H.device)).abs().max()),
+                "spectral_norm": float(torch.linalg.matrix_norm(H, ord=2)),
+                "row_sum_err": float((H.sum(dim=1) - 1).abs().max()),
+                "col_sum_err": float((H.sum(dim=0) - 1).abs().max()),
+                "w_pre": [float(v) for v in self.w_pre.detach().cpu()],
+                "w_post": [float(v) for v in self.w_post.detach().cpu()],
+            }
+
+
 if __name__ == "__main__":
     torch.manual_seed(42)
     B, C = 4, 64
@@ -152,3 +238,24 @@ if __name__ == "__main__":
 
     print(f"DSCM self-test passed: dist_to_I={diag['dist_to_identity']:.2e}, "
           f"grad={grad_norm:.3e}, sigma_max={diag['spectral_norm']:.6f}")
+
+    # --- n 流 Hyper-Connections（文献口径 mHC） ---
+    for n in (2, 4):
+        hc = HyperConnection(C, n_streams=n)
+        h = HyperConnection.expand(torch.randn(2, 16, C), n)
+        # 恒等初始化：read 恢复输入
+        x_in = hc.read(h)
+        assert torch.allclose(x_in, h[..., 0, :], atol=1e-5), "identity read broken"
+        # 一层更新后各流仍应几乎相同（bit-exact identity init 的可观测后果）
+        branch = torch.randn(2, 16, C)
+        h2 = hc.write(h, branch)
+        spread = (h2 - h2.mean(dim=-2, keepdim=True)).abs().max()
+        assert float(spread) < 5e-2, f"streams diverged at init: {float(spread)}"
+        # 等价于标准残差
+        assert torch.allclose(HyperConnection.contract(h2), h[..., 0, :] + branch, atol=5e-2)
+        d = hc.diagnostics()
+        assert d["row_sum_err"] < 1e-3 and d["spectral_norm"] <= 1.0 + 1e-3
+        hc.write(h, branch).square().sum().backward()
+        assert float(hc.log_kernel.grad.norm()) > 1e-8, "HC mixing frozen"
+        print(f"HC n={n} self-test passed: dist_to_I={d['dist_to_identity']:.2e}, "
+              f"sigma_max={d['spectral_norm']:.6f}")

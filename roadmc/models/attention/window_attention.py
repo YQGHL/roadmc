@@ -14,7 +14,27 @@ _HERE = Path(__file__).resolve().parents[3]
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from roadmc.models.mhc.mhc import MHCConnection
+from roadmc.models.mhc.mhc import HyperConnection, MHCConnection
+
+
+def parse_mixing(mixing: str) -> Tuple[str, int]:
+    """解析混合模式字符串 → (kind, n_streams)。
+
+    - ``none``：标准残差（无混合）
+    - ``dscm``：通道维双随机混合残差（本项目模块，n=1）
+    - ``hc2`` / ``hc4``：文献口径 n 流 Hyper-Connections（mHC 对照）
+    """
+    m = mixing.lower()
+    if m in ("none", "off"):
+        return "none", 1
+    if m in ("dscm", "mhc"):  # 'mhc' 为旧 CLI 别名，语义 = DSCM
+        return "dscm", 1
+    if m.startswith("hc"):
+        n = int(m[2:]) if len(m) > 2 else 2
+        if n < 1:
+            raise ValueError(f"hc stream count must be >= 1, got {n}")
+        return "hc", n
+    raise ValueError(f"unknown mixing mode: {mixing!r} (expected none|dscm|hc2|hc4)")
 
 
 def _window_partition(
@@ -366,11 +386,16 @@ class ShiftedWindowTransformerBlock(nn.Module):
         shift: bool = False,
         use_mhc: bool = True,
         drop_path: float = 0.0,
+        mixing: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.shift = shift
-        self.use_mhc = use_mhc
+        # mixing 优先；use_mhc 保留为旧 CLI 的兼容入口。
+        if mixing is None:
+            mixing = "dscm" if use_mhc else "none"
+        self.mixing_kind, self.n_streams = parse_mixing(mixing)
+        self.use_mhc = self.mixing_kind != "none"
 
         self.norm1 = nn.LayerNorm(dim)
         self.attn = WindowAttention3D(dim, num_heads, window_size, mlp_ratio)
@@ -380,14 +405,36 @@ class ShiftedWindowTransformerBlock(nn.Module):
             nn.GELU(),
             nn.Linear(int(dim * mlp_ratio), dim),
         )
-        self.mhc = MHCConnection(dim) if use_mhc else None
+        if self.mixing_kind == "dscm":
+            self.mhc = MHCConnection(dim)
+            self.hc_attn = None
+            self.hc_ffn = None
+        elif self.mixing_kind == "hc":
+            # HC 口径：每个子层（注意力 / FFN）各自是一"层"，各带一组
+            # 读出/混合/写回参数。
+            self.mhc = None
+            self.hc_attn = HyperConnection(dim, n_streams=self.n_streams)
+            self.hc_ffn = HyperConnection(dim, n_streams=self.n_streams)
+        else:
+            self.mhc = None
+            self.hc_attn = None
+            self.hc_ffn = None
         self.drop_path = DropPath(drop_path)
 
     def forward(self, coords: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if self.mixing_kind == "hc":
+            # x: (B, N, n, C) —— 每个子层读出 → 分支 → 双随机混合写回
+            a_in = self.hc_attn.read(x)
+            branch = self.drop_path(self.attn(coords, self.norm1(a_in), shift=self.shift))
+            x = self.hc_attn.write(x, branch)
+            f_in = self.hc_ffn.read(x)
+            branch_ffn = self.drop_path(self.ffn(self.norm2(f_in)))
+            return self.hc_ffn.write(x, branch_ffn)
+
         B, N, C = x.shape
         x_attn = x + self.drop_path(self.attn(coords, self.norm1(x), shift=self.shift))
         ffn_out = self.drop_path(self.ffn(self.norm2(x_attn)))
-        if self.mhc is not None and self.use_mhc:
+        if self.mhc is not None:
             mixed = self.mhc(x_attn.reshape(-1, C)).reshape(B, N, C)
             return mixed + ffn_out
         return x_attn + ffn_out

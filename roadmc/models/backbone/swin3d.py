@@ -18,7 +18,11 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from typing import List, Optional, Tuple
 
-from roadmc.models.attention.window_attention import ShiftedWindowTransformerBlock
+from roadmc.models.attention.window_attention import (
+    ShiftedWindowTransformerBlock,
+    parse_mixing,
+)
+from roadmc.models.mhc.mhc import HyperConnection
 
 
 def _serial_order(coords: torch.Tensor, bits: int = 10) -> torch.Tensor:
@@ -67,8 +71,15 @@ class SerializedGridPool(nn.Module):
     def forward(
         self, coords: torch.Tensor, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (coords_pooled, x_pooled, fine_to_coarse) with M = ceil(N/4)."""
-        B, N, C = x.shape
+        """Returns (coords_pooled, x_pooled, fine_to_coarse) with M = ceil(N/4).
+
+        ``x`` 可以是 (B, N, C) 或带流维的 (B, N, n, C)——池化只作用在点维，
+        投影/归一只作用在最后的通道维，中间维原样保留。
+        """
+        B, N = x.shape[0], x.shape[1]
+        trailing = tuple(x.shape[2:])          # (C,) 或 (n, C)
+        x_flat = x.reshape(B, N, -1)
+        Cflat = x_flat.shape[-1]
         s = self.STRIDE
         order = _serial_order(coords)
 
@@ -83,9 +94,9 @@ class SerializedGridPool(nn.Module):
         M = Np // s
 
         gather_c = torch.gather(coords, 1, order_p.unsqueeze(-1).expand(B, Np, 3))
-        gather_x = torch.gather(x, 1, order_p.unsqueeze(-1).expand(B, Np, C))
+        gather_x = torch.gather(x_flat, 1, order_p.unsqueeze(-1).expand(B, Np, Cflat))
         coords_pooled = gather_c.reshape(B, M, s, 3).mean(dim=2)
-        x_pooled = gather_x.reshape(B, M, s, C).mean(dim=2)
+        x_pooled = gather_x.reshape(B, M, s, Cflat).mean(dim=2).reshape(B, M, *trailing)
         x_pooled = self.norm(self.proj(x_pooled))
 
         # fine_to_coarse[b, i] = 原始顺序下第 i 个细点所属的粗点索引。
@@ -220,8 +231,14 @@ class Swin3D(nn.Module):
         use_checkpoint: bool = False,
         use_mhc: bool = True,
         drop_path_rate: float = 0.0,
+        mixing: Optional[str] = None,
     ):
         super().__init__()
+
+        if mixing is None:
+            mixing = "dscm" if use_mhc else "none"
+        self.mixing = mixing
+        self.mixing_kind, self.n_streams = parse_mixing(mixing)
 
         channels = [embed_dim * (2 ** i) for i in range(4)]
 
@@ -249,6 +266,7 @@ class Swin3D(nn.Module):
                         shift=shift,
                         use_mhc=use_mhc,
                         drop_path=dpr[block_idx],
+                        mixing=mixing,
                     )
                 )
                 block_idx += 1
@@ -266,15 +284,24 @@ class Swin3D(nn.Module):
     def forward(
         self, coords: torch.Tensor, feats: torch.Tensor
     ) -> torch.Tensor:
-        """Patch embed → 4 stages (skip + 池化映射) → decode."""
+        """Patch embed → 4 stages (skip + 池化映射) → decode.
+
+        HC 模式下残差被扩展为 n 条流 (B,N,n,C) 贯穿骨干，skip 在进入
+        解码器前按流维取均值收缩——恒等初始化时该 expand/contract 对
+        使整网 bit-exact 等价于标准残差网络。
+        """
         x = torch.cat([coords, feats], dim=-1)
         x = self.patch_embed(x)
+        if self.mixing_kind == "hc":
+            x = HyperConnection.expand(x, self.n_streams)
 
         skip_features: List[torch.Tensor] = []
         mappings: List[Optional[torch.Tensor]] = []
         cur_coords = coords
         for stage in self.stages:
             cur_coords, x, skip, mapping = stage(cur_coords, x)
+            if self.mixing_kind == "hc":
+                skip = HyperConnection.contract(skip)
             skip_features.append(skip)
             if mapping is not None:
                 mappings.append(mapping)

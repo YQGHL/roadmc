@@ -329,6 +329,7 @@ class RoadMCSegModel(pl.LightningModule):
         validation_bootstrap_samples: int = 0,
         validation_bootstrap_seed: int = 42,
         drop_path_rate: float = 0.0,
+        mixing: Optional[str] = None,
     ):
         super().__init__()
         if feature_schema != OBSERVABLE_FEATURE_SCHEMA:
@@ -358,6 +359,7 @@ class RoadMCSegModel(pl.LightningModule):
             use_checkpoint=use_checkpoint,
             use_mhc=use_mhc,
             drop_path_rate=drop_path_rate,
+            **({"mixing": mixing} if mixing is not None else {}),
         )
 
         self.focal_loss = FocalLoss(gamma=2.0, alpha=class_weights)

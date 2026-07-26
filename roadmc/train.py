@@ -121,6 +121,7 @@ def train_baseline(args):
         t_max=args.t_max if args.t_max else args.max_epochs,
         input_point_count=args.max_points,
         drop_path_rate=args.drop_path_rate,
+        mixing=args.mixing,
     )
 
     datamodule = RoadMCDataModule(
@@ -491,6 +492,11 @@ def main():
                              "(decoupled schedules make runs incomparable)")
     parser.add_argument("--drop_path_rate", type=float, default=0.1,
                         help="Stochastic depth rate, linearly scaled per block")
+    parser.add_argument("--mixing", type=str, default=None,
+                        choices=["none", "dscm", "hc2", "hc4"],
+                        help="Residual mixing: none | dscm (channel-wise doubly "
+                             "stochastic) | hc2/hc4 (literature n-stream "
+                             "hyper-connections). Overrides --use_mhc/--no_mhc.")
     parser.add_argument(
         "--lr",
         type=float,

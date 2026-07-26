@@ -222,8 +222,19 @@ class PointMambaBackbone(nn.Module):
         use_checkpoint: bool = False,
         use_mhc: bool = True,
         drop_path_rate: float = 0.0,
+        mixing: Optional[str] = None,
     ):
         super().__init__()
+        # 本分支只支持 none / dscm；n 流 HC 的消融在 swin3d 主线上做
+        # （EMA mixer 是效率基线而非贡献候选）。
+        if mixing is not None:
+            m = mixing.lower()
+            if m.startswith("hc"):
+                raise ValueError(
+                    "PointMambaBackbone does not implement n-stream hyper-connections; "
+                    "run the HC ablation on the swin3d backbone."
+                )
+            use_mhc = m not in ("none", "off")
         if tuple(num_heads) != (3, 6, 12, 24) or window_size != 64:
             warnings.warn(
                 "PointMambaBackbone ignores num_heads/window_size; "
