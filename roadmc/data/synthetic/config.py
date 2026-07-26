@@ -30,6 +30,10 @@ DEFAULT_MAX_SURFACE_MEMORY_MIB: float = 4096.0
 ASPHALT_LABELS: Tuple[int, ...] = tuple(range(0, 21))
 CONCRETE_LABELS: Tuple[int, ...] = tuple(range(21, 38))
 
+# ISO 8608 拟合有效带上限 (cycle/m)：波长 0.354 m。更短波长属于 ISO 13473
+# 纹理域，由生成器的纹理谱段负责，两带互补不重叠。
+ISO8608_BAND_MAX_CYCLES_PER_M: float = 2.83
+
 # ISO 8608 路面功率谱密度参数 — 各粗糙度等级对应的不平整度系数 (×10⁻⁶ m³/cycle)
 ISO_ROUGHNESS: Dict[str, float] = {
     "A": 16,      # 极好
@@ -94,7 +98,14 @@ class RoadSurfaceConfig:
         length: 路面长度 (米)，默认 5m。
         grid_res: 网格分辨率 (米)，默认 5mm 即 0.005m。
         pavement_type: 路面类型，'asphalt' 或 'concrete'。
-        roughness_class: ISO 8608 粗糙度等级，'A'~'E'。
+        roughness_class: ISO 8608 粗糙度等级，'A'~'E'。等级指谱系数
+            Gd(n0) 的取值；补丁尺寸限制了可表示的低频带，不构成对
+            IRI 的声明。
+        crossfall: 排水横坡坡率。JTG D50 直线段沥青路面常取 1.5%-2%，
+            默认 0.02。设 0 可关闭。
+        crossfall_shape: 'crowned' 双向路拱（默认，7m 双车道口径）或
+            'plane' 单向坡（超高段）。
+        longitudinal_grade: 纵坡坡率，默认 0（生成时可采样小坡度）。
     """
 
     width: float = 7.0
@@ -102,6 +113,9 @@ class RoadSurfaceConfig:
     grid_res: float = 0.005
     pavement_type: Literal["asphalt", "concrete", "mixed"] = "asphalt"
     roughness_class: Literal["A", "B", "C", "D", "E"] = "A"
+    crossfall: float = 0.02
+    crossfall_shape: Literal["crowned", "plane"] = "crowned"
+    longitudinal_grade: float = 0.0
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.width) or self.width <= 0:
@@ -110,6 +124,12 @@ class RoadSurfaceConfig:
             raise ValueError(f"length must be > 0, got {self.length}")
         if not math.isfinite(self.grid_res) or self.grid_res <= 0:
             raise ValueError(f"grid_res must be > 0, got {self.grid_res}")
+        if not math.isfinite(self.crossfall) or not 0.0 <= self.crossfall <= 0.08:
+            raise ValueError(f"crossfall must be in [0, 0.08], got {self.crossfall}")
+        if not math.isfinite(self.longitudinal_grade) or abs(self.longitudinal_grade) > 0.10:
+            raise ValueError(
+                f"longitudinal_grade must be in [-0.10, 0.10], got {self.longitudinal_grade}"
+            )
 
     @property
     def surface_grid_spacing_m(self) -> float:
@@ -146,16 +166,25 @@ class RoadSurfaceConfig:
 
 @dataclass
 class MicroTextureConfig:
-    """微观纹理叠加 (fBm) 参数。
+    """宏观纹理谱段参数（自仿射表面，谱斜率 -(2H+2)）。
+
+    纹理段占据 ISO 8608 带上限 (2.83 c/m) 到网格 Nyquist 之间的
+    波数带，对应 ISO 13473 宏观纹理域。<0.5mm 的真·微观纹理在
+    毫米级网格上不可表达，本模块不声明它。
 
     Attributes:
-        amplitude: fBm 振幅 (米)，默认 0.001m = 1mm。
-        hurst: Hurst 指数，控制表面粗糙度。H≈0.5 为标准布朗运动，
-               H→1 为平滑，H→0 为粗糙。默认 0.7。
-        octaves: 叠加倍频程数，默认 6。
+        amplitude: 纹理位移 RMS (米)。语义严格等于输出 RMS（经
+            Parseval 校准）。默认 0.0008m = 0.8mm（覆盖宏观+兆观
+            纹理带 10-353mm），H=0.7 谱形下实测 MPD/RMS ≈ 0.46，
+            对应 MPD ≈ 0.37mm，落入密级配沥青 ISO 13473-1 实测
+            区间 0.3-1.2mm（由回归测试闭环断言）。
+        hurst: Hurst 指数 H，控制谱斜率 β = 2H+2。沥青宏观纹理
+            实测 H ≈ 0.6-0.9，默认 0.7。
+        octaves: 已弃用（旧逐点噪声实现的参数），保留仅为向后
+            兼容，谱合成路径不使用。
     """
 
-    amplitude: float = 0.001
+    amplitude: float = 0.0008
     hurst: float = 0.7
     octaves: int = 6
 
@@ -349,9 +378,15 @@ class LiDARScanConfig:
         enable: 是否启用扫描线模式。False 时使用规则网格。
         scan_pattern: 扫描模式 — 'rotating' (旋转式) 或 'solid_state' (固态闪光)。
         scan_lines: 扫描线数量 (旋转式) 或激光器通道数 (固态)。
-        vertical_fov_deg: 垂直视场角 (度)，默认 40°。
+        vertical_fov_deg: 垂直视场角 (度)，默认 40°。扫描线的地面
+            位置按 y_i = y_s + h·tan(α_i) 由该视场角均分仰角得到，
+            线距随距离二次增长。
         range_decay: 距离衰减系数，远处密度降低倍率。
         incidence_angle_drop: 入射角相关的丢点概率基数。
+        sensor_pose: 传感器位姿 (x, y, z)，米制路面坐标。None 时由
+            生成器取车载默认 (width/2, -1.0, 2.0)。**整条观测管线
+            （扫描重采样、测距噪声投影、强度、丢点）共用这一个
+            位姿** —— 这是测量误差模型可审计性的前提。
     """
 
     enable: bool = False
@@ -360,6 +395,19 @@ class LiDARScanConfig:
     vertical_fov_deg: float = 40.0
     range_decay: float = 0.3
     incidence_angle_drop: float = 0.05
+    sensor_pose: Optional[Tuple[float, float, float]] = None
+    line_sigma_m: float = 0.02
+
+    def __post_init__(self) -> None:
+        if self.sensor_pose is not None:
+            if len(self.sensor_pose) != 3:
+                raise ValueError(f"sensor_pose must be (x, y, z), got {self.sensor_pose}")
+            if not all(math.isfinite(v) for v in self.sensor_pose):
+                raise ValueError(f"sensor_pose must be finite, got {self.sensor_pose}")
+            if self.sensor_pose[2] <= 0.0:
+                raise ValueError(
+                    f"sensor_pose height must be > 0 (above the road), got {self.sensor_pose[2]}"
+                )
 
 
 @dataclass
@@ -635,6 +683,26 @@ class GeneratorConfig:
                 **estimate.as_dict(),
                 "max_surface_points": int(self.max_surface_points),
                 "max_surface_memory_mib": float(self.max_surface_memory_mib),
+                # 谱带审计：等级标签指谱系数 Gd(n0)。补丁尺寸截断了
+                # ISO 带的低频侧（IRI 加权带基本缺失），因此合成场景
+                # 不携带 IRI 声明。
+                "roughness_band_cycles_per_m": [
+                    1.0 / float(max(self.road.width, self.road.length)),
+                    min(
+                        ISO8608_BAND_MAX_CYCLES_PER_M,
+                        0.5 / self.road.grid_res,
+                    ),
+                ],
+                "iso8608_full_band_represented": False,
+                "texture_band_cycles_per_m": [
+                    min(ISO8608_BAND_MAX_CYCLES_PER_M, 0.5 / self.road.grid_res),
+                    0.5 / self.road.grid_res,
+                ],
+                "texture_rms_m": float(self.micro_texture.amplitude),
+                "texture_hurst": float(self.micro_texture.hurst),
+                "crossfall": float(self.road.crossfall),
+                "crossfall_shape": str(self.road.crossfall_shape),
+                "longitudinal_grade": float(self.road.longitudinal_grade),
             },
             "sensor_output": {
                 "mode": self.sensor_output_mode,

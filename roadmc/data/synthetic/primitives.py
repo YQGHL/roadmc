@@ -4,8 +4,9 @@ RoadMC 数学与力学基元 —— Physics-Simulation-Driven Road Surface Primi
 严格遵循 JTG 5210-2018《公路技术状况评定标准》，共 38 个标签 (0-37)。
 
 本文件实现了 11 个数学与力学基元函数，通过物理学仿真生成路面点云数据：
-  1. generate_road_surface()   — ISO 8608 PSD 路面宏观轮廓 (FFT 谱合成)
-  2. add_micro_texture()       — 分数布朗运动 (fBm) 微观纹理叠加
+  1. generate_road_surface()   — 分段各向同性径向 PSD (ISO 8608 段 + 自仿射
+                                  纹理段) + 横坡/纵坡设计几何 (FFT 谱合成)
+  2. add_micro_texture()       — 自仿射纹理谱合成 (散点兼容路径)
   3. add_crack()               — 裂缝 (纵向/横向 Bézier + 龟裂/块状 Voronoi)
   4. add_pothole()             — 超椭圆坑槽
   5. add_raveling()            — 松散 (细集料脱落)
@@ -22,15 +23,19 @@ RoadMC 数学与力学基元 —— Physics-Simulation-Driven Road Surface Primi
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import numpy as np
 from scipy import interpolate, spatial, stats
 
 try:
-    from .config import ISO_ROUGHNESS
+    from .config import ISO8608_BAND_MAX_CYCLES_PER_M, ISO_ROUGHNESS
 except ImportError:
-    from config import ISO_ROUGHNESS
+    from config import ISO8608_BAND_MAX_CYCLES_PER_M, ISO_ROUGHNESS
+
+# JTG 5210-2018 线状裂缝轻/重判据：缝宽 3 mm 分界。
+JTG_CRACK_WIDTH_THRESHOLD_M: float = 0.003
 
 def _compute_normals(
     Z: np.ndarray, dx: float, dy: float
@@ -271,28 +276,42 @@ def generate_road_surface(
     pavement_type: str = "asphalt",
     roughness_class: str = "A",
     seed: Optional[int] = None,
+    *,
+    texture_rms: float = 0.0,
+    texture_hurst: float = 0.7,
+    crossfall: float = 0.0,
+    crossfall_shape: str = "crowned",
+    longitudinal_grade: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Generate road surface point cloud via ISO 8608 PSD spectral synthesis.
+    """Generate a road surface via a piecewise isotropic radial PSD.
 
-    ISO 8608 路面功率谱密度 (PSD)：
+    高度场由三部分构成：确定性设计几何 + ISO 8608 宏观粗糙度 + 自仿射
+    宏观纹理，随机部分共用一次 FFT 合成。
+
+    **ISO 8608 段** — ISO 定义的是一维纵断面谱
+    :math:`G_d(n) = G_d(n_0)(n/n_0)^{-w}` (:math:`n_0=0.1`, :math:`w=2`)。
+    各向同性二维表面必须满足边缘化一致性
+    :math:`G_{1D}(n_x) = \\int \\Phi(\\sqrt{n_x^2+n_y^2})\\,dn_y`
+    (Dodds & Robson 1973; Kamash & Robson 1978; Bogsjö 2008)，对 w=2 解得
 
     .. math::
-        G_d(n) = G_d(n_0) \\left(\\frac{n}{n_0}\\right)^{-w}
+        \\Phi_{\\mathrm{ISO}}(\\Omega) = \\frac{G_d(n_0)\\,n_0^2}{4}\\,
+        \\Omega^{-3}, \\qquad \\Omega \\le 2.83\\ \\mathrm{c/m}.
 
-    其中 :math:`n_0 = 0.1` cycle/m, :math:`w = 2`,
-    :math:`G_d(n_0)` 取值由 ``ISO_ROUGHNESS`` 配置决定 (单位 ×10⁻⁶ m³/cycle)。
+    **纹理段** — 自仿射 (fBm 型) 表面谱
+    :math:`\\Phi_{\\mathrm{tex}}(\\Omega) \\propto \\Omega^{-(2H+2)}`
+    (Persson 2006)，占据 :math:`(2.83, f_{\\mathrm{Nyq}}]`，
+    总能量按 Parseval 校准到 ``texture_rms``。
 
-    二维路面生成使用可分离 PSD 模型 + 逆傅里叶变换：
+    方差目标为离散 Parseval 和
+    :math:`\\sigma^2 = \\sum \\Phi\\,\\Delta f_x \\Delta f_y` (单位 m²)。
+    每次实现被精确缩放到目标 RMS —— 这是受控方差的设计选择，便于
+    等级间可比性（样本方差的自然涨落被抑制，见项目文档声明）。
 
-    .. math::
-        S(f_x, f_y) = G_d(|f_x|) \\cdot G_d(|f_y|)
-
-    :math:`h(x,y) = \\mathcal{F}^{-1}\\left\\{
-        \\sqrt{S(f_x, f_y)} \\cdot W(f_x, f_y) \\right\\}`
-
-    其中 :math:`W(f_x, f_y)` 为复高斯白噪声的傅里叶变换。
-
-    法向量通过中心有限差分计算并归一化。
+    **设计几何** — 排水横坡（双向路拱或单向坡）与纵坡：
+    :math:`z_c(x) = -i_c\\,|x - W/2|` (crowned) 或 :math:`-i_c\\,x` (plane)，
+    :math:`z_g(y) = i_g\\,y`。法向量从叠加后的最终高度场统一重算，
+    因此包含坡度与纹理的贡献。
 
     Args:
         width:  路面宽度 (m)，x 方向。
@@ -301,10 +320,15 @@ def generate_road_surface(
         pavement_type: 路面类型 ('asphalt' | 'concrete')，仅影响标签。
         roughness_class: ISO 8608 粗糙度等级 'A'–'E'。
         seed: 随机种子。
+        texture_rms: 宏观纹理位移 RMS (m)。0 表示无纹理段。
+        texture_hurst: 纹理段 Hurst 指数 H，谱斜率 -(2H+2)。
+        crossfall: 排水横坡坡率 (如 0.02 = 2%)。0 表示水平。
+        crossfall_shape: 'crowned' 双向路拱 | 'plane' 单向坡。
+        longitudinal_grade: 纵坡坡率。
 
     Returns:
         points:  点云 (N, 3) = [x, y, z]。
-        normals: 单位法向量 (N, 3)。
+        normals: 单位法向量 (N, 3)，含坡度与纹理贡献。
     """
     rng = np.random.default_rng(seed)
 
@@ -314,37 +338,65 @@ def generate_road_surface(
     X, Y = np.meshgrid(x, y, indexing="ij")  # (nx, ny)
 
     n0 = 0.1  # 参考空间频率 (cycle/m)
-    w = 2.0  # 波度指数 (waviness exponent)
     Gd0 = ISO_ROUGHNESS[roughness_class] * 1e-6  # m³/cycle
 
     fx = np.fft.fftfreq(nx, d=grid_res)  # (nx,)
     fy = np.fft.fftfreq(ny, d=grid_res)  # (ny,)
+    FX, FY = np.meshgrid(fx, fy, indexing="ij")
+    omega = np.sqrt(FX**2 + FY**2)  # 径向波数 (cycle/m)
+    nyquist = 0.5 / grid_res
+    dfx = 1.0 / (nx * grid_res)
+    dfy = 1.0 / (ny * grid_res)
 
-    # 可分离 1D PSD
+    f_iso_max = min(ISO8608_BAND_MAX_CYCLES_PER_M, nyquist)
+
+    # ISO 8608 段：各向同性径向谱 Φ(Ω) = (Gd0·n0²/4)·Ω⁻³，带限到 2.83 c/m。
     with np.errstate(divide="ignore", invalid="ignore"):
-        psd_x = np.where(np.abs(fx) > 0, Gd0 * (np.abs(fx) / n0) ** (-w), 0.0)
-        psd_y = np.where(np.abs(fy) > 0, Gd0 * (np.abs(fy) / n0) ** (-w), 0.0)
+        psd_iso = np.where(
+            (omega > 0.0) & (omega <= f_iso_max),
+            0.25 * Gd0 * n0**2 * np.where(omega > 0.0, omega, 1.0) ** (-3.0),
+            0.0,
+        )
+    var_iso = float(np.sum(psd_iso) * dfx * dfy)
 
-    # 二维 PSD (可分离模型)：S(fx, fy) = G_d(|fx|) * G_d(|fy|)
-    psd_2d = np.outer(psd_x, psd_y)  # (nx, ny)
+    # 纹理段：Φ ∝ Ω^-(2H+2)，占据 (2.83, Nyquist]，能量校准到 texture_rms²。
+    var_tex = 0.0
+    psd_tex = np.zeros_like(psd_iso)
+    if texture_rms > 0.0 and nyquist > f_iso_max:
+        beta = 2.0 * texture_hurst + 2.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            raw = np.where(
+                omega > f_iso_max,
+                np.where(omega > 0.0, omega, 1.0) ** (-beta),
+                0.0,
+            )
+        raw_var = float(np.sum(raw) * dfx * dfy)
+        if raw_var > 0.0:
+            psd_tex = raw * (texture_rms**2 / raw_var)
+            var_tex = texture_rms**2
+
+    psd_2d = psd_iso + psd_tex
 
     white_noise = rng.normal(0.0, 1.0, (nx, ny))
     W_hat = np.fft.fft2(white_noise)
-
-    H_hat = np.sqrt(psd_2d + 1e-30) * W_hat  # 避免 sqrt(0)
-    h_field = np.real(np.fft.ifft2(H_hat))
-
+    h_field = np.real(np.fft.ifft2(np.sqrt(psd_2d) * W_hat))
     h_field = h_field - np.mean(h_field)
 
-    # RMS 缩放：将 RMS 匹配到 PSD 积分值
-    # 理论方差：σ²_target = [Σ G_d(fx_i)Δfx] · [Σ G_d(fy_j)Δfy]
-    dfx = 1.0 / (nx * grid_res)  # 频率分辨率
-    dfy = 1.0 / (ny * grid_res)
-    var_target = (np.sum(psd_x) * dfx) * (np.sum(psd_y) * dfy)
-    rms_target = np.sqrt(max(var_target, 1e-30))
+    # Parseval 定标：σ² = ΣΦ·Δfx·Δfy (m²)，实现级精确缩放（受控方差）。
+    rms_target = np.sqrt(max(var_iso + var_tex, 0.0))
     rms_current = np.std(h_field)
-    if rms_current > 1e-12:
+    if rms_current > 1e-15 and rms_target > 0.0:
         h_field = h_field * (rms_target / rms_current)
+
+    # 确定性设计几何：横坡/路拱 + 纵坡。法向量必须包含坡度贡献，
+    # 因此在计算法向之前叠加。
+    if crossfall != 0.0:
+        if crossfall_shape == "crowned":
+            h_field = h_field - crossfall * np.abs(X - width / 2.0)
+        else:
+            h_field = h_field - crossfall * X
+    if longitudinal_grade != 0.0:
+        h_field = h_field + longitudinal_grade * Y
 
     normals_grid = _compute_normals(h_field, grid_res, grid_res)
 
@@ -365,28 +417,34 @@ def resample_to_lidar_pattern(
     range_decay: float = 0.3,
     incidence_angle_drop: float = 0.05,
     rng: Optional[np.random.Generator] = None,
+    sensor_pose: Optional[np.ndarray] = None,
+    line_sigma_m: float = 0.02,
 ) -> np.ndarray:
     """P1-1: Resample uniform grid points to simulate LiDAR scan line density.
 
-    将规则网格点云重采样为模拟 LiDAR 扫描线模式的非均匀分布。
+    将规则网格点云重采样为模拟 LiDAR 扫描线模式的非均匀分布
+    （对规则网格做概率稀疏化的快速近似，不是射线投射；保留点仍在
+    原网格位置上——诚实口径见 TECHNICAL_REPORT 的限制声明）。
 
-    旋转式 LiDAR：
-    - 沿 y 方向（道路纵向）的扫描线间距由 scan_lines 和 vertical_fov 决定
-    - 沿 x 方向（扫描方向）保持高密度
-    - 施加距离衰减和入射角丢点
-
-    .. math::
-        P_{\\text{keep}}(x,y) = \\frac{1}{1 + \\alpha \\cdot |y - y_{\\text{scan}}|}
-        \\cdot \\left(1 - \\beta \\cdot \\frac{r}{r_{\\max}}\\right)
+    旋转式 LiDAR（车载位姿 ``sensor_pose``，与噪声/强度共用）：
+    - 扫描线地面位置 :math:`y_i = y_s + h\\tan\\alpha_i`，仰角
+      :math:`\\alpha_i` 由 ``vertical_fov_deg`` 均分，地面线距
+      :math:`\\Delta y_i \\approx \\Delta\\alpha \\cdot R_i^2 / h`
+      随距离二次增长；
+    - 距离衰减与真实入射角 (:math:`\\cos\\theta \\approx h/R`) 丢点。
 
     Args:
         points: 规则网格点云 (N, 3)。
         scan_lines: 扫描线数量。
-        vertical_fov_deg: 垂直视场角 (度)。
+        vertical_fov_deg: 垂直视场角 (度)，决定仰角序列。
         scan_pattern: 'rotating' 或 'solid_state'。
         range_decay: 距离衰减系数 α。
         incidence_angle_drop: 入射角丢点系数 β。
         rng: 随机数生成器。
+        sensor_pose: 传感器位姿 (x, y, z)。None 时取场景前方车载
+            默认 (x 中线, y_min-1, h=2 m)。
+        line_sigma_m: 扫描线地面宽度 σ (m)，固定物理量（footprint +
+            平台抖动），默认 2 cm。
 
     Returns:
         重采样后的点云索引 (N',)，可用于 points[idx]。
@@ -404,29 +462,45 @@ def resample_to_lidar_pattern(
     x_min, x_max = float(np.min(x)), float(np.max(x))
     y_min, y_max = float(np.min(y)), float(np.max(y))
 
-    # 距离（简化：以路面中心为扫描原点）
-    sensor_height = max(x_max - x_min, y_max - y_min) * 1.5  # 假设传感器高度
-    r_dist = np.sqrt((x - (x_min + x_max) / 2) ** 2 + sensor_height ** 2)
+    # 传感器位姿：与噪声/强度/丢点共用同一车载几何。旧实现的
+    # "1.5×extent 高空原点" 是航测几何，与噪声阶段的隐含位姿矛盾。
+    if sensor_pose is None:
+        pose = np.array([(x_min + x_max) / 2.0, y_min - 1.0, 2.0], dtype=np.float64)
+    else:
+        pose = np.asarray(sensor_pose, dtype=np.float64).reshape(3)
+    h = max(float(pose[2]), 1e-3)
+
+    r_dist = np.sqrt(
+        (x - pose[0]) ** 2 + (y - pose[1]) ** 2 + h ** 2
+    )
     r_max = np.max(r_dist) + 1e-12
 
     if scan_pattern == "rotating":
-        scan_spacing = (y_max - y_min) / scan_lines
-        y_scans = np.linspace(y_min, y_max, scan_lines)
+        # 扫描线地面位置 y_i = y_s + h·tan(α_i)：仰角在 [α_lo, α_hi]
+        # 内均分（受 vertical_fov_deg 限制），地面线距
+        # Δy ≈ Δα·R²/h 随距离二次增长——真实旋转式 LiDAR 的
+        # 各向异性密度形态。
+        alpha_lo = math.atan2(max(y_min - pose[1], 1e-3), h)
+        alpha_hi = math.atan2(max(y_max - pose[1], 2e-3), h)
+        fov_rad = math.radians(vertical_fov_deg)
+        if alpha_hi - alpha_lo > fov_rad:
+            alpha_hi = alpha_lo + fov_rad
+        alphas = np.linspace(alpha_lo, alpha_hi, scan_lines)
+        y_scans = pose[1] + h * np.tan(alphas)
 
         nearest_scan = np.argmin(np.abs(y[:, None] - y_scans[None, :]), axis=1)
         dist_to_scan = np.abs(y - y_scans[nearest_scan])
 
-        # 到扫描线距离越远，保留概率越低（Gaussian falloff）
-        scan_sigma = scan_spacing * 0.8
-        scan_prob = np.exp(-0.5 * (dist_to_scan / scan_sigma) ** 2)
+        # 到最近扫描线的 Gaussian falloff。线宽是固定的物理量
+        # （footprint + 平台抖动，cm 量级），不随线距缩放——否则
+        # 远端线间真空会被抹平，密度各向异性消失。
+        scan_prob = np.exp(-0.5 * (dist_to_scan / max(line_sigma_m, 1e-4)) ** 2)
 
         range_prob = 1.0 - range_decay * (r_dist / r_max)
 
-        # 入射角效应：边缘点更稀疏（大角度入射 → 低反射率 → 丢点率高）
-        # 简化：用 x 到中心线的距离模拟入射角
-        x_center = (x_min + x_max) / 2.0
-        incidence_angle = np.abs(x - x_center) / max(x_max - x_center, 0.01)
-        incidence_prob = 1.0 - incidence_angle_drop * incidence_angle
+        # 真实入射角：平坦路面 cosθ ≈ h/R。
+        cos_theta = np.clip(h / r_dist, 0.0, 1.0)
+        incidence_prob = 1.0 - incidence_angle_drop * (1.0 - cos_theta)
 
         keep_prob = scan_prob * range_prob * incidence_prob
         keep_prob = np.clip(keep_prob, 0.0, 1.0)
@@ -446,65 +520,74 @@ def add_micro_texture(
     normals: np.ndarray,
     amplitude: float,
     hurst: float,
-    octaves: int,
+    octaves: int = 0,
     seed: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Add micro-texture via fractional Brownian motion (fBm) overlay.
+    """Add spatially correlated self-affine macro-texture to a point set.
 
-    分数布朗运动 (fBm) 沿法线方向叠加微纹理：
+    通过 FFT 谱合成生成自仿射纹理场（二维 fBm 型表面，功率谱
+    :math:`\\Phi(\\Omega) \\propto \\Omega^{-(2H+2)}`，Mandelbrot & Van Ness
+    1968; Saupe 1988），在包围盒网格上合成后按点位双线性采样，
+    沿法向位移。位移场是空间相关的：粗糙度结构由谱斜率
+    （即 Hurst 指数 H）控制，``amplitude`` 严格等于位移 RMS。
 
-    .. math::
-        \\mathbf{p}' = \\mathbf{p} + A \\sum_{k=0}^{\\text{octaves}-1}
-        s^{-kH} \\cdot \\mathcal{L}_{\\alpha}\\left(\\cdot\\right) \\cdot \\mathbf{n}
-
-    其中 :math:`H` 为 Hurst 指数，:math:`\\mathcal{L}_{\\alpha}` 为 Lévy
-    :math:`\\alpha`-stable 分布 (:math:`\\alpha = 2H`)，:math:`s` 为倍频程缩放因子，
-    :math:`\\mathbf{n}` 为法向量。
-
-    Hurst 指数 :math:`H \\in (0,1)`：
-    - :math:`H \\to 0.5`：标准布朗运动 (粗糙)
-    - :math:`H \\to 1.0`：平滑趋势
-    - :math:`H \\to 0.0`：极端粗糙
+    主生成管线已把纹理段合并进 ``generate_road_surface`` 的分段径向
+    谱（那里法向从最终高度场统一重算）；本函数保留给散点输入的
+    调用方。**散点路径不更新法向量**——返回的 normals 是输入的副本，
+    需要一致法向时应在位移后的点集上重新估计。
 
     Args:
         points:  点云 (N, 3)。
         normals: 单位法向量 (N, 3)。
-        amplitude: fBm 总振幅 (m)。
-        hurst: Hurst 指数。
-        octaves: 叠加倍频程数。
+        amplitude: 纹理位移 RMS (m)。
+        hurst: Hurst 指数 H ∈ (0, 1)，谱斜率 -(2H+2)。
+        octaves: 已弃用，仅为向后兼容保留，不再使用。
         seed: 随机种子。
 
     Returns:
         points_modified:  修改后点云 (N, 3)。
-        normals_modified: 更新后单位法向量 (N, 3)。
+        normals_copy: 输入法向量的副本（未更新，见上）。
     """
+    del octaves  # legacy parameter of the removed i.i.d.-noise implementation
     rng = np.random.default_rng(seed)
-    N = points.shape[0]
 
     pts = points.copy()
     nrm = normals.copy()
+    if amplitude <= 0.0 or points.shape[0] < 4:
+        return pts, nrm
 
-    # Lévy stable alpha = 2*H (clamped to [0.1, 1.9] for scipy stability)
-    alpha = max(0.1, min(1.9, 2.0 * hurst))
+    x_min, y_min = points[:, 0].min(), points[:, 1].min()
+    x_max, y_max = points[:, 0].max(), points[:, 1].max()
+    extent_x = max(x_max - x_min, 1e-6)
+    extent_y = max(y_max - y_min, 1e-6)
 
-    delta = np.zeros(N, dtype=np.float64)
+    # 网格间距取点密度的量级（均匀分布假设），限制网格规模。
+    approx_spacing = math.sqrt(extent_x * extent_y / points.shape[0])
+    gx = int(np.clip(round(extent_x / approx_spacing), 16, 2048))
+    gy = int(np.clip(round(extent_y / approx_spacing), 16, 2048))
 
-    for k in range(octaves):
-        scale = 2.0 ** (-k * hurst)
-        noise = stats.levy_stable.rvs(
-            alpha=alpha,
-            beta=0.0,  # 对称
-            loc=0.0,
-            scale=1.0,
-            size=N,
-            random_state=rng,
-        )
-        # 剔除极端值 (截断到 5σ)
-        noise = np.clip(noise, -5.0, 5.0)
-        delta += scale * noise
+    fx = np.fft.fftfreq(gx, d=extent_x / gx)
+    fy = np.fft.fftfreq(gy, d=extent_y / gy)
+    FX, FY = np.meshgrid(fx, fy, indexing="ij")
+    omega = np.sqrt(FX**2 + FY**2)
+    beta = 2.0 * hurst + 2.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        psd = np.where(omega > 0.0, np.where(omega > 0.0, omega, 1.0) ** (-beta), 0.0)
 
-    displacement = amplitude * delta[:, None] * nrm
-    pts += displacement
+    field = np.real(np.fft.ifft2(np.sqrt(psd) * np.fft.fft2(rng.normal(0.0, 1.0, (gx, gy)))))
+    field = field - field.mean()
+    field_std = field.std()
+    if field_std > 1e-15:
+        field = field * (amplitude / field_std)
+
+    interp = interpolate.RegularGridInterpolator(
+        (np.linspace(x_min, x_max, gx), np.linspace(y_min, y_max, gy)),
+        field,
+        bounds_error=False,
+        fill_value=0.0,
+    )
+    delta = interp(points[:, :2])
+    pts += delta[:, None] * nrm
 
     return pts, nrm
 
@@ -626,8 +709,15 @@ def add_crack(
     else:
         raise ValueError(f"Unknown crack_type: {crack_type}")
 
-    width_mean = params.get("width_mean", 0.005)
-    width_std = params.get("width_std", 0.3)
+    # JTG 5210-2018 的线状裂缝轻/重判据是缝宽（3 mm 分界），不是缝深
+    # （检测设备通常无法可靠测缝深）。宽度分布按严重度采样并截断到
+    # 判据的正确一侧，深度只与宽度弱相关、不作为分级依据。
+    if severity == "light":
+        width_mean = params.get("width_mean", 0.0018)
+        width_std = params.get("width_std", 0.25)
+    else:
+        width_mean = params.get("width_mean", 0.006)
+        width_std = params.get("width_std", 0.3)
     label_width_floor = params.get("label_width_floor", 0.0)
 
     if crack_type in ("longitudinal", "transverse"):
@@ -659,7 +749,10 @@ def add_crack(
                 control_pts = np.stack([x_vals, y_center + np.full(4, offsets[0]) + offsets],
                                        axis=1)
 
-        num_curve_samples = max(N // 100, 100)
+        # 段数由曲线几何决定并设上限——旧的 N//100 使段数随点云规模
+        # 线性增长（350k 点 → 3500 段 × 全点云距离 = 58 s/裂缝，5mm
+        # 网格下不可用），与几何保真无关。
+        num_curve_samples = int(np.clip(N // 100, 100, 400))
         curve_pts = _cubic_bezier(control_pts, num_curve_samples)
 
         pert_seed = rng.integers(0, 2**31)
@@ -672,25 +765,56 @@ def add_crack(
         curve_pts[:, 0] += pert_x * 0.02
         curve_pts[:, 1] += pert_y * 0.02
 
+        # 候选点预筛：只有距曲线 ≤ r_cand 的点才可能落进裂缝或其
+        # 标签带（缝宽 P99 半宽 ~6mm + label_width_floor），远处点
+        # 无需参与逐段距离计算。语义不变，纯性能优化。
+        r_cand = max(0.06, label_width_floor)
+        point_tree = spatial.cKDTree(xy)
+        cand_lists = point_tree.query_ball_point(curve_pts, r_cand)
+        cand_idx = np.unique(np.concatenate([np.asarray(c, dtype=np.int64)
+                                             for c in cand_lists if len(c)]))
         min_dist = np.full(N, np.inf)
         min_t = np.zeros(N)
-        # 用多段线近似，计算到每段距离和局部参数
-        for k in range(num_curve_samples - 1):
-            t_start = k / (num_curve_samples - 1)
-            t_end = (k + 1) / (num_curve_samples - 1)
-            dists, t_local = _point_to_segment_distance_t(
-                xy, curve_pts[k], curve_pts[k + 1]
-            )
-            # 将局部参数映射到全局曲线参数
-            t_on_curve_local = t_start + t_local * (t_end - t_start)
-            # 仅在当前段更近时更新距离和参数
-            better = dists < min_dist
-            min_dist = np.where(better, dists, min_dist)
-            min_t = np.where(better, t_on_curve_local, min_t)
+        if len(cand_idx) > 0:
+            xy_cand = xy[cand_idx]
+            cand_dist = np.full(len(cand_idx), np.inf)
+            cand_t = np.zeros(len(cand_idx))
+            # 用多段线近似，计算到每段距离和局部参数
+            for k in range(num_curve_samples - 1):
+                t_start = k / (num_curve_samples - 1)
+                t_end = (k + 1) / (num_curve_samples - 1)
+                dists, t_local = _point_to_segment_distance_t(
+                    xy_cand, curve_pts[k], curve_pts[k + 1]
+                )
+                # 将局部参数映射到全局曲线参数
+                t_on_curve_local = t_start + t_local * (t_end - t_start)
+                # 仅在当前段更近时更新距离和参数
+                better = dists < cand_dist
+                cand_dist = np.where(better, dists, cand_dist)
+                cand_t = np.where(better, t_on_curve_local, cand_t)
+            min_dist[cand_idx] = cand_dist
+            min_t[cand_idx] = cand_t
 
-        # 裂缝宽度沿曲线变化 (对数正态采样)，基于空间位置插值
+        # 裂缝宽度沿曲线变化 (对数正态采样)，基于空间位置插值。
+        # 截断到 JTG 3 mm 判据的正确一侧：轻度 ≤ 3 mm，重度 > 3 mm。
         lognorm_sample = rng.lognormal(mean=np.log(width_mean), sigma=width_std,
                                        size=num_curve_samples)
+        if severity == "light":
+            lognorm_sample = np.minimum(lognorm_sample, JTG_CRACK_WIDTH_THRESHOLD_M - 1e-4)
+        else:
+            lognorm_sample = np.maximum(lognorm_sample, JTG_CRACK_WIDTH_THRESHOLD_M + 2e-4)
+
+        # measure-then-label：标签严重度由实现几何的代表缝宽（中位数）
+        # 对照 3 mm 阈值决定，而不是信任输入的 severity 字符串——
+        # "标签由几何参数决定" 从声明变成可验证机制。（截断采样使
+        # 实现值与请求值一致，此处是防回归的机制化保证。）
+        w_rep = float(np.median(lognorm_sample))
+        realized_light = w_rep <= JTG_CRACK_WIDTH_THRESHOLD_M
+        if crack_type == "longitudinal":
+            label_val = 5 if realized_light else 6
+        else:
+            label_val = 7 if realized_light else 8
+
         # 使用每个点在曲线上的投影参数 t 进行宽度插值，而非点索引
         half_width = np.interp(
             min_t,
@@ -722,13 +846,18 @@ def add_crack(
         area = (x_max - x_min) * (y_max - y_min)
 
         if crack_type == "alligator":
-            # 龟裂：块度 0.2m (重) 或 0.5m (轻)
+            # 龟裂：块度 0.2m (重) 或 0.5m (轻)；JTG 轻度判据为
+            # "缝细" (~≤2mm)，重度缝宽且块度小——缝宽随严重度变化。
             block_size = 0.2 if severity == "severe" else 0.5
-            width_crack = params.get("width_mean", 0.004)
+            width_crack = params.get(
+                "width_mean", 0.0015 if severity == "light" else 0.005
+            )
         else:
-            # 块状裂缝：块度 > 1m
+            # 块状裂缝：块度 > 1m；缝宽按 3mm 判据取侧。
             block_size = 1.0 if severity == "light" else 0.6
-            width_crack = params.get("width_mean", 0.003)
+            width_crack = params.get(
+                "width_mean", 0.002 if severity == "light" else 0.005
+            )
 
         num_seeds = max(int(area / (block_size ** 2)), 4)
 
@@ -1174,7 +1303,10 @@ def add_rutting(
 
     pts[:, 2] -= rut_depth
 
-    affected = rut_depth > depth * 0.05
+    # 标签边界必须几何可观测：绝对阈值 ≥2mm（旧的 5% 相对阈值在
+    # 标注边界处形变仅 ~0.6mm，低于传感器噪声，标签不可学习且把
+    # 标注带宽拉到 1m/轮迹，远超 0.6m 物理轮迹宽）。
+    affected = rut_depth > max(0.002, depth * 0.05)
     lbl[affected] = label_val
 
     return pts, lbl
@@ -1207,6 +1339,12 @@ def add_corrugation(
     轻 (标签 17)：振幅 10-25mm
     重 (标签 18)：振幅 > 25mm
 
+    波浪拥包是**局部**病害（数米范围的搓板/推挤），不是全路段周期
+    起伏：正弦调制乘以高斯空间包络（σ_e ~ 1-3 m），标签只覆盖包络
+    支撑域内波幅可观测的点——旧实现无包络时约 94% 的场景点被标注，
+    类先验被极端扭曲。注意 amplitude 指单侧波高；若 JTG 分级量按
+    峰谷差解读则为 2A，正式实验前需对照标准原文口径（文档声明）。
+
     Args:
         points:  点云 (N, 3)。
         labels:  标签 (N,)。
@@ -1214,13 +1352,13 @@ def add_corrugation(
         wavelength: 波长 (m)。
         amplitude:  振幅 (m)。
         severity: 'light' | 'severe'。
-        seed: 随机种子 (未使用)。
+        seed: 随机种子（包络中心与尺寸）。
 
     Returns:
         points_modified:  修改后点云 (N, 3)。
         labels_modified: 修改后标签 (N,)。
     """
-    _ = seed
+    rng = np.random.default_rng(seed)
     pts = points.copy()
     lbl = labels.copy()
 
@@ -1233,10 +1371,23 @@ def add_corrugation(
     else:
         raise ValueError(f"Unknown direction: {direction}")
 
-    modulation = amplitude * np.cos(2.0 * np.pi * u / wavelength)
+    # 高斯空间包络：局部搓板区（中心随机、σ_e ∈ [0.7, 1.3] m）。
+    x_min, x_max = float(np.min(pts[:, 0])), float(np.max(pts[:, 0]))
+    y_min, y_max = float(np.min(pts[:, 1])), float(np.max(pts[:, 1]))
+    cx = float(rng.uniform(x_min, x_max))
+    cy = float(rng.uniform(y_min, y_max))
+    sigma_e = float(rng.uniform(0.7, 1.3))
+    envelope = np.exp(
+        -((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2) / (2.0 * sigma_e ** 2)
+    )
+
+    modulation = amplitude * envelope * np.cos(2.0 * np.pi * u / wavelength)
     pts[:, 2] += modulation
 
-    affected = np.abs(modulation) > amplitude * 0.1
+    # 标签 = 包络支撑域内局部波幅可观测（≥2mm 且 ≥20% 名义振幅）的点，
+    # 即标注半径 ≤ σ_e·√(2·ln 5) ≈ 1.8σ_e —— 局部病害而非全场。
+    local_amp = amplitude * envelope
+    affected = local_amp > max(0.002, amplitude * 0.2)
     lbl[affected] = label_val
 
     return pts, lbl
@@ -1251,13 +1402,15 @@ def add_bleeding(
     region_mask: np.ndarray,
     seed: Optional[int] = None,
 ) -> np.ndarray:
-    """Add bleeding (泛油) — increase reflectivity, NO geometry change.
+    """Add bleeding (泛油) — reflectance change only, NO geometry change.
 
-    泛油仅改变路面反射率 (强度值)，不改变几何形状。
-    标签 = 19。
+    泛油仅改变路面反射率 (强度值)，不改变几何形状。标签 = 19。
 
-    本函数返回修改后的标签数组。调用方可将 ``region_mask`` 区域的
-    强度 (反射率) 值增加 (例如 +0.3) 以模拟沥青泛油的高反射特性。
+    物理方向：泛油是沥青结合料上泛形成的光滑油膜，在 905/1550 nm
+    近红外波段结合料强吸收（反照率低于外露集料），且光滑表面的
+    镜面反射使非垂直入射的后向散射进一步减弱——泛油区域在 MLS
+    强度影像中通常**偏暗**。强度修正由生成器的辐射模型
+    (``_compute_intensity``, 反照率 ×0.55) 统一施加，本函数只贴标签。
 
     Args:
         points:  点云 (N, 3) (仅用于形状检查)。
@@ -1575,11 +1728,15 @@ def add_concrete_damage(
 
         fault_offset = params.get("d_max", 0.005 if severity == "light" else 0.015)
 
+        # 错台是接缝两侧**整板**的相对竖向位移（基层唧泥/塌陷），
+        # z 场为逐板分片常量、在接缝处一次跳变——旧实现只位移接缝
+        # 两侧 ±40mm 窄条带，制造出两个物理上不存在的反向台阶。
+        # （恰在接缝线上的点归属单侧，避免出现第三个中间高程级。）
+        side = np.where(y >= joint_y, 1.0, -1.0)
+        pts[:, 2] += side * fault_offset * 0.5
+        # JTG 在接缝处量测错台，标签仍限于接缝邻域条带。
         near_joint = np.abs(y - joint_y) < joint_w * 5
         if np.any(near_joint):
-            # 一侧上升，一侧下降
-            side = np.sign(y - joint_y)
-            pts[near_joint, 2] += side[near_joint] * fault_offset * 0.5
             lbl[near_joint] = label_val
 
     # 5) 唧泥 (Pumping)
@@ -1721,35 +1878,47 @@ def simulate_lidar_noise(
     mixed_pixel_prob: float = 0.01,
     curvature: Optional[np.ndarray] = None,
     curvature_threshold: float = 0.5,
+    sensor_origin: Optional[np.ndarray] = None,
+    sigma_r: Optional[np.ndarray] = None,
+    drop_weight: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Simulate LiDAR measurement noise on point cloud.
 
-    1. **球坐标噪声**：
-       将点云从笛卡尔坐标 :math:`(x, y, z)` 转换为球坐标 :math:`(r, \\theta, \\phi)`：
-       .. math::
-           r &= \\sqrt{x^2 + y^2 + z^2} \\\\
-           \\theta &= \\arctan(y/x) \\\\
-           \\phi &= \\arcsin(z/r)
-       对距离加高斯噪声，角度加高斯抖动，再转换回笛卡尔坐标。
+    1. **球坐标噪声（传感器坐标系）**：
+       以 ``sensor_origin`` 为球心把点云转换为 :math:`(r, \\theta, \\phi)`，
+       对距离加高斯噪声、角度加高斯抖动，再转换回笛卡尔坐标。测距
+       误差沿真实波束方向 :math:`\\mathbf d = (\\mathbf p - \\mathbf p_s)/R`
+       作用，其垂直分量 :math:`n_r |d_z|` 是病害深度测量误差的主体
+       —— 这要求传感器位于路面上方（车载 h≈2 m），而不是路面角点。
 
-    2. **Dropout (点丢失)**：
-       基于 Bernoulli 过程 :math:`P(\\text{drop}) = p_d` 独立决定每个点的丢失。
-       同时附加距离依赖性：远点丢失概率更高。
+    2. **测距噪声异方差**：``sigma_r`` 给定时使用逐点标准差
+       :math:`\\sigma_{r,i}`。物理依据：:math:`\\sigma_r \\propto
+       1/\\sqrt{\\mathrm{SNR}}`，暗、掠射、远处的点噪声更大
+       (Wujanz et al. 2017; Soudarissanane et al. 2011)。
 
-    3. **边缘混合效应 (Edge Mixing) — P2-3 修复**：
-       仅对曲率变化大的病害边缘点做邻域均值混合 (模拟 LiDAR 混合像素效应)。
-       使用批量化 KDTree 查询替代逐点查询 (可改进点#5)。
+    3. **Dropout（辐射耦合）**：``drop_weight`` 给定时（接收功率代理
+       :math:`\\propto \\rho\\cos\\theta/R^2`），丢点概率随功率下降
+       单调上升 :math:`P_i = \\mathrm{clip}(p_d \\cdot \\tilde w / w_i,
+       0, 0.95)`（:math:`\\tilde w` 为中位功率），低强度 ↔ 高丢点
+       的真实耦合得以保留；未提供时退回旧的距离比例模型。
+
+    4. **边缘混合效应**：仅对曲率相对阈值筛出的病害边缘点做邻域
+       均值混合（模拟混合像元）。
 
     Args:
         points:  点云 (N, 3)。
-        distance_noise_std: 距离测量高斯噪声标准差 (m)。
+        distance_noise_std: 距离噪声标准差 (m)，``sigma_r`` 为 None 时使用。
         dropout_rate: 基础点丢失概率 [0, 1)。
         angular_jitter_deg: 角度抖动标准差 (度)。
         seed: 随机种子。
-        enable_edge_mixing: 是否启用边缘混合，默认 True (P2-3)。
-        mixed_pixel_prob: 混合像素点比例，默认 0.01 (1%)。
-        curvature: 曲率数组 (N,) 用于筛选边缘点，None 时退化到全局混合 (P2-3)。
-        curvature_threshold: 曲率阈值，大于此值的点才参与混合 (P2-3)。
+        enable_edge_mixing: 是否启用边缘混合。
+        mixed_pixel_prob: 混合像素点比例。
+        curvature: 曲率数组 (N,) 用于筛选边缘点。
+        curvature_threshold: 相对曲率阈值（乘以 std(|curvature|)）。
+        sensor_origin: 传感器位姿 (3,)。None 时退回旧的原点球心
+            （仅为向后兼容；正式管线必须传入车载位姿）。
+        sigma_r: 逐点测距噪声标准差 (N,)，None 时用常数。
+        drop_weight: 逐点接收功率代理 (N,)，用于辐射耦合丢点。
 
     Returns:
         噪声点云 (N', 3)，其中 N' ≤ N。NaN 点已被移除。
@@ -1758,34 +1927,53 @@ def simulate_lidar_noise(
     pts = points.copy()
     N = pts.shape[0]
 
-    # 1. 笛卡尔 → 球坐标
-    x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+    if sensor_origin is None:
+        origin = np.zeros(3, dtype=np.float64)
+    else:
+        origin = np.asarray(sensor_origin, dtype=np.float64).reshape(3)
+
+    # 1. 平移到传感器坐标系后做笛卡尔 → 球坐标
+    q = pts - origin[None, :]
+    x, y, z = q[:, 0], q[:, 1], q[:, 2]
     r = np.sqrt(x ** 2 + y ** 2 + z ** 2) + 1e-12
     theta = np.arctan2(y, x)
     phi = np.arcsin(np.clip(z / r, -1.0, 1.0))
 
-    # 2. 加噪声
+    # 2. 加噪声（sigma_r 提供时逐点异方差）
     angular_jitter_rad = np.deg2rad(angular_jitter_deg)
 
-    r_noisy = r + rng.normal(0.0, distance_noise_std, size=N)
+    if sigma_r is not None:
+        sigma = np.asarray(sigma_r, dtype=np.float64).reshape(N)
+        r_noisy = r + rng.normal(0.0, 1.0, size=N) * sigma
+    else:
+        r_noisy = r + rng.normal(0.0, distance_noise_std, size=N)
     r_noisy = np.maximum(r_noisy, 0.0)
     theta_noisy = theta + rng.normal(0.0, angular_jitter_rad, size=N)
     phi_noisy = phi + rng.normal(0.0, angular_jitter_rad, size=N)
     phi_noisy = np.clip(phi_noisy, -np.pi / 2.0, np.pi / 2.0)
 
-    # 3. 球坐标 → 笛卡尔
+    # 3. 球坐标 → 笛卡尔，再平移回路面坐标系
     pts_noisy = np.empty_like(pts)
     pts_noisy[:, 0] = r_noisy * np.cos(theta_noisy) * np.cos(phi_noisy)
     pts_noisy[:, 1] = r_noisy * np.sin(theta_noisy) * np.cos(phi_noisy)
     pts_noisy[:, 2] = r_noisy * np.sin(phi_noisy)
+    pts_noisy += origin[None, :]
 
     # 4. Dropout
     if dropout_rate > 0:
-        # 基础丢失概率 + 距离相关附加
-        r_max = np.max(r_noisy)
-        dist_factor = r_noisy / max(r_max, 1e-12)
-        dropout_prob = dropout_rate + (1.0 - dropout_rate) * dist_factor * 0.2
-        dropout_prob = np.clip(dropout_prob, 0.0, 0.99)
+        if drop_weight is not None:
+            # 辐射耦合：P(drop) 随接收功率下降单调上升，中位功率处
+            # 恰为基础丢失率。
+            w = np.asarray(drop_weight, dtype=np.float64).reshape(N)
+            w = np.maximum(w, 1e-12)
+            w_ref = float(np.median(w))
+            dropout_prob = np.clip(dropout_rate * (w_ref / w), 0.0, 0.95)
+        else:
+            # 旧行为（无功率信息的调用方）：距离比例附加项。
+            r_max = np.max(r_noisy)
+            dist_factor = r / max(r_max, 1e-12)
+            dropout_prob = dropout_rate + (1.0 - dropout_rate) * dist_factor * 0.2
+            dropout_prob = np.clip(dropout_prob, 0.0, 0.99)
 
         keep_mask = rng.random(N) > dropout_prob
         pts_noisy = pts_noisy[keep_mask]

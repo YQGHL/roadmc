@@ -43,7 +43,6 @@ try:
     )
     from .primitives import (
         generate_road_surface,
-        add_micro_texture,
         add_crack,
         add_pothole,
         add_raveling,
@@ -78,7 +77,6 @@ except ImportError:
     )
     from primitives import (  # type: ignore[no-redef]
         generate_road_surface,
-        add_micro_texture,
         add_crack,
         add_pothole,
         add_raveling,
@@ -275,7 +273,8 @@ class SyntheticRoadDataset(_DatasetBase):
             else self._select_pavement_type(rng)
         )
 
-        # 2. 路面宏观轮廓 + 微观纹理
+        # 2. 路面宏观轮廓 + 纹理谱段 + 设计几何（单次谱合成，法向从
+        # 最终高度场统一重算——纹理不再作为独立的逐点位移步骤）。
         points, normals = generate_road_surface(
             width=width,
             length=length,
@@ -283,6 +282,11 @@ class SyntheticRoadDataset(_DatasetBase):
             pavement_type=pavement_type,
             roughness_class=self.config.road.roughness_class,
             seed=int(rng.integers(0, 2 ** 31)),
+            texture_rms=self.config.micro_texture.amplitude,
+            texture_hurst=self.config.micro_texture.hurst,
+            crossfall=self.config.road.crossfall,
+            crossfall_shape=self.config.road.crossfall_shape,
+            longitudinal_grade=self.config.road.longitudinal_grade,
         )
         if len(points) != surface_estimate.point_count:
             raise RuntimeError(
@@ -290,17 +294,7 @@ class SyntheticRoadDataset(_DatasetBase):
                 f"{surface_estimate.point_count:,} points but generated {len(points):,}."
             )
 
-        if self.config.micro_texture.amplitude > 0.0:
-            points, normals = add_micro_texture(
-                points,
-                normals,
-                amplitude=self.config.micro_texture.amplitude,
-                hurst=self.config.micro_texture.hurst,
-                octaves=self.config.micro_texture.octaves,
-                seed=int(rng.integers(0, 2 ** 31)),
-            )
-
-        # 2.5 P1-1: LiDAR 扫描线密度重采样（可选）
+        # 2.5 P1-1: LiDAR 扫描线密度重采样（可选）——与噪声/强度共用位姿
         if self.config.lidar_scan.enable:
             scan_idx = resample_to_lidar_pattern(
                 points,
@@ -310,6 +304,8 @@ class SyntheticRoadDataset(_DatasetBase):
                 range_decay=self.config.lidar_scan.range_decay,
                 incidence_angle_drop=self.config.lidar_scan.incidence_angle_drop,
                 rng=rng,
+                sensor_pose=self._sensor_pose(),
+                line_sigma_m=self.config.lidar_scan.line_sigma_m,
             )
             if len(scan_idx) > 10:
                 points = points[scan_idx]
@@ -357,14 +353,13 @@ class SyntheticRoadDataset(_DatasetBase):
             elif disease_type == "pothole":
                 cx = float(rng.uniform(0.5, width - 0.5))
                 cy = float(rng.uniform(0.5, length - 0.5))
+                # JTG 5210-2018 坑槽轻/重仅按深度 (25mm) 分级；平面半径
+                # 与严重度解耦采样——旧实现按严重度硬切半径区间，使
+                # 轻/重可被平面尺寸这一非规范线索 100% 分离。
+                radius = float(rng.uniform(0.05, self.config.pothole.max_radius_severe))
                 if severity == "light":
-                    radius = float(rng.uniform(0.05, self.config.pothole.max_radius_light))
                     depth = float(rng.uniform(0.005, self.config.pothole.max_depth_light))
                 else:
-                    radius = float(rng.uniform(
-                        self.config.pothole.max_radius_light,
-                        self.config.pothole.max_radius_severe,
-                    ))
                     depth = float(rng.uniform(
                         self.config.pothole.max_depth_light * 1.1,
                         self.config.pothole.max_depth_severe,
@@ -395,7 +390,8 @@ class SyntheticRoadDataset(_DatasetBase):
                 center_line = width / 2.0
                 wheel_sep = self.config.rutting.wheel_separation
                 if severity == "light":
-                    depth = float(rng.uniform(0.005, self.config.rutting.max_depth_light))
+                    # JTG 车辙起判阈值 10mm：5-10mm 不构成车辙病害。
+                    depth = float(rng.uniform(0.010, self.config.rutting.max_depth_light))
                 else:
                     depth = float(rng.uniform(
                         self.config.rutting.max_depth_light * 1.1,
@@ -569,9 +565,12 @@ class SyntheticRoadDataset(_DatasetBase):
         if points.shape[0] == 0:
             raise RuntimeError("Empty point cloud after NaN filtering.")
 
-        # 7. 强度反射率计算（在松散标签应用之后）
-        # P0-2: 移到松散应用之后，确保松散区域的标签 11/12 被正确反映
-        intensity = self._compute_intensity(labels, pavement_type, rng)
+        # 7. 辐射强度计算（在松散标签应用之后）：I ∝ ρ·cosθ/R²，
+        # 同时得到接收功率代理，供 σ_r 与丢点共用（统一辐射预算）。
+        sensor_origin = self._sensor_pose()
+        intensity, received_power = self._compute_intensity(
+            points, normals, labels, pavement_type, sensor_origin, rng
+        )
 
         # 8. LiDAR 噪声仿真
         # 保存噪声前状态以传递标签/特征
@@ -580,6 +579,17 @@ class SyntheticRoadDataset(_DatasetBase):
         pre_intensity = intensity.copy()
         pre_curvature = curvature.copy()
         pre_normals = normals.copy()
+
+        # 逐点测距噪声：σ_r ∝ 1/√SNR ∝ 1/√P_recv（限幅 [0.5, 3]×），
+        # 暗、掠射、远处的点噪声更大。
+        sigma_base = self.config.lidar_noise.distance_noise_std
+        if sigma_base > 0.0:
+            power_ref = float(np.median(received_power))
+            sigma_r = sigma_base * np.clip(
+                np.sqrt(power_ref / np.maximum(received_power, 1e-12)), 0.5, 3.0
+            )
+        else:
+            sigma_r = None
 
         noisy_points = simulate_lidar_noise(
             points,
@@ -591,6 +601,9 @@ class SyntheticRoadDataset(_DatasetBase):
             mixed_pixel_prob=self.config.lidar_noise.mixed_pixel_prob,
             curvature=pre_curvature,  # P2-3: 仅高曲率边缘点混合
             curvature_threshold=0.5,
+            sensor_origin=sensor_origin,
+            sigma_r=sigma_r,
+            drop_weight=received_power,
         )
 
         if noisy_points.shape[0] == 0:
@@ -609,8 +622,11 @@ class SyntheticRoadDataset(_DatasetBase):
         normals = pre_normals[nn_idx]
 
         # P0-4 距离阈值保护：超过 3σ 距离的点回退到背景标签
-        # 防止裂缝边缘噪声点携带错误标签到远处
-        max_transfer_dist = self.config.lidar_noise.distance_noise_std * 3.0
+        # 防止裂缝边缘噪声点携带错误标签到远处（σ 取逐点噪声均值）
+        if sigma_r is not None:
+            max_transfer_dist = float(np.mean(sigma_r)) * 3.0
+        else:
+            max_transfer_dist = self.config.lidar_noise.distance_noise_std * 3.0
         if max_transfer_dist > 0.0:
             uncertain_mask = nn_dist > max_transfer_dist
         else:
@@ -707,6 +723,15 @@ class SyntheticRoadDataset(_DatasetBase):
                     and len(points_final) > sensor_points_before_output_sampling
                 ),
             }
+        )
+        resolution_metadata["sensor_output"]["sensor_pose_m"] = [
+            float(v) for v in sensor_origin
+        ]
+        resolution_metadata["sensor_output"]["intensity_model"] = (
+            "radiometric.v2: rho(x,y)*shading*cos(theta)/R^2, "
+            "lognormal albedo field (corr 0.3 m, sigma_ln 0.25), "
+            "Gamma speckle M=12, 8-bit quantization; sigma_r and dropout "
+            "share the same received-power proxy"
         )
         # Audit trail for controlled scenes: record how many target-label
         # points actually survived output sampling and whether the minimum
@@ -870,40 +895,116 @@ class SyntheticRoadDataset(_DatasetBase):
             edge_width=cfg.edge_width,
         )
 
+    def _sensor_pose(self) -> np.ndarray:
+        """整条观测管线共用的传感器位姿 (x, y, z)，米制路面坐标。"""
+        pose = self.config.lidar_scan.sensor_pose
+        if pose is not None:
+            return np.asarray(pose, dtype=np.float64).reshape(3)
+        # 车载默认：横向居中、位于场景起点前方 1 m、高 2 m。
+        return np.array([self.config.road.width / 2.0, -1.0, 2.0], dtype=np.float64)
+
     def _compute_intensity(
         self,
+        points: np.ndarray,
+        normals: np.ndarray,
         labels: np.ndarray,
         pavement_type: str,
+        sensor_origin: np.ndarray,
         rng: np.random.Generator,
-    ) -> np.ndarray:
-        """模拟 LiDAR 强度反射率（基于物理反射率模型）。
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """辐射强度模型：I ∝ ρ(x,y)·cosθ / R²，加斑点噪声与 8-bit 量化。
 
-        P1-6: 沥青基底反射率 0.10-0.25，水泥基底 0.30-0.50。
-        输出范围 [0, 1]，代表归一化反射率。
+        激光雷达方程 (Jelalian 1992) 的朗伯近似。类别信息只能通过
+        **空间相关、类间高度重叠**的材料反照率场 ρ(x,y) 间接进入强度
+        —— 不存在按标签查表的固定偏移（旧实现的偏移使单通道强度即可
+        近乎完美分类，构成隐性标签泄漏并被审计确认为强度域差主因）。
+
+        组成：
+        - 材料反照率均值（905 nm 量级的物理方向）：沥青 ~0.17 /
+          水泥 ~0.40；泛油（沥青结合料油膜，NIR 强吸收 + 镜面损耗）
+          **变暗** ×0.55；修补（富油新料）×0.85；松散/露骨（集料
+          外露）×1.15-1.2。裂缝/坑槽类不做材料偏移——凹陷内的变暗
+          由几何遮蔽因子产生。
+        - 空间相关反照率场：对数正态乘性场（FFT 低通，相关长度
+          ~0.3 m，σ_ln≈0.25），保证类内方差大、类间分布重叠。
+        - 几何遮蔽：低于局部参考面的点按 exp(-depth/12 mm) 变暗
+          （深槽回波弱），参考面取 0.08 m 粗网格中位数。
+        - cosθ/R² 几何项、AGC 归一（99 分位）、乘性 Gamma 斑点
+          （M=12）、uint8 量化。
+
+        Returns:
+            intensity: 归一化强度 (N,) float32 ∈ [0, 1]，256 级。
+            received_power: 未归一化接收功率代理 (N,)，供逐点
+                σ_r 与辐射耦合丢点复用（同一 ρcosθ/R² 的两面）。
         """
         N = labels.shape[0]
-        # P1-6: 物理合理的反射率基线
+
+        # --- 材料反照率均值 ---
         if pavement_type == "asphalt":
-            base = float(rng.uniform(0.10, 0.25))
+            base = float(rng.uniform(0.12, 0.22))
         else:
-            base = float(rng.uniform(0.30, 0.50))
+            base = float(rng.uniform(0.32, 0.48))
+        mult = np.ones(N, dtype=np.float64)
+        mult[labels == 19] = 0.55                       # 泛油：NIR 变暗（修正方向）
+        mult[(labels == 20) | (labels == 37)] = 0.85    # 修补：富油新料略暗
+        mult[(labels == 11) | (labels == 12)] = 1.15    # 松散：集料外露略亮
+        mult[labels == 36] = 1.20                       # 露骨
+        mult[labels == 29] = 1.10                       # 唧泥：细料泛白
 
-        intensity = np.full(N, base, dtype=np.float64)
-        intensity += rng.normal(0.0, 0.02, size=N)
+        # --- 空间相关对数正态反照率场 ---
+        gx = gy = 96
+        x_min, y_min = points[:, 0].min(), points[:, 1].min()
+        x_max, y_max = points[:, 0].max(), points[:, 1].max()
+        ext_x = max(x_max - x_min, 1e-6)
+        ext_y = max(y_max - y_min, 1e-6)
+        fx = np.fft.fftfreq(gx, d=ext_x / gx)
+        fy = np.fft.fftfreq(gy, d=ext_y / gy)
+        f_r = np.sqrt(fx[:, None] ** 2 + fy[None, :] ** 2)
+        corr_len = 0.3  # m
+        lowpass = np.exp(-((f_r * corr_len) ** 2))
+        field = np.real(np.fft.ifft2(lowpass * np.fft.fft2(rng.normal(size=(gx, gy)))))
+        fstd = field.std()
+        if fstd > 1e-12:
+            field = (field - field.mean()) / fstd
+        from scipy.interpolate import RegularGridInterpolator
+        interp = RegularGridInterpolator(
+            (np.linspace(x_min, x_max, gx), np.linspace(y_min, y_max, gy)),
+            field, bounds_error=False, fill_value=0.0,
+        )
+        rho_field = np.exp(0.25 * interp(points[:, :2]))
+        rho = np.clip(base * mult * rho_field, 0.02, 0.95)
 
-        # 病害区域强度修正（JTG 标准病害反射率特征）
-        intensity[labels == 19] += 0.20   # 泛油：反射率显著增加 (油膜反射)
-        intensity[(labels == 11) | (labels == 12)] -= 0.10
-        intensity[labels == 36] -= 0.08
-        intensity[(labels == 20) | (labels == 37)] += 0.15
-        intensity[labels == 29] += 0.12
-        intensity[labels == 34] -= 0.05
-        # 裂缝：反射率轻微降低（阴影 + 粗糙边缘）
-        crack_mask = (labels >= 1) & (labels <= 8)
-        intensity[crack_mask] -= 0.05
-        intensity[(labels == 9) | (labels == 10)] -= 0.08
+        # --- 几何遮蔽：相对局部参考面的凹陷深度 ---
+        cell = 0.08  # m
+        ix = np.clip(((points[:, 0] - x_min) / cell).astype(np.int64), 0, None)
+        iy = np.clip(((points[:, 1] - y_min) / cell).astype(np.int64), 0, None)
+        cell_id = ix * (iy.max() + 1) + iy
+        order = np.argsort(cell_id, kind="stable")
+        sorted_ids = cell_id[order]
+        boundaries = np.flatnonzero(np.diff(sorted_ids)) + 1
+        groups = np.split(order, boundaries)
+        z_ref = np.empty(N, dtype=np.float64)
+        for g in groups:
+            z_ref[g] = np.median(points[g, 2])
+        depth = np.maximum(z_ref - points[:, 2], 0.0)
+        shading = 0.25 + 0.75 * np.exp(-depth / 0.012)
 
-        return np.clip(intensity, 0.0, 1.0).astype(np.float32)
+        # --- 几何项与接收功率 ---
+        d = points - sensor_origin[None, :]
+        R2 = np.sum(d * d, axis=1) + 1e-12
+        d_hat = d / np.sqrt(R2)[:, None]
+        cos_theta = np.clip(np.abs(np.sum(normals * (-d_hat), axis=1)), 0.03, 1.0)
+        received_power = rho * shading * cos_theta / R2
+
+        # --- AGC 归一 + 斑点噪声 + 量化 ---
+        scale = float(np.percentile(received_power, 99.0))
+        intensity = received_power / max(scale, 1e-12)
+        speckle_m = 12.0
+        intensity = intensity * rng.gamma(shape=speckle_m, scale=1.0 / speckle_m, size=N)
+        intensity = np.clip(intensity, 0.0, 1.0)
+        intensity = np.round(intensity * 255.0) / 255.0
+
+        return intensity.astype(np.float32), received_power
 
     @staticmethod
     def _resample_to_target(
