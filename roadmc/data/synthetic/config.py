@@ -9,13 +9,23 @@ RoadMC 合成数据生成器配置模块。
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 # 全局常量
 
 NUM_CLASSES: int = 38
 """JTG 5210-2018 病害分类总数（含背景标签 0）。"""
+
+RESOLUTION_CONTRACT_VERSION: str = "roadmc-resolution-v1"
+"""Version of the surface -> sensor -> model resolution metadata contract."""
+
+SURFACE_PEAK_BYTES_PER_POINT: int = 320
+"""Conservative peak-RAM estimate for the current float64 synthesis pipeline."""
+
+DEFAULT_MAX_SURFACE_POINTS: int = 10_000_000
+DEFAULT_MAX_SURFACE_MEMORY_MIB: float = 4096.0
 
 ASPHALT_LABELS: Tuple[int, ...] = tuple(range(0, 21))
 CONCRETE_LABELS: Tuple[int, ...] = tuple(range(21, 38))
@@ -94,12 +104,44 @@ class RoadSurfaceConfig:
     roughness_class: Literal["A", "B", "C", "D", "E"] = "A"
 
     def __post_init__(self) -> None:
-        if self.width <= 0:
+        if not math.isfinite(self.width) or self.width <= 0:
             raise ValueError(f"width must be > 0, got {self.width}")
-        if self.length <= 0:
+        if not math.isfinite(self.length) or self.length <= 0:
             raise ValueError(f"length must be > 0, got {self.length}")
-        if self.grid_res <= 0:
+        if not math.isfinite(self.grid_res) or self.grid_res <= 0:
             raise ValueError(f"grid_res must be > 0, got {self.grid_res}")
+
+    @property
+    def surface_grid_spacing_m(self) -> float:
+        """Physical spacing of the synthesis height field in metres.
+
+        ``grid_res`` remains the stored field for API compatibility.  This
+        explicit name prevents it from being mistaken for sensor or model
+        point spacing.
+        """
+
+        return float(self.grid_res)
+
+    @property
+    def surface_area_m2(self) -> float:
+        """Nominal horizontal road area in square metres."""
+
+        return float(self.width * self.length)
+
+    @property
+    def surface_grid_shape(self) -> Tuple[int, int]:
+        """Exact shape produced by ``np.arange(0, extent, grid_res)``."""
+
+        nx = max(1, int(math.ceil(self.width / self.grid_res)))
+        ny = max(1, int(math.ceil(self.length / self.grid_res)))
+        return nx, ny
+
+    @property
+    def surface_grid_point_count(self) -> int:
+        """Number of points allocated before sensor simulation."""
+
+        nx, ny = self.surface_grid_shape
+        return nx * ny
 
 
 @dataclass
@@ -360,6 +402,26 @@ class DiseaseConfig:
                 raise ValueError(f"disease_probs['{k}'] = {v} not in [0,1]")
 
 
+@dataclass(frozen=True)
+class SurfaceGenerationEstimate:
+    """Preflight estimate for the full-resolution synthesis surface."""
+
+    grid_shape: Tuple[int, int]
+    point_count: int
+    estimated_peak_memory_mib: float
+    bytes_per_point_assumption: int = SURFACE_PEAK_BYTES_PER_POINT
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Return a JSON-serializable representation."""
+
+        return {
+            "grid_shape": list(self.grid_shape),
+            "point_count": int(self.point_count),
+            "estimated_peak_memory_mib": float(self.estimated_peak_memory_mib),
+            "bytes_per_point_assumption": int(self.bytes_per_point_assumption),
+        }
+
+
 @dataclass
 class GeneratorConfig:
     """合成数据集生成器顶层配置。
@@ -381,9 +443,15 @@ class GeneratorConfig:
         lidar_noise: LiDAR 噪声配置。
         lidar_scan: LiDAR 扫描几何配置 (P1-1)。
         seed: 全局随机种子，默认 None (非确定性)。
-        num_points: 每场景目标点数 (旧参数)，默认 65536。
-        target_density: 目标点密度 (点/㎡)，None 时使用 num_points (P1-2)。
+        num_points: 传感器输出目标点数 (兼容旧名称)，默认 65536。
+        target_density: 传感器输出目标密度 (点/㎡，兼容旧名称)。
+        model_target_points: 下游模型每场景目标点数。生成器只记录该契约，
+            不执行模型采样；None 表示由训练配置决定。
+        target_label_min_output_points: 受控场景下目标标签的最小存活点数。
+            默认 1，仅防止标签完全消失，不固定病害点比例。
         point_count_tolerance: 点数波动容忍度 (±比例)，默认 0.2 (P1-2)。
+        max_surface_points: 传感器采样前允许分配的最大表面网格点数。
+        max_surface_memory_mib: 单个生成 worker 的估算峰值内存上限。
         normalize: 是否坐标归一化到单位球，默认 True。
     """
 
@@ -404,8 +472,203 @@ class GeneratorConfig:
     seed: Optional[int] = None
     num_points: int = 65536
     target_density: Optional[float] = None  # P1-2: 点/㎡
+    model_target_points: Optional[int] = None
+    target_label_min_output_points: int = 1
     point_count_tolerance: float = 0.20  # P1-2: ±20%
+    max_surface_points: int = DEFAULT_MAX_SURFACE_POINTS
+    max_surface_memory_mib: float = DEFAULT_MAX_SURFACE_MEMORY_MIB
     normalize: bool = True
+
+    def __post_init__(self) -> None:
+        if self.num_points < 1:
+            raise ValueError(f"num_points must be >= 1, got {self.num_points}")
+        if self.target_density is not None and self.target_density < 0:
+            raise ValueError(
+                f"target_density must be >= 0 when provided, got {self.target_density}"
+            )
+        if self.model_target_points is not None and self.model_target_points < 1:
+            raise ValueError(
+                "model_target_points must be >= 1 when provided, "
+                f"got {self.model_target_points}"
+            )
+        if self.target_label_min_output_points < 0:
+            raise ValueError(
+                "target_label_min_output_points must be >= 0, "
+                f"got {self.target_label_min_output_points}"
+            )
+        if not 0.0 <= self.point_count_tolerance < 1.0:
+            raise ValueError(
+                "point_count_tolerance must be in [0, 1), "
+                f"got {self.point_count_tolerance}"
+            )
+        if self.max_surface_points < 1:
+            raise ValueError(
+                f"max_surface_points must be >= 1, got {self.max_surface_points}"
+            )
+        if (
+            not math.isfinite(self.max_surface_memory_mib)
+            or self.max_surface_memory_mib <= 0
+        ):
+            raise ValueError(
+                "max_surface_memory_mib must be finite and > 0, "
+                f"got {self.max_surface_memory_mib}"
+            )
+        if self.target_label_min_output_points > self.sensor_output_target_points:
+            raise ValueError(
+                "target_label_min_output_points cannot exceed the requested sensor "
+                f"output point count ({self.sensor_output_target_points}), got "
+                f"{self.target_label_min_output_points}"
+            )
+
+        self.validate_surface_budget()
+
+    @property
+    def sensor_output_mode(self) -> str:
+        """Configured sensor-output sampling mode."""
+
+        if self.target_density is not None and self.target_density > 0:
+            return "density_voxel"
+        return "fixed_count"
+
+    @property
+    def sensor_output_target_points(self) -> int:
+        """Requested stored sensor points before any model-side sampling."""
+
+        if self.sensor_output_mode == "density_voxel":
+            return max(1, int(self.road.surface_area_m2 * float(self.target_density)))
+        return int(self.num_points)
+
+    @property
+    def sensor_output_density_points_per_m2(self) -> Optional[float]:
+        """Requested sensor density, or ``None`` for fixed-count output."""
+
+        if self.sensor_output_mode == "density_voxel":
+            return float(self.target_density)
+        return None
+
+    def estimate_surface_generation(self) -> SurfaceGenerationEstimate:
+        """Estimate point allocation and conservative peak RAM per worker."""
+
+        point_count = self.road.surface_grid_point_count
+        memory_mib = point_count * SURFACE_PEAK_BYTES_PER_POINT / (1024.0 ** 2)
+        return SurfaceGenerationEstimate(
+            grid_shape=self.road.surface_grid_shape,
+            point_count=point_count,
+            estimated_peak_memory_mib=memory_mib,
+        )
+
+    def validate_surface_budget(self) -> SurfaceGenerationEstimate:
+        """Reject a surface that exceeds configured per-worker safety limits."""
+
+        estimate = self.estimate_surface_generation()
+        if estimate.point_count > self.max_surface_points:
+            raise ValueError(
+                "Surface grid would allocate "
+                f"{estimate.point_count:,} points at "
+                f"{self.road.surface_grid_spacing_m * 1000.0:.3f} mm, exceeding "
+                f"max_surface_points={self.max_surface_points:,}. This check applies "
+                "before sensor/output and model downsampling. Increase the spacing, "
+                "crop the road, or explicitly raise the limit after checking RAM."
+            )
+        if estimate.estimated_peak_memory_mib > self.max_surface_memory_mib:
+            raise ValueError(
+                "Surface synthesis is estimated to peak at "
+                f"{estimate.estimated_peak_memory_mib:.1f} MiB per worker, exceeding "
+                f"max_surface_memory_mib={self.max_surface_memory_mib:.1f}. Reduce the "
+                "surface size/resolution or explicitly raise the memory budget."
+            )
+        return estimate
+
+    def validate_parallel_budget(
+        self,
+        workers: int,
+        max_parallel_memory_mib: float,
+    ) -> float:
+        """Validate aggregate high-resolution memory for parallel generation."""
+
+        if workers < 1:
+            raise ValueError(f"workers must be >= 1, got {workers}")
+        if not math.isfinite(max_parallel_memory_mib) or max_parallel_memory_mib <= 0:
+            raise ValueError(
+                "max_parallel_memory_mib must be finite and > 0, "
+                f"got {max_parallel_memory_mib}"
+            )
+        total_mib = self.validate_surface_budget().estimated_peak_memory_mib * workers
+        if total_mib > max_parallel_memory_mib:
+            raise ValueError(
+                f"{workers} workers may require about {total_mib:.1f} MiB for surface "
+                f"synthesis, exceeding the parallel budget of {max_parallel_memory_mib:.1f} "
+                "MiB. Reduce --workers or explicitly raise --max-parallel-memory-mib."
+            )
+        return total_mib
+
+    def resolution_metadata(self, actual_output_points: Optional[int] = None) -> Dict[str, Any]:
+        """Describe distinct surface, sensor-output, and model resolutions.
+
+        The returned structure is JSON-safe and intentionally states that
+        model sampling is downstream.  ``actual_output_points`` may be supplied
+        after a scene has passed through scan simulation and output sampling.
+        """
+
+        estimate = self.estimate_surface_generation()
+        requested_points = self.sensor_output_target_points
+        output_points = (
+            None if actual_output_points is None else int(actual_output_points)
+        )
+        density = (
+            None
+            if output_points is None
+            else output_points / self.road.surface_area_m2
+        )
+        nominal_spacing = (
+            None
+            if output_points is None or output_points == 0
+            else math.sqrt(self.road.surface_area_m2 / output_points)
+        )
+        return {
+            "contract_version": RESOLUTION_CONTRACT_VERSION,
+            "surface_grid": {
+                "spacing_m": self.road.surface_grid_spacing_m,
+                "width_m": float(self.road.width),
+                "length_m": float(self.road.length),
+                "area_m2": self.road.surface_area_m2,
+                **estimate.as_dict(),
+                "max_surface_points": int(self.max_surface_points),
+                "max_surface_memory_mib": float(self.max_surface_memory_mib),
+            },
+            "sensor_output": {
+                "mode": self.sensor_output_mode,
+                "requested_points": requested_points,
+                "requested_density_points_per_m2": self.sensor_output_density_points_per_m2,
+                "actual_points": output_points,
+                "actual_density_points_per_m2": density,
+                "nominal_equivalent_spacing_m": nominal_spacing,
+                "surface_grid_spacing_is_preserved": False,
+                "controlled_target_label_protection": (
+                    {
+                        "strategy": "minimum_points",
+                        "minimum_points": int(self.target_label_min_output_points),
+                        "fixed_fraction": None,
+                    }
+                    if self.sensor_output_mode == "fixed_count"
+                    else {
+                        # Voxel majority voting has no minimum-survival
+                        # guarantee; the contract must say so explicitly.
+                        "strategy": "none",
+                        "minimum_points": None,
+                        "fixed_fraction": None,
+                    }
+                ),
+            },
+            "model_input": {
+                "target_points": (
+                    None
+                    if self.model_target_points is None
+                    else int(self.model_target_points)
+                ),
+                "sampling_applied_by_generator": False,
+            },
+        }
 
 
 # 工具函数

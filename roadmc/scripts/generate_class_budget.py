@@ -25,7 +25,13 @@ import numpy as np
 os.environ.setdefault("ROADMC_GENERATOR_NO_TORCH", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from roadmc.data.synthetic.config import DiseaseConfig, GeneratorConfig, RoadSurfaceConfig
+from roadmc.data.synthetic.config import (
+    DEFAULT_MAX_SURFACE_MEMORY_MIB,
+    DEFAULT_MAX_SURFACE_POINTS,
+    DiseaseConfig,
+    GeneratorConfig,
+    RoadSurfaceConfig,
+)
 from roadmc.data.synthetic.labels import ALL_DISEASE_LABELS
 from roadmc.data.features import OBSERVABLE_FEATURE_SCHEMA, has_observable_feature_schema
 
@@ -74,15 +80,28 @@ def _empty_coverage(labels: tuple[int, ...]) -> dict[int, dict[str, int]]:
     }
 
 
-def _scan_coverage(split_dir: Path, labels: tuple[int, ...]) -> dict[int, dict[str, int]]:
+def _scan_coverage(
+    split_dir: Path,
+    labels: tuple[int, ...],
+    *,
+    ignore_legacy_scenes: bool = False,
+) -> dict[int, dict[str, int]]:
     coverage = _empty_coverage(labels)
     if not split_dir.exists():
         return coverage
 
     target_set = set(labels)
+    legacy_scenes: list[str] = []
     for path in sorted(split_dir.glob("scene_*.npz")):
         try:
             with np.load(path, allow_pickle=False) as scene:
+                # Scenes without the resolution contract predate the natural
+                # prevalence sampler (they were generated under the removed
+                # fixed 10% target-label quota).  Counting them toward quotas
+                # would silently mix two sampling regimes in one dataset.
+                if "resolution_metadata_json" not in scene.files:
+                    legacy_scenes.append(path.name)
+                    continue
                 scene_labels = scene["labels"].astype(np.int64, copy=False)
                 target_label = int(scene["target_label"]) if "target_label" in scene.files else -1
         except Exception as exc:  # pragma: no cover - corrupt files are operational failures
@@ -98,6 +117,20 @@ def _scan_coverage(split_dir: Path, labels: tuple[int, ...]) -> dict[int, dict[s
             coverage[target_label]["scene_count"] += 1
             coverage[target_label]["instance_count"] += 1
             coverage[target_label]["point_count"] += count_by_label[target_label]
+
+    if legacy_scenes:
+        if not ignore_legacy_scenes:
+            raise SystemExit(
+                f"{split_dir} contains {len(legacy_scenes)} legacy scene(s) without the "
+                "resolution contract (e.g. generated under the removed fixed 10% "
+                "target-label quota); resuming into a mixed-regime directory is not "
+                "allowed. Use a fresh --output-dir, or pass --ignore-legacy-scenes to "
+                f"exclude them from quota accounting. First offender: {legacy_scenes[0]}"
+            )
+        warnings.warn(
+            f"{split_dir}: excluded {len(legacy_scenes)} legacy scene(s) without the "
+            "resolution contract from quota accounting."
+        )
 
     return coverage
 
@@ -188,6 +221,19 @@ def _save_forced_scene(task: tuple[int, int]) -> dict[str, int | bool | str]:
             coordinate_center=scene["coordinate_center"],
             coordinate_scale=scene["coordinate_scale"],
             coordinates_normalized=scene["coordinates_normalized"],
+            resolution_metadata_json=np.asarray(
+                json.dumps(
+                    scene["resolution_metadata"],
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            ),
+            resolution_contract=scene["resolution_contract"],
+            surface_grid_spacing_m=scene["surface_grid_spacing_m"],
+            surface_grid_shape=scene["surface_grid_shape"],
+            surface_grid_point_count=scene["surface_grid_point_count"],
+            sensor_output_point_count=scene["sensor_output_point_count"],
+            model_target_points=scene["model_target_points"],
         )
         return {
             "ok": True,
@@ -218,10 +264,11 @@ def _budget_split(
     max_attempts: int,
     wave_size: int,
     dry_run: bool,
+    ignore_legacy_scenes: bool = False,
 ) -> dict[str, Any]:
     split_dir = output_dir / split
     split_dir.mkdir(parents=True, exist_ok=True)
-    coverage = _scan_coverage(split_dir, labels)
+    coverage = _scan_coverage(split_dir, labels, ignore_legacy_scenes=ignore_legacy_scenes)
     initial_coverage = {label: record.copy() for label, record in coverage.items()}
     start_scene_id = _next_scene_id(split_dir)
     attempts = {label: coverage[label]["instance_count"] for label in labels}
@@ -314,10 +361,31 @@ def main() -> None:
     parser.add_argument("--min-points-per-class", type=int, default=1000)
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--max-attempts-per-class", type=int, default=0, help="0 chooses a conservative automatic limit")
+    parser.add_argument(
+        "--target-label-min-output-points",
+        type=int,
+        default=0,
+        help=(
+            "minimum surviving target-label points per controlled scene; 0 derives "
+            "ceil(min-points-per-class / target-scenes-per-class) so the point quota "
+            "stays arithmetically reachable under natural prevalence"
+        ),
+    )
+    parser.add_argument(
+        "--max-parallel-memory-mib",
+        type=float,
+        default=8192.0,
+        help="aggregate surface-synthesis memory budget across all workers (MiB)",
+    )
+    parser.add_argument(
+        "--ignore-legacy-scenes",
+        action="store_true",
+        help="exclude pre-contract scenes from quota accounting instead of aborting",
+    )
     parser.add_argument("--wave-size", type=int, default=4, help="maximum new scenes per incomplete class per scheduling wave")
     parser.add_argument("--workers", type=int, default=0, help="0 chooses min(8, cpu_count - 2); use 16 explicitly when appropriate")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--grid-res", type=float, default=0.01)
+    parser.add_argument("--grid-res", type=float, default=0.005)
     parser.add_argument("--num-points", type=int, default=8192)
     parser.add_argument("--pavement", choices=("asphalt", "concrete", "mixed"), default="mixed")
     parser.add_argument("--roughness", choices=("A", "B", "C", "D", "E"), default="B")
@@ -349,6 +417,7 @@ def main() -> None:
         seed=args.seed,
         num_points=args.num_points,
     )
+    config.validate_parallel_budget(workers, args.max_parallel_memory_mib)
     output_dir = Path(args.output_dir)
     selected_splits = ("train", "val") if args.split == "both" else (args.split,)
     started = time.time()
@@ -361,10 +430,25 @@ def main() -> None:
         else:
             target_scenes = args.target_scenes_per_class
             min_points = args.min_points_per_class
+        # Under natural prevalence, thin classes can survive with only a few
+        # points per scene, which makes the point quota arithmetically
+        # unreachable within the attempt cap.  The per-scene survival floor is
+        # therefore derived from the quota itself (and audited per scene via
+        # target_label_protection) instead of silently fixing a percentage.
+        min_output_points = args.target_label_min_output_points
+        if min_output_points <= 0:
+            min_output_points = max(1, int(np.ceil(min_points / target_scenes)))
+        if min_output_points > args.num_points:
+            raise ValueError(
+                f"target-label survival floor {min_output_points} exceeds --num-points "
+                f"{args.num_points}; lower --min-points-per-class or raise --num-points"
+            )
+        split_config = replace(config, target_label_min_output_points=min_output_points)
+        print(f"[{split}] target_label_min_output_points={min_output_points}")
         reports[split] = _budget_split(
             output_dir=output_dir,
             split=split,
-            config=config,
+            config=split_config,
             labels=labels,
             target_scenes=target_scenes,
             min_points=min_points,
@@ -372,6 +456,7 @@ def main() -> None:
             max_attempts=max_attempts,
             wave_size=args.wave_size,
             dry_run=args.dry_run,
+            ignore_legacy_scenes=args.ignore_legacy_scenes,
         )
 
     manifest = {

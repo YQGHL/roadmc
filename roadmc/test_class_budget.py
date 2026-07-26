@@ -25,17 +25,36 @@ class ClassBudgetTests(unittest.TestCase):
                 split_dir / "scene_000000.npz",
                 labels=np.array([0, 1, 1, 20, 20, 20], dtype=np.int32),
                 target_label=1,
+                resolution_metadata_json="{}",
             )
             np.savez_compressed(
                 split_dir / "scene_000001.npz",
                 labels=np.array([0, 20, 20, 20], dtype=np.int32),
                 target_label=20,
+                resolution_metadata_json="{}",
             )
 
             coverage = _scan_coverage(split_dir, (1, 20))
 
         self.assertEqual(coverage[1], {"scene_count": 1, "instance_count": 1, "point_count": 2})
         self.assertEqual(coverage[20], {"scene_count": 1, "instance_count": 1, "point_count": 3})
+
+    def test_coverage_rejects_legacy_scenes_without_resolution_contract(self) -> None:
+        """旧 10% 配额时代的场景不得静默计入类别配额。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            split_dir = Path(tmpdir)
+            np.savez_compressed(
+                split_dir / "scene_000000.npz",
+                labels=np.array([0, 1, 1], dtype=np.int32),
+                target_label=1,
+            )
+            with self.assertRaises(SystemExit):
+                _scan_coverage(split_dir, (1,))
+
+            with self.assertWarns(UserWarning):
+                coverage = _scan_coverage(split_dir, (1,), ignore_legacy_scenes=True)
+        self.assertEqual(coverage[1]["scene_count"], 0)
+        self.assertEqual(coverage[1]["point_count"], 0)
 
     def test_feature_contract_rejects_legacy_or_malformed_scenes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -16,7 +16,15 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from roadmc.data.synthetic.config import DiseaseConfig, GeneratorConfig, LABEL_MAP, NUM_CLASSES, RoadSurfaceConfig
+from roadmc.data.synthetic.config import (
+    DEFAULT_MAX_SURFACE_MEMORY_MIB,
+    DEFAULT_MAX_SURFACE_POINTS,
+    DiseaseConfig,
+    GeneratorConfig,
+    LABEL_MAP,
+    NUM_CLASSES,
+    RoadSurfaceConfig,
+)
 
 _WORKER_DATASET = None
 _WORKER_SPLIT_DIR = None
@@ -62,6 +70,19 @@ def _save_one_scene(dataset, split_dir: Path, scene_id: int) -> dict:
             coordinate_center=scene["coordinate_center"],
             coordinate_scale=scene["coordinate_scale"],
             coordinates_normalized=scene["coordinates_normalized"],
+            resolution_metadata_json=np.asarray(
+                json.dumps(
+                    scene["resolution_metadata"],
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            ),
+            resolution_contract=scene["resolution_contract"],
+            surface_grid_spacing_m=scene["surface_grid_spacing_m"],
+            surface_grid_shape=scene["surface_grid_shape"],
+            surface_grid_point_count=scene["surface_grid_point_count"],
+            sensor_output_point_count=scene["sensor_output_point_count"],
+            model_target_points=scene["model_target_points"],
         )
         result["ok"] = True
         result["npoints"] = int(len(pts))
@@ -190,47 +211,158 @@ def verify_class_distribution(output_dir: Path, split: str) -> Dict[int, int]:
     return class_counts
 
 
-def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the CLI while retaining all legacy option spellings."""
+
     parser = argparse.ArgumentParser(description="RoadMC 合成点云数据集批量生成")
     parser.add_argument("--train-count", type=int, default=2000, help="训练集场景数 (默认 2000)")
     parser.add_argument("--val-count", type=int, default=500, help="验证集场景数 (默认 500)")
     parser.add_argument("--output-dir", type=str, default="./data/synthetic_output", help="输出目录")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    parser.add_argument("--grid-res", type=float, default=0.01, help="网格分辨率 (米)")
-    parser.add_argument("--num-points", type=int, default=65536, help="每个场景的目标点数")
-    parser.add_argument("--target-density", type=float, default=None, help="按路面面积指定目标点密度，设置后优先于 num_points")
+    parser.add_argument(
+        "--surface-grid-spacing",
+        "--grid-res",
+        dest="surface_grid_spacing",
+        type=float,
+        default=0.005,
+        help="物理表面高度场网格间距 (米)，默认 0.005 与 GeneratorConfig 一致；--grid-res 为兼容旧名",
+    )
+    parser.add_argument(
+        "--sensor-output-points",
+        "--num-points",
+        dest="sensor_output_points",
+        type=int,
+        default=65536,
+        help="存盘传感器点云目标点数；--num-points 为兼容旧名",
+    )
+    parser.add_argument(
+        "--sensor-output-density",
+        "--target-density",
+        dest="sensor_output_density",
+        type=float,
+        default=None,
+        help="存盘传感器点密度 (点/平方米)，大于 0 时优先于固定点数",
+    )
+    parser.add_argument(
+        "--model-target-points",
+        type=int,
+        default=None,
+        help="下游模型目标点数，仅写入契约；生成器不会执行该采样",
+    )
+    parser.add_argument(
+        "--max-surface-points",
+        type=int,
+        default=DEFAULT_MAX_SURFACE_POINTS,
+        help="单场景传感器采样前允许的最大表面网格点数",
+    )
+    parser.add_argument(
+        "--max-surface-memory-mib",
+        type=float,
+        default=DEFAULT_MAX_SURFACE_MEMORY_MIB,
+        help="单 worker 表面合成估算峰值内存上限 (MiB)",
+    )
+    parser.add_argument(
+        "--max-parallel-memory-mib",
+        type=float,
+        default=8192.0,
+        help="所有生成 worker 的表面合成估算内存总上限 (MiB)",
+    )
     parser.add_argument("--pavement", type=str, default="mixed", choices=["asphalt", "concrete", "mixed"], help="路面类型")
     parser.add_argument("--roughness", type=str, default="B", choices=["A", "B", "C", "D", "E"], help="ISO 8608 粗糙度等级")
     parser.add_argument("--max-diseases", type=int, default=3, help="每场景最多病害数")
     parser.add_argument("--no-stratified", action="store_true", help="禁用分层采样")
     parser.add_argument("--workers", type=int, default=1, help="并行 worker 数")
-    args = parser.parse_args()
+    return parser
 
-    pavement_for_config = args.pavement
 
-    config = GeneratorConfig(
+def _config_from_args(args: argparse.Namespace) -> GeneratorConfig:
+    """Translate CLI names into the backward-compatible config fields."""
+
+    return GeneratorConfig(
         road=RoadSurfaceConfig(
-            grid_res=args.grid_res,
+            grid_res=args.surface_grid_spacing,
             roughness_class=args.roughness,
-            pavement_type=pavement_for_config,
+            pavement_type=args.pavement,
         ),
         disease=DiseaseConfig(
             max_diseases_per_scene=args.max_diseases,
             use_stratified=not args.no_stratified,
         ),
         seed=args.seed,
-        num_points=args.num_points,
-        target_density=args.target_density,
+        num_points=args.sensor_output_points,
+        target_density=args.sensor_output_density,
+        model_target_points=args.model_target_points,
+        max_surface_points=args.max_surface_points,
+        max_surface_memory_mib=args.max_surface_memory_mib,
     )
+
+
+def _validate_request(
+    args: argparse.Namespace,
+    config: GeneratorConfig,
+) -> tuple[int, float]:
+    """Validate counts and aggregate worker memory before creating outputs."""
+
+    if args.train_count < 0 or args.val_count < 0:
+        raise ValueError("--train-count and --val-count must be >= 0")
+    if args.max_diseases < 1:
+        raise ValueError("--max-diseases must be >= 1")
+    if args.workers < 0:
+        raise ValueError("--workers must be >= 0; zero retains legacy single-worker behavior")
+
+    effective_workers = max(1, args.workers)
+    largest_split = max(args.train_count, args.val_count)
+    active_workers = min(effective_workers, largest_split) if largest_split else 0
+    estimated_parallel_mib = 0.0
+    if active_workers:
+        estimated_parallel_mib = config.validate_parallel_budget(
+            active_workers,
+            args.max_parallel_memory_mib,
+        )
+    return effective_workers, estimated_parallel_mib
+
+
+def _print_resolution_summary(
+    config: GeneratorConfig,
+    workers: int,
+    estimated_parallel_mib: float,
+) -> None:
+    estimate = config.estimate_surface_generation()
+    model_points = (
+        "由训练配置决定"
+        if config.model_target_points is None
+        else str(config.model_target_points)
+    )
+    print(
+        "分辨率契约: "
+        f"表面={config.road.surface_grid_spacing_m * 1000.0:.2f} mm "
+        f"({estimate.point_count:,} 点), "
+        f"传感器输出={config.sensor_output_mode}/约 "
+        f"{config.sensor_output_target_points:,} 点, "
+        f"模型目标={model_points}"
+    )
+    if estimated_parallel_mib:
+        print(
+            f"安全估算: {workers} worker(s) 表面合成峰值约 "
+            f"{estimated_parallel_mib:.1f} MiB"
+        )
+    print("注意: 表面网格间距不会在传感器输出或模型采样后保持不变。")
+
+
+def main() -> None:
+    args = _build_parser().parse_args()
+    config = _config_from_args(args)
+    workers, estimated_parallel_mib = _validate_request(args, config)
 
     output_dir = Path(args.output_dir)
     print("\n开始生成数据集...")
-    print(f"配置: 网格分辨率={args.grid_res}m, 路面类型={args.pavement}, 粗糙度={args.roughness}, 每场景最多病害={args.max_diseases}")
+    print(f"配置: 路面类型={args.pavement}, 粗糙度={args.roughness}, 每场景最多病害={args.max_diseases}")
     print(f"随机种子: {args.seed}")
+    _print_resolution_summary(config, workers, estimated_parallel_mib)
 
     stats = {
-        "train": generate_dataset(args.train_count, config, "train", output_dir, use_stratified=not args.no_stratified, num_workers=args.workers),
-        "val": generate_dataset(args.val_count, config, "val", output_dir, use_stratified=not args.no_stratified, num_workers=args.workers),
+        "train": generate_dataset(args.train_count, config, "train", output_dir, use_stratified=not args.no_stratified, num_workers=workers),
+        "val": generate_dataset(args.val_count, config, "val", output_dir, use_stratified=not args.no_stratified, num_workers=workers),
     }
 
     print("\n" + "=" * 60)
@@ -238,16 +370,25 @@ def main() -> None:
 
     metadata = {
         "config": {
-            "grid_res": args.grid_res,
+            "surface_grid_spacing_m": args.surface_grid_spacing,
+            "grid_res": args.surface_grid_spacing,
             "pavement": args.pavement,
-            "num_points": args.num_points,
-            "target_density": args.target_density,
+            "sensor_output_points": args.sensor_output_points,
+            "num_points": args.sensor_output_points,
+            "sensor_output_density": args.sensor_output_density,
+            "target_density": args.sensor_output_density,
+            "model_target_points": args.model_target_points,
             "roughness": args.roughness,
             "seed": args.seed,
             "max_diseases": args.max_diseases,
             "num_classes": NUM_CLASSES,
             "use_stratified": not args.no_stratified,
+            "max_surface_points": args.max_surface_points,
+            "max_surface_memory_mib": args.max_surface_memory_mib,
+            "max_parallel_memory_mib": args.max_parallel_memory_mib,
         },
+        "resolution_contract": config.resolution_metadata(),
+        "parallel_surface_estimated_peak_memory_mib": estimated_parallel_mib,
         "generated_at": datetime.now().isoformat(),
         "train_count": args.train_count,
         "val_count": args.val_count,

@@ -205,6 +205,9 @@ class SyntheticRoadDataset(_DatasetBase):
         config: GeneratorConfig,
         dataset_size: int = 2000,
     ) -> None:
+        # Re-run the preflight here because dataclass instances are mutable and
+        # callers may have changed the road geometry after construction.
+        self.surface_estimate = config.validate_surface_budget()
         self.config = config
         self.dataset_size = dataset_size
 
@@ -239,9 +242,9 @@ class SyntheticRoadDataset(_DatasetBase):
         7. 强度反射率计算 (P0-2)
         8. LiDAR 噪声仿真 (P2-3: 仅高曲率边缘混合)
         9. 最近邻传递标签/特征/法向量 (P0-4: 带距离阈值)
-        10. 体素下采样 (P1-2) 或 num_points 重采样
+        10. 传感器输出密度体素化或固定点数重采样
         11. 坐标归一化
-        12. 特征拼接
+        12. 特征拼接与三层分辨率元数据
 
         Args:
             idx: 场景索引，用于种子生成 (config.seed + idx)。
@@ -263,6 +266,7 @@ class SyntheticRoadDataset(_DatasetBase):
         grid_res = self.config.road.grid_res
         width = self.config.road.width
         length = self.config.road.length
+        surface_estimate = self.config.validate_surface_budget()
 
         # 1. 路面类型选择
         pavement_type = (
@@ -280,6 +284,11 @@ class SyntheticRoadDataset(_DatasetBase):
             roughness_class=self.config.road.roughness_class,
             seed=int(rng.integers(0, 2 ** 31)),
         )
+        if len(points) != surface_estimate.point_count:
+            raise RuntimeError(
+                "Surface preflight mismatch: estimated "
+                f"{surface_estimate.point_count:,} points but generated {len(points):,}."
+            )
 
         if self.config.micro_texture.amplitude > 0.0:
             points, normals = add_micro_texture(
@@ -305,6 +314,7 @@ class SyntheticRoadDataset(_DatasetBase):
             if len(scan_idx) > 10:
                 points = points[scan_idx]
                 normals = normals[scan_idx]
+        scan_pattern_points = int(len(points))
         # 3. 标签初始化 + 病害选择 & 应用
         labels = np.zeros(points.shape[0], dtype=np.int64)
 
@@ -482,8 +492,23 @@ class SyntheticRoadDataset(_DatasetBase):
                 changed_indices = np.where(changed_mask)[0]
                 labels[changed_indices[restore]] = old_labels[changed_indices[restore]]
 
-        # 4. 曲率计算 — P2-2: KDTree 局部邻域，解除网格顺序依赖
-        curvature = _compute_kdtree_curvature(points, k_neighbors=20)
+        # 4. Curvature for sensor edge mixing.  The full-resolution surface is
+        # still a regular grid unless scan-line resampling was enabled.  A
+        # finite-difference fast path avoids millions of individual KDTree
+        # queries for 2-5 mm synthesis while retaining the irregular-cloud
+        # fallback for scan-pattern data.
+        if (
+            not self.config.lidar_scan.enable
+            and len(points) == surface_estimate.point_count
+        ):
+            curvature = _compute_grid_curvature(
+                points[:, 2].reshape(surface_estimate.grid_shape),
+                grid_res,
+            ).reshape(-1).astype(np.float32)
+            curvature_method = "regular_grid_finite_difference"
+        else:
+            curvature = _compute_kdtree_curvature(points, k_neighbors=20)
+            curvature_method = "kdtree_pca"
 
         # 5. 应用松散 (raveling) — 产生 NaN 点
         if raveling_entry is not None:
@@ -570,6 +595,7 @@ class SyntheticRoadDataset(_DatasetBase):
 
         if noisy_points.shape[0] == 0:
             raise RuntimeError("All points dropped during LiDAR noise simulation.")
+        sensor_points_before_output_sampling = int(len(noisy_points))
 
         # 9. 最近邻传递标签/特征/法向量（带距离阈值保护）
         # P0-4: 增加距离阈值，防止标签溢出/侵蚀
@@ -597,7 +623,17 @@ class SyntheticRoadDataset(_DatasetBase):
         restore_mask = uncertain_mask & crack_mask
         labels[restore_mask] = 0
 
-        # 10. P1-2: 使用体素下采样替代随机重采样
+        # 10. Sensor/output sampling.  This is separate from the downstream
+        # model target point count, which is recorded but never applied here.
+        # protection_available stays False on the density_voxel path: voxel
+        # majority voting offers no minimum-survival guarantee, and the audit
+        # record must not imply one.
+        protection_info: Dict = {
+            "protected_label": -1 if target_label is None else int(target_label),
+            "protected_min_points": int(self.config.target_label_min_output_points),
+            "protection_available": False,
+            "protection_applied": False,
+        }
         if self.config.target_density is not None and self.config.target_density > 0:
             road_area = width * length
             target_count = int(road_area * self.config.target_density)
@@ -612,14 +648,26 @@ class SyntheticRoadDataset(_DatasetBase):
                     voxel_size=effective_voxel_size,
                 )
             )
+            sensor_output_sampling_method = "density_voxel"
         else:
             # 回退到旧的 num_points 硬重采样
-            points_final, labels_final, intensity_final, curvature_final, normals_final = (
-                self._resample_to_target(
-                    noisy_points, labels, intensity, curvature, normals,
-                    self.config.num_points, rng, protected_label=target_label,
-                )
+            (
+                points_final,
+                labels_final,
+                intensity_final,
+                curvature_final,
+                normals_final,
+                protection_info,
+            ) = self._resample_to_target(
+                noisy_points, labels, intensity, curvature, normals,
+                self.config.num_points, rng,
+                protected_label=target_label,
+                protected_min_points=self.config.target_label_min_output_points,
             )
+            sensor_output_sampling_method = "fixed_count_random"
+
+        physical_bounds_min_m = points_final.min(axis=0).astype(np.float64)
+        physical_bounds_max_m = points_final.max(axis=0).astype(np.float64)
 
         # 11. 坐标归一化
         coordinate_center = np.zeros(3, dtype=np.float32)
@@ -642,6 +690,42 @@ class SyntheticRoadDataset(_DatasetBase):
             k_neighbors=DEFAULT_GEOMETRY_K_NEIGHBORS,
         )
 
+        resolution_metadata = self.config.resolution_metadata(
+            actual_output_points=len(points_final)
+        )
+        resolution_metadata["surface_grid"]["curvature_method"] = curvature_method
+        resolution_metadata["sensor_output"].update(
+            {
+                "scan_pattern_points": scan_pattern_points,
+                "points_before_output_sampling": sensor_points_before_output_sampling,
+                "sampling_method": sensor_output_sampling_method,
+                "output_to_surface_point_ratio": (
+                    len(points_final) / surface_estimate.point_count
+                ),
+                "fixed_count_upsampling_used": bool(
+                    sensor_output_sampling_method == "fixed_count_random"
+                    and len(points_final) > sensor_points_before_output_sampling
+                ),
+            }
+        )
+        # Audit trail for controlled scenes: record how many target-label
+        # points actually survived output sampling and whether the minimum
+        # survival protection had to intervene.
+        if target_label is not None:
+            target_output_points = int(np.count_nonzero(labels_final == target_label))
+            protection_info["target_label_output_points"] = target_output_points
+            protection_info["target_label_output_ratio"] = (
+                target_output_points / max(len(labels_final), 1)
+            )
+        resolution_metadata["sensor_output"]["target_label_protection"] = protection_info
+        resolution_metadata["physical_coordinates"] = {
+            "unit": "m",
+            "bounds_min_m": physical_bounds_min_m.tolist(),
+            "bounds_max_m": physical_bounds_max_m.tolist(),
+            "stored_coordinates_normalized": coordinates_normalized,
+            "normalization_is_reversible": True,
+        }
+
         return {
             "points": points_final,
             "labels": labels_final.astype(np.int64),
@@ -655,6 +739,17 @@ class SyntheticRoadDataset(_DatasetBase):
             "coordinate_center": coordinate_center.astype(np.float32),
             "coordinate_scale": float(coordinate_scale),
             "coordinates_normalized": coordinates_normalized,
+            "resolution_metadata": resolution_metadata,
+            "resolution_contract": resolution_metadata["contract_version"],
+            "surface_grid_spacing_m": float(grid_res),
+            "surface_grid_shape": np.asarray(surface_estimate.grid_shape, dtype=np.int64),
+            "surface_grid_point_count": int(surface_estimate.point_count),
+            "sensor_output_point_count": int(len(points_final)),
+            "model_target_points": (
+                -1
+                if self.config.model_target_points is None
+                else int(self.config.model_target_points)
+            ),
         }
 
     def _select_pavement_type(self, rng: np.random.Generator) -> str:
@@ -820,34 +915,48 @@ class SyntheticRoadDataset(_DatasetBase):
         target_num: int,
         rng: np.random.Generator,
         protected_label: int | None = None,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """重采样到目标点数。多于目标则随机下采样，少于目标则随机重复补齐。"""
+        protected_min_points: int = 1,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict]:
+        """重采样到目标点数。多于目标则随机下采样，少于目标则随机重复补齐。
+
+        受控场景 (protected_label 非 None) 先做自然随机下采样，只有当目标
+        标签的自然存活点数低于 protected_min_points 时才强制补足到最低数量。
+        不再保留任何固定比例配额，因此输出场景的病害点比例反映自然
+        prevalence，而不是被生成器人为固定。
+        """
         N = points.shape[0]
+        protection_info = {
+            "protected_label": -1 if protected_label is None else int(protected_label),
+            "protected_min_points": int(protected_min_points),
+            "protection_available": True,
+            "protection_applied": False,
+        }
         if N == target_num:
-            return points, labels, intensity, curvature, normals
+            return points, labels, intensity, curvature, normals, protection_info
 
         if N > target_num:
-            if protected_label is None:
-                idx = rng.choice(N, size=target_num, replace=False)
-            else:
+            idx = rng.choice(N, size=target_num, replace=False)
+            if protected_label is not None and protected_min_points > 0:
                 protected_idx = np.flatnonzero(labels == protected_label)
-                other_idx = np.flatnonzero(labels != protected_label)
-                if len(protected_idx) == 0:
-                    idx = rng.choice(N, size=target_num, replace=False)
-                else:
-                    protected_quota = min(
-                        len(protected_idx), max(1, int(np.ceil(target_num * 0.10)))
+                min_keep = min(len(protected_idx), protected_min_points, target_num)
+                natural_kept = int(np.count_nonzero(labels[idx] == protected_label))
+                if natural_kept < min_keep:
+                    kept_protected = rng.choice(protected_idx, size=min_keep, replace=False)
+                    remaining_pool = np.setdiff1d(
+                        np.arange(N), kept_protected, assume_unique=False
                     )
-                    kept_protected = rng.choice(
-                        protected_idx, size=protected_quota, replace=False
+                    kept_other = rng.choice(
+                        remaining_pool, size=target_num - min_keep, replace=False
                     )
-                    remaining = target_num - protected_quota
-                    if len(other_idx) >= remaining:
-                        kept_other = rng.choice(other_idx, size=remaining, replace=False)
-                    else:
-                        available = np.setdiff1d(np.arange(N), kept_protected, assume_unique=False)
-                        kept_other = rng.choice(available, size=remaining, replace=False)
                     idx = np.concatenate((kept_protected, kept_other))
+                    protection_info["protection_applied"] = True
+                    # min_keep is capped by the surviving pool: record the
+                    # value actually enforced so the audit record cannot be
+                    # read as "at least protected_min_points points exist".
+                    protection_info["effective_min_keep"] = int(min_keep)
+                    protection_info["min_unreachable"] = bool(
+                        min_keep < protected_min_points
+                    )
         else:
             n_extra = target_num - N
             extra_idx = rng.choice(N, size=n_extra, replace=True)
@@ -859,6 +968,7 @@ class SyntheticRoadDataset(_DatasetBase):
             intensity[idx],
             curvature[idx],
             normals[idx],
+            protection_info,
         )
 
     @staticmethod

@@ -113,6 +113,19 @@ def _save_scene(scene_id: int) -> dict:
             coordinate_center=scene["coordinate_center"],
             coordinate_scale=scene["coordinate_scale"],
             coordinates_normalized=scene["coordinates_normalized"],
+            resolution_metadata_json=np.asarray(
+                json.dumps(
+                    scene["resolution_metadata"],
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            ),
+            resolution_contract=scene["resolution_contract"],
+            surface_grid_spacing_m=scene["surface_grid_spacing_m"],
+            surface_grid_shape=scene["surface_grid_shape"],
+            surface_grid_point_count=scene["surface_grid_point_count"],
+            sensor_output_point_count=scene["sensor_output_point_count"],
+            model_target_points=scene["model_target_points"],
         )
         result["ok"] = True
         result["npoints"] = int(len(points))
@@ -226,13 +239,24 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=0, help="0 means auto, currently min(8, cpu_count - 2)")
     parser.add_argument("--chunksize", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--grid-res", type=float, default=0.01)
+    parser.add_argument("--grid-res", type=float, default=0.005)
     parser.add_argument("--num-points", type=int, default=8192)
     parser.add_argument("--target-density", type=float, default=None)
     parser.add_argument("--pavement", choices=["asphalt", "concrete", "mixed"], default="mixed")
     parser.add_argument("--roughness", choices=["A", "B", "C", "D", "E"], default="B")
     parser.add_argument("--max-diseases", type=int, default=3)
     parser.add_argument("--no-stratified", action="store_true")
+    parser.add_argument(
+        "--max-parallel-memory-mib",
+        type=float,
+        default=8192.0,
+        help="aggregate surface-synthesis memory budget across all workers (MiB)",
+    )
+    parser.add_argument(
+        "--allow-grid-res-mismatch",
+        action="store_true",
+        help="expand a dataset even when its recorded grid_res differs from --grid-res",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -247,6 +271,32 @@ def main() -> None:
 
     workers = _auto_workers() if args.workers <= 0 else args.workers
     output_dir = Path(args.output_dir)
+
+    # Appending scenes generated at a different physical surface resolution
+    # would silently mix regimes inside one train/val split.  Compare against
+    # whichever metadata file the existing dataset carries.
+    for metadata_name in ("expansion_metadata.json", "metadata.json"):
+        metadata_file = output_dir / metadata_name
+        if not metadata_file.exists():
+            continue
+        try:
+            with open(metadata_file, encoding="utf-8") as handle:
+                recorded = json.load(handle).get("config", {}).get("grid_res")
+        except (OSError, json.JSONDecodeError) as exc:
+            warnings.warn(f"Could not read {metadata_file}: {exc}")
+            continue
+        if recorded is not None and not np.isclose(float(recorded), args.grid_res):
+            message = (
+                f"{metadata_file} records grid_res={recorded} but --grid-res is "
+                f"{args.grid_res}; appending would mix surface resolutions in one "
+                "dataset. Pass the recorded value explicitly, or use "
+                "--allow-grid-res-mismatch to override."
+            )
+            if not args.allow_grid_res_mismatch:
+                raise SystemExit(message)
+            warnings.warn(message)
+        break
+
     config = GeneratorConfig(
         road=RoadSurfaceConfig(
             grid_res=args.grid_res,
@@ -261,6 +311,7 @@ def main() -> None:
         num_points=args.num_points,
         target_density=args.target_density,
     )
+    config.validate_parallel_budget(workers, args.max_parallel_memory_mib)
 
     print("RoadMC dataset expansion")
     print(f"output_dir={output_dir}")

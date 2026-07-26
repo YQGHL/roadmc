@@ -298,15 +298,26 @@ if __name__ == '__main__':
 
         os.makedirs(os.path.join(tmpdir, "train"), exist_ok=True)
         os.makedirs(os.path.join(tmpdir, "val"), exist_ok=True)
+        import json
+
+        def _npz_safe(scene: dict) -> dict:
+            # resolution_metadata is a nested dict; savez would pickle it into
+            # an object array that np.load(allow_pickle=False) refuses to read.
+            scene = dict(scene)
+            scene["resolution_metadata_json"] = json.dumps(
+                scene.pop("resolution_metadata"), ensure_ascii=True, sort_keys=True
+            )
+            return scene
+
         for i in range(2):
-            scene = ds.generate_scene(i)
+            scene = _npz_safe(ds.generate_scene(i))
             np.savez_compressed(
                 os.path.join(tmpdir, f"train/scene_{i:04d}.npz"),
                 **scene,
             )
         # Generate at least one val scene
         for i in range(2):
-            scene = ds.generate_scene(i + 10)
+            scene = _npz_safe(ds.generate_scene(i + 10))
             np.savez_compressed(
                 os.path.join(tmpdir, f"val/scene_{i:04d}.npz"),
                 **scene,
