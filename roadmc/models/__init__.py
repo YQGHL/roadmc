@@ -1,12 +1,14 @@
 """RoadMC model package."""
 
+# DeformableWindowAttention3D 不在导出面：默认训练路径从未使用它，
+# 且其 argmin 采样不可微、cdist 距离阵在 8GB 卡上不可用（审计 F0.4）。
+# 类保留在 window_attention.py 中作为实验性代码。
 __all__ = [
     "Swin3D",
     "PointMambaBackbone",
     "MHCConnection",
     "WindowAttention3D",
     "ShiftedWindowTransformerBlock",
-    "DeformableWindowAttention3D",
     "RoadMCSegModel",
 ]
 
@@ -21,16 +23,14 @@ def __getattr__(name: str):
     if name == "MHCConnection":
         from roadmc.models.mhc.mhc import MHCConnection
         return MHCConnection
-    if name in {"WindowAttention3D", "ShiftedWindowTransformerBlock", "DeformableWindowAttention3D"}:
+    if name in {"WindowAttention3D", "ShiftedWindowTransformerBlock"}:
         from roadmc.models.attention.window_attention import (
-            DeformableWindowAttention3D,
             ShiftedWindowTransformerBlock,
             WindowAttention3D,
         )
         return {
             "WindowAttention3D": WindowAttention3D,
             "ShiftedWindowTransformerBlock": ShiftedWindowTransformerBlock,
-            "DeformableWindowAttention3D": DeformableWindowAttention3D,
         }[name]
     if name == "RoadMCSegModel":
         from roadmc.models.model_pl import RoadMCSegModel

@@ -67,8 +67,22 @@ def effective_number_class_weights(
         denominator = -np.expm1(values[supported] * np.log(beta))
         weights[supported] = (1.0 - beta) / np.maximum(denominator, 1e-12)
     weights[supported] /= weights[supported].mean()
+    # clip 必须是最终生效语义："归一 → clip → 再归一" 会把被 clip 的
+    # 权重放大回 max_weight 之上（38 类极端不平衡下实测可达上界的
+    # ~3 倍）。迭代 clip/归一到不动点后以一次硬 clip 收尾，保证
+    # max(weights) ≤ max_weight 严格成立（均值可能略低于 1，属文档
+    # 声明的取舍）。
+    for _ in range(8):
+        clipped = np.minimum(weights[supported], max_weight)
+        mean = clipped.mean()
+        if mean <= 0:
+            break
+        renormed = clipped / mean
+        if np.all(renormed <= max_weight + 1e-9):
+            weights[supported] = renormed
+            break
+        weights[supported] = renormed
     weights[supported] = np.minimum(weights[supported], max_weight)
-    weights[supported] /= weights[supported].mean()
     return weights.astype(np.float32)
 
 

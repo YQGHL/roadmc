@@ -21,8 +21,30 @@ def _window_partition(
     coords: torch.Tensor,
     window_size: int,
     shift: bool = False,
+    mode: str = "columnar",
 ) -> Tuple[torch.Tensor, int]:
-    """Assign points to 3D windows based on normalized coordinates."""
+    """Assign points to attention windows.
+
+    两种分窗模式：
+
+    - ``columnar``（默认，2.5D 柱状）：窗口只由 (x, y) 决定，z 不参与
+      分箱。路面点云是近平面的（x/y 米级、z 毫米级）：逐轴归一化的
+      立方分窗会把毫米级高度残差拉伸成整轴，导致坑底与坑沿被切进
+      不同窗口——病害点被系统性隔离出其物理邻域。柱状窗口保证
+      病害全深度与其周边路表同窗。
+    - ``cubic``：三轴分箱（各向同性点云用）。
+
+    Shift 通过**平移分箱原点**实现（bin = floor(u·g + 0.5)，每轴产生
+    g+1 个箱，边缘窗口自然变小）——不做 mod-1 环绕。旧实现的
+    ``% 1.0`` 环绕复刻了 Swin 的 cyclic shift 却没有配套 attention
+    mask，使场景两端相距整条路面的点落入同一窗口互相 attend
+    （shifted block 中约 58% 的窗口跨越 >90% 场景范围）。平移分箱
+    无环绕即无需掩码（Stratified Transformer 的做法）。
+
+    Returns:
+        window_id: (B, N) 整型窗口编号。
+        num_windows: 编号上界（含空窗）。
+    """
     _, N, _ = coords.shape
 
     coords_min = coords.amin(dim=1, keepdim=True)
@@ -31,17 +53,93 @@ def _window_partition(
     coords_range = torch.where(coords_range < 1e-6, torch.ones_like(coords_range), coords_range)
     coords_norm = (coords - coords_min) / coords_range
 
-    grid_res = max(1, round((N / window_size) ** (1.0 / 3.0)))
-    if shift:
-        coords_norm = (coords_norm + 0.5 / grid_res) % 1.0
+    n_windows = max(1, round(N / window_size))
+    if mode == "columnar":
+        g = max(1, round(n_windows ** 0.5))
+        u = coords_norm[..., :2]  # z 不分箱
+        dims = 2
+    else:
+        g = max(1, round(n_windows ** (1.0 / 3.0)))
+        u = coords_norm
+        dims = 3
 
-    bin_idx = (coords_norm * grid_res).long().clamp(0, grid_res - 1)
+    if shift:
+        # 平移半个窗口的分箱原点：bin ∈ [0, g]，共 g+1 个箱/轴。
+        bin_idx = torch.floor(u * g + 0.5).long().clamp(0, g)
+        base = g + 1
+    else:
+        bin_idx = torch.floor(u * g).long().clamp(0, g - 1)
+        base = g
+
+    if dims == 2:
+        window_id = bin_idx[..., 0] * base + bin_idx[..., 1]
+        return window_id, base ** 2
     window_id = (
-        bin_idx[..., 0] * (grid_res * grid_res)
-        + bin_idx[..., 1] * grid_res
+        bin_idx[..., 0] * (base * base)
+        + bin_idx[..., 1] * base
         + bin_idx[..., 2]
     )
-    return window_id, grid_res ** 3
+    return window_id, base ** 3
+
+
+def _window_attention_sdpa(
+    coords: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    window_id: torch.Tensor,
+    pos_mlp: nn.Module,
+) -> torch.Tensor:
+    """Batched window attention via sort + pad + scaled_dot_product_attention.
+
+    与逐窗 Python 循环在数学上严格等价（同一 softmax(QKᵀ/√d + B)V），
+    但把每场景数百次小 kernel 调用合并为一次 SDPA——旧实现单层前向
+    39-254 ms（GPU 利用率损失 >600 倍），且 `for wid in torch.unique`
+    在 CUDA tensor 上迭代每窗触发一次 device-host 同步。
+    """
+    B, H, N, D = q.shape
+    device = q.device
+
+    # 全批展平：不同 batch 元素的窗口互不相通。
+    max_wid = int(window_id.max().item()) + 1
+    flat_wid = (window_id + torch.arange(B, device=device)[:, None] * max_wid).reshape(-1)
+    order = torch.argsort(flat_wid, stable=True)
+    sorted_wid = flat_wid[order]
+    _, counts = torch.unique_consecutive(sorted_wid, return_counts=True)
+    W = counts.shape[0]
+    M = int(counts.max().item())
+
+    # 每个排序位置的 (窗口序号, 窗口内槽位)
+    w_of = torch.repeat_interleave(torch.arange(W, device=device), counts)
+    offsets = torch.cumsum(counts, dim=0) - counts
+    slot = torch.arange(B * N, device=device) - offsets[w_of]
+
+    def pad(t: torch.Tensor) -> torch.Tensor:
+        # t: (B, H, N, D) -> (W, H, M, D)，padding 为 0
+        t_flat = t.permute(0, 2, 1, 3).reshape(B * N, H, -1)[order]
+        buf = t.new_zeros(W, M, H, t_flat.shape[-1])
+        buf[w_of, slot] = t_flat
+        return buf.permute(0, 2, 1, 3)
+
+    q_pad, k_pad, v_pad = pad(q), pad(k), pad(v)
+
+    coords_flat = coords.reshape(B * N, 3)[order]
+    coords_pad = coords.new_zeros(W, M, 3)
+    coords_pad[w_of, slot] = coords_flat
+    rel = coords_pad.unsqueeze(2) - coords_pad.unsqueeze(1)      # (W, M, M, 3)
+    bias = pos_mlp(rel).permute(0, 3, 1, 2)                       # (W, H, M, M)
+
+    valid = torch.zeros(W, M, dtype=torch.bool, device=device)
+    valid[w_of, slot] = True
+    attn_mask = bias.masked_fill(~valid[:, None, None, :], float("-inf"))
+
+    out_pad = F.scaled_dot_product_attention(q_pad, k_pad, v_pad, attn_mask=attn_mask)
+
+    out_flat = out_pad.permute(0, 2, 1, 3)[w_of, slot]            # (B·N, H, D)
+    inv = torch.empty_like(order)
+    inv[order] = torch.arange(B * N, device=device)
+    out = out_flat[inv].reshape(B, N, H, D).permute(0, 2, 1, 3)
+    return out
 
 
 def _window_attention_blockwise(
@@ -53,7 +151,7 @@ def _window_attention_blockwise(
     pos_mlp: nn.Module,
     softmax: nn.Softmax,
 ) -> torch.Tensor:
-    """Compute attention independently per window to avoid global N x N tensors."""
+    """Reference per-window loop (kept for equivalence tests only)."""
     B, H, _, D = q.shape
     out = torch.zeros_like(q)
     scale = D ** -0.5
@@ -79,8 +177,28 @@ def _window_attention_blockwise(
     return out
 
 
+class DropPath(nn.Module):
+    """Stochastic depth (Huang et al. 2016): x + b/(1-p)·F(x), b~Bernoulli."""
+
+    def __init__(self, drop_prob: float = 0.0) -> None:
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob <= 0.0 or not self.training:
+            return x
+        keep = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = torch.bernoulli(torch.full(shape, keep, device=x.device, dtype=x.dtype))
+        return x * mask / keep
+
+
 class WindowAttention3D(nn.Module):
-    """3D window attention with MLP-learned relative position bias."""
+    """Windowed point attention with MLP-learned relative position bias.
+
+    分窗默认 2.5D 柱状（z 不分箱），shift 用平移分箱原点（无环绕）；
+    注意力经 sort+pad+SDPA 批量执行，与逐窗参考实现数学等价。
+    """
 
     def __init__(
         self,
@@ -89,12 +207,14 @@ class WindowAttention3D(nn.Module):
         window_size: int = 32,
         mlp_ratio: float = 4.0,
         qkv_bias: bool = True,
+        partition_mode: str = "columnar",
     ) -> None:
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.window_size = window_size
         self.head_dim = dim // num_heads
+        self.partition_mode = partition_mode
 
         assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}"
 
@@ -124,22 +244,28 @@ class WindowAttention3D(nn.Module):
         k = k.view(B, N, H, D).transpose(1, 2)
         v = v.view(B, N, H, D).transpose(1, 2)
 
-        window_id, _ = _window_partition(coords, self.window_size, shift=shift)
-        out = _window_attention_blockwise(
+        window_id, _ = _window_partition(
+            coords, self.window_size, shift=shift, mode=self.partition_mode
+        )
+        out = _window_attention_sdpa(
             coords=coords,
             q=q,
             k=k,
             v=v,
             window_id=window_id,
             pos_mlp=self.pos_mlp,
-            softmax=self.softmax,
         )
         out = out.transpose(1, 2).reshape(B, N, C)
         return self.proj(out)
 
 
 class DeformableWindowAttention3D(nn.Module):
-    """Deformable 3D attention using learned offsets and nearest-key lookup."""
+    """EXPERIMENTAL — not wired into any backbone; do not cite as a method component.
+
+    已知缺陷（审计 F0.4，未修复）：argmin 最近邻采样不可微（offset
+    学习只剩偏置旁路）；torch.cdist 距离阵 O(N²K) 在 N=8192 时约 4GB。
+    如需启用须改为 kNN 软插值 + 局部候选检索并跑消融。
+    """
 
     def __init__(
         self,
@@ -212,7 +338,15 @@ class DeformableWindowAttention3D(nn.Module):
 
 
 class ShiftedWindowTransformerBlock(nn.Module):
-    """Transformer block with window attention and MHC connection."""
+    """Transformer block with window attention and optional DSCM mixing.
+
+    DSCM（双随机通道混合）以**乘法/凸组合**语义作用在被携带的残差流
+    上：``x_out = H·x_attn + FFN(norm(x_attn))``。双随机矩阵满足
+    σ_max(H)=1 且积仍双随机，该接线的深层复合范数有界；旧的加法
+    接线 ``y = x + H·x`` 的块雅可比含 (I+H)，沿全 1 方向特征值为 2，
+    同维块堆叠特征范数按 2^L 指数增长（审计实测 12 块 ×428）。
+    H 恒等初始化，训练起点严格等价于标准残差。
+    """
 
     def __init__(
         self,
@@ -222,6 +356,7 @@ class ShiftedWindowTransformerBlock(nn.Module):
         mlp_ratio: float = 4.0,
         shift: bool = False,
         use_mhc: bool = True,
+        drop_path: float = 0.0,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -237,14 +372,16 @@ class ShiftedWindowTransformerBlock(nn.Module):
             nn.Linear(int(dim * mlp_ratio), dim),
         )
         self.mhc = MHCConnection(dim) if use_mhc else None
+        self.drop_path = DropPath(drop_path)
 
     def forward(self, coords: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
-        x_attn = self.attn(coords, self.norm1(x), shift=self.shift) + x
-        x_ffn = self.ffn(self.norm2(x_attn)) + x_attn
+        x_attn = x + self.drop_path(self.attn(coords, self.norm1(x), shift=self.shift))
+        ffn_out = self.drop_path(self.ffn(self.norm2(x_attn)))
         if self.mhc is not None and self.use_mhc:
-            return self.mhc(x_ffn.reshape(-1, C), x_attn.reshape(-1, C)).reshape(B, N, C)
-        return x_ffn
+            mixed = self.mhc(x_attn.reshape(-1, C)).reshape(B, N, C)
+            return mixed + ffn_out
+        return x_attn + ffn_out
 
 
 if __name__ == "__main__":

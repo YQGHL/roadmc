@@ -72,14 +72,19 @@ class FocalLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor,
                 valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Compute focal loss with optional valid_mask masking. -1 target values are ignored.
+        """Compute focal loss. -1 targets are ignored unconditionally.
+
+        无 valid_mask 路径下的 -1 padding 若不过滤，gather(-1) 会回绕到
+        最后一类、alpha[-1] 同样回绕——契约声明与实现必须一致。
         """
+        keep = targets >= 0
         if valid_mask is not None:
-            logits = logits[valid_mask]
-            targets = targets[valid_mask]
-            if targets.numel() == 0:
-                return torch.tensor(0.0, device=logits.device, requires_grad=True)
-        
+            keep = keep & valid_mask
+        logits = logits[keep]
+        targets = targets[keep]
+        if targets.numel() == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
         probs = F.softmax(logits, dim=-1)  # (BxN, C) after masking
 
         # gather p_t = p[target_class] for each point
@@ -117,13 +122,16 @@ class DiceLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor,
                 valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Compute dice loss (vectorized, L2 fix) with optional valid_mask masking. -1 target values are ignored.
+        """Compute dice loss. -1 targets are ignored unconditionally
+        (F.one_hot(-1) raises; the docstring contract is now enforced).
         """
+        keep = targets >= 0
         if valid_mask is not None:
-            logits = logits[valid_mask]
-            targets = targets[valid_mask]
-            if targets.numel() == 0:
-                return torch.tensor(0.0, device=logits.device, requires_grad=True)
+            keep = keep & valid_mask
+        logits = logits[keep]
+        targets = targets[keep]
+        if targets.numel() == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
 
         num_classes = logits.shape[-1]
         probs = F.softmax(logits, dim=-1)  # (M, C) after masking
@@ -173,13 +181,21 @@ class EdgeLoss(nn.Module):
 
     def _scatter_to_bev(
         self, values: torch.Tensor, coords: torch.Tensor
-    ) -> torch.Tensor:
-        """M3+M4: Scatter per-point values to 2D BEV grid with mean aggregation + aspect ratio preservation.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Scatter per-point values to a BEV grid (mean aggregation).
 
-        Uses ``scatter_add_`` + count tracking for per-pixel mean (not "last write wins").
-        Preserves physical aspect ratio by computing grid dimensions from coordinate ranges.
+        - 保持纵横比的 (gs_y, gs_x) 栅格；Sobel 直接在非方形网格上做
+          （conv2d 不要求方形）——旧实现先保形分箱又 interpolate 拉回
+          正方形，把刚保住的纵横比再次破坏、梯度幅值各向异性。
+        - 返回占用掩码：稀疏点云在 200² 网格上 60-90% 空格，空格恒 0，
+          Sobel 在"有点/无点"边界产生的响应是栅格化伪影而非病害边界，
+          必须被掩掉。
         """
-        gs = self.grid_size
+        # 栅格分辨率由点数导出（cell ≈ 2× 平均点间距 → 每格 ~4 点），
+        # grid_size 只是上限：固定 200² 网格对 2048-16384 点意味着
+        # 60-90% 空格，Sobel 响应大量来自占用伪影而非病害边界。
+        n_pts = coords.shape[0]
+        gs = int(max(8, min(self.grid_size, round(float(n_pts) ** 0.5 / 2.0))))
         x_phys = coords[:, 0]
         y_phys = coords[:, 1]
 
@@ -191,34 +207,27 @@ class EdgeLoss(nn.Module):
         if (y_max - y_min) < 1e-6:
             y_min, y_max = y_min - 0.5, y_max + 0.5
 
-        # M4: preserve aspect ratio — scale x,y to same physical resolution
         x_range = x_max - x_min
         y_range = y_max - y_min
         if x_range > y_range:
-            gs_y = max(1, int(gs * y_range / x_range))
+            gs_y = max(3, int(gs * y_range / x_range))
             gs_x = gs
         else:
-            gs_x = max(1, int(gs * x_range / y_range))
+            gs_x = max(3, int(gs * x_range / y_range))
             gs_y = gs
 
         xi = ((x_phys - x_min) / (x_max - x_min) * (gs_x - 1)).long().clamp(0, gs_x - 1)
         yi = ((y_phys - y_min) / (y_max - y_min) * (gs_y - 1)).long().clamp(0, gs_y - 1)
 
-        # M3: mean aggregation via scatter_add_ + count tracking
         grid = torch.zeros(gs_y, gs_x, device=values.device, dtype=torch.float64)
         cnt = torch.zeros(gs_y, gs_x, device=values.device, dtype=torch.int64)
         grid.index_put_((yi, xi), values.double(), accumulate=True)
         cnt.index_put_((yi, xi), torch.ones_like(values, dtype=torch.int64), accumulate=True)
+        occupancy = (cnt > 0)
         cnt = cnt.clamp(min=1)
         grid = (grid / cnt.float()).float()
 
-        # Resize to (gs, gs) for Sobel conv
-        if gs_y != gs or gs_x != gs:
-            grid = grid.unsqueeze(0).unsqueeze(0)
-            grid = F.interpolate(grid, size=(gs, gs), mode='bilinear', align_corners=False)
-            grid = grid.squeeze(0).squeeze(0)
-
-        return grid
+        return grid, occupancy
 
     def _sobel_edge(self, grid: torch.Tensor) -> torch.Tensor:
         """Apply Sobel filter to a 2D grid.
@@ -256,17 +265,28 @@ class EdgeLoss(nn.Module):
 
             probabilities = F.softmax(logits_list[b], dim=-1)
             damage_probability = (1.0 - probabilities[..., 0]).float()
-            damage_target = (targets_list[b] != 0).float()
-            pred_grid = self._scatter_to_bev(damage_probability, coords_list[b])
-            target_grid = self._scatter_to_bev(damage_target, coords_list[b])
+            # `> 0` 而非 `!= 0`：无 valid_mask 路径下 -1 padding 不是病害。
+            damage_target = (targets_list[b] > 0).float()
+            pred_grid, occupancy = self._scatter_to_bev(damage_probability, coords_list[b])
+            target_grid, _ = self._scatter_to_bev(damage_target, coords_list[b])
 
             pred_edge = self._sobel_edge(pred_grid)
             target_edge = self._sobel_edge(target_grid)
+
+            # 只有 3×3 邻域全部有点的像素，其 Sobel 响应才来自真实的
+            # 占据值变化而非空格伪影。
+            occ = occupancy.float().unsqueeze(0).unsqueeze(0)
+            interior = (-F.max_pool2d(-occ, kernel_size=3, stride=1, padding=1))
+            interior = interior.squeeze(0).squeeze(0)
+            pred_edge = pred_edge * interior
+            target_edge = target_edge * interior
+
             boundary = (target_edge > 1e-3).float().unsqueeze(0).unsqueeze(0)
             if self.boundary_dilation > 0:
                 kernel = 2 * self.boundary_dilation + 1
                 boundary = F.max_pool2d(boundary, kernel_size=kernel, stride=1, padding=self.boundary_dilation)
             weights = 1.0 + self.boundary_weight * boundary.squeeze(0).squeeze(0)
+            weights = weights * interior
             losses.append(((pred_edge - target_edge).abs() * weights).sum() / weights.sum().clamp_min(1.0))
 
         if not losses:
@@ -308,6 +328,7 @@ class RoadMCSegModel(pl.LightningModule):
         metric_min_support: int = 1,
         validation_bootstrap_samples: int = 0,
         validation_bootstrap_seed: int = 42,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
         if feature_schema != OBSERVABLE_FEATURE_SCHEMA:
@@ -336,6 +357,7 @@ class RoadMCSegModel(pl.LightningModule):
             mlp_ratio=mlp_ratio,
             use_checkpoint=use_checkpoint,
             use_mhc=use_mhc,
+            drop_path_rate=drop_path_rate,
         )
 
         self.focal_loss = FocalLoss(gamma=2.0, alpha=class_weights)
@@ -514,23 +536,30 @@ class RoadMCSegModel(pl.LightningModule):
                 continue
             if "decode.cls_head" in name and param.ndim == 2:
                 head_params.append(param)
-            elif param.ndim == 2:
+            elif param.ndim == 2 and not self._is_muon_excluded(name):
                 matrix_params.append(param)
             else:
                 adamw_params.append(param)
 
         if optimizer_name == "muon":
+            # Muon 只作用于 hidden 2D 矩阵（Muon 惯例 + torch 文档）：
+            # 分类头、patch embed 首层、经 Sinkhorn 非线性作用的 DSCM
+            # log-核都归 AdamW——旧路由把它们全交给 Muon（头还给了
+            # 3× lr），方向相反。adjust_lr_fn="match_rms_adamw"
+            # (0.2·γ·√max(A,B)) 使更新 RMS 与 AdamW 匹配；默认的
+            # "original" (√max(1,A/B)) 在方阵下更新 RMS 小一个量级，
+            # Muon 支路事实欠训练，此前的 Muon vs AdamW 对比无效。
             muon_groups = []
             if matrix_params:
                 muon_groups.append(
                     {"params": matrix_params, "lr": self.lr, "weight_decay": self.weight_decay}
                 )
-            if head_params:
-                muon_groups.append(
-                    {"params": head_params, "lr": self.lr * 3.0, "weight_decay": self.weight_decay * 0.5}
-                )
 
             adamw_groups = []
+            if head_params:
+                adamw_groups.append(
+                    {"params": head_params, "lr": self.lr, "weight_decay": self.weight_decay * 0.5}
+                )
             if adamw_params:
                 adamw_groups.append(
                     {"params": adamw_params, "lr": self.lr, "weight_decay": 0.0}
@@ -540,6 +569,7 @@ class RoadMCSegModel(pl.LightningModule):
                 muon_groups,
                 momentum=0.95,
                 nesterov=True,
+                adjust_lr_fn="match_rms_adamw",
             )
             if adamw_groups:
                 adamw = torch.optim.AdamW(
@@ -571,10 +601,27 @@ class RoadMCSegModel(pl.LightningModule):
             )
         else:
             raise ValueError(f"Unsupported optimizer_name: {optimizer_name}")
-        # T_max can be set via init param or defaults to 50
-        t_max = getattr(self, 't_max', 50)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max)
+        # 1 epoch 线性 warmup + cosine 到 t_max（t_max 应等于计划训练
+        # epoch 数——train.py 已接线；与 max_epochs 解耦会使不同 run 的
+        # lr 轨迹不可比）。
+        t_max = max(int(getattr(self, 't_max', 50)), 2)
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0, total_iters=1
+        )
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max - 1)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[1]
+        )
         return optimizer, scheduler
+
+    @staticmethod
+    def _is_muon_excluded(name: str) -> bool:
+        """Hidden-matrix filter: embeddings and non-linear-operator params go to AdamW."""
+        return (
+            "patch_embed" in name
+            or ".mhc.log_kernel" in name
+            or name.endswith("mhc.log_kernel")
+        )
 
     @staticmethod
     def compute_miou(

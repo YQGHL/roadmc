@@ -152,7 +152,13 @@ def _augment_point_cloud(
     coords: torch.Tensor,
     normals: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply data augmentation: random rotation, translation, scaling."""
+    """Apply feature-preserving augmentation: z-rotation + translation.
+
+    只使用保持可观测特征不变的增广群：绕 z 旋转（两个几何特征均
+    旋转不变）与平移。各向同性缩放会改变 signed_local_height_residual
+    的物理量纲而 feats 未重算——违反"特征必须对应喂给模型的那个
+    点云"的契约，故移除。
+    """
     angle = torch.rand(1).item() * 2 * torch.pi
     c, s = float(torch.cos(torch.tensor(angle))), float(torch.sin(torch.tensor(angle)))
     rot_z = torch.tensor([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
@@ -161,9 +167,6 @@ def _augment_point_cloud(
 
     translation = torch.randn(3) * 0.2
     coords = coords + translation
-
-    scale = 0.8 + torch.rand(1) * 0.4
-    coords = coords * scale
 
     return coords, normals
 
