@@ -4,7 +4,7 @@
 
 **物理约束的路面点云生成与病害分割**
 
-合成点云 · 可观测几何特征 · Swin3D / PointMamba · mHC · Muon / AdamW
+合成点云 · 可观测几何特征 · Swin3D / 门控 EMA · DSCM · Muon / AdamW
 
 [English](README.en.md)
 
@@ -37,13 +37,13 @@ RoadMC 包含两个同等重要的模块：
   <img src="readmeimage/training_pipeline.png" alt="RoadMC point-wise segmentation and evaluation pipeline" width="92%" />
 </p>
 
-训练管线从左到右为场景加载、按数据划分执行的抽样、输入嵌入、骨干编码、mHC/解码以及损失和指标聚合。整体路线为：
+训练管线从左到右为场景加载、按数据划分执行的抽样、输入嵌入、骨干编码、DSCM/解码以及损失和指标聚合。整体路线为：
 
 ```text
 路面形貌 + 病害形变 + LiDAR 观测
         -> 带标签的场景文件 (.npz)
         -> 可观测输入特征
-        -> Swin3D / PointMamba + mHC
+        -> Swin3D / 门控 EMA + DSCM
         -> 逐点 logits 与全局评估报告
 ```
 
@@ -54,9 +54,10 @@ RoadMC 包含两个同等重要的模块：
 | 训练任务 | 二分类：背景 `0` / 病害 `1` |
 | 生成器 | 自然 prevalence 采样 + 分辨率/保护审计契约（2026-07） |
 | 历史基线 | Disease IoU `0.7235`，产自已移除的固定 10% 配额生成器，**证据效力已失效** |
-| 当前基线 | v2 重建中：自然 prevalence 数据 + 独立 train/val/test 三分 |
-| 当前模型 | `Swin3D + mHC + Muon/AdamW` |
-| 自动化测试 | `52/52` 通过 |
+| 当前基线 v2 | ✅ Disease IoU `0.4781` [0.4435, 0.5105]（独立 test，阈值 0.32，ECE 0.0028） |
+| 当前模型 | `Swin3D + DSCM + Muon/AdamW` |
+| R2 消融 | ⏳ 进行中（mixing 维 seed42：none / dscm 已出 test，hc2 待评估） |
+| 自动化测试 | `111/111` 通过 |
 | 真实域状态 | 已完成无标签点云域差诊断，尚无真实语义 mIoU |
 
 ## 安装
@@ -172,8 +173,8 @@ roadmc.observable_features.v1
 | 模块 | 选择 | 作用 |
 | --- | --- | --- |
 | Backbone | `swin3d` | 窗口化点云 Transformer，多阶段特征提取 |
-| Backbone | `pointmamba` | Morton 顺序点序列混合，显存更友好 |
-| mHC | 默认开启 | Sinkhorn 风格通道混合，改善深层特征流动 |
+| Backbone | `pointmamba` | 门控 EMA 点序列混合（PointMamba-inspired），显存更友好 |
+| DSCM | 默认开启 | 双随机通道混合（Sinkhorn，原 mHC）；CLI 仍用 `--use_mhc` / `--mixing dscm` |
 | Head | per-point classifier | 输出每个点的类别 logits |
 | Loss | Focal + Dice + supervised BEV Edge | 处理类别不平衡并增强边界监督 |
 | Optimizer | hybrid Muon + AdamW | 矩阵参数使用 Muon，一维参数使用 AdamW |
@@ -225,7 +226,7 @@ python roadmc/scripts/quick_diagnose.py `
 binary -> four -> eight -> full38
 ```
 
-每个阶段复用 backbone 和 mHC 权重，重新初始化任务分类头：
+每个阶段复用 backbone 和 DSCM 权重，重新初始化任务分类头：
 
 ```powershell
 python roadmc/train.py baseline `
@@ -259,7 +260,7 @@ python roadmc/evaluate.py `
   --output-json ./output/evaluation.json
 ```
 
-**历史基线（已被取代）**：2026-07 之前的二分类证据——独立 Disease IoU `0.7235`、Precision/Recall `0.8874 / 0.7966`、ECE `0.0020`、bootstrap 95% CI `[0.7070, 0.7391]`——产自旧生成器。该版本对每个受控场景强制保留约 `10%` 的目标类别点数，验证集病害比例因此是人为固定的，IoU、校准指标和阈值选择都受其影响。此配额已移除，改为自然 prevalence 采样加最低存活审计；上述数字保留仅作历史记录，不再作为当前性能声明。基线 v2 将在自然 prevalence 数据与独立 test split 上重建，预期 IoU 会低于历史数字——这是纠偏而不是退步。
+**历史基线（已被取代）**：2026-07 之前的二分类证据——独立 Disease IoU `0.7235`、Precision/Recall `0.8874 / 0.7966`、ECE `0.0020`、bootstrap 95% CI `[0.7070, 0.7391]`——产自旧生成器。该版本对每个受控场景强制保留约 `10%` 的目标类别点数，验证集病害比例因此是人为固定的，IoU、校准指标和阈值选择都受其影响。此配额已移除，改为自然 prevalence 采样加最低存活审计；上述数字保留仅作历史记录，不再作为当前性能声明。基线 v2 已在自然 prevalence 数据与独立 test split 上重建并定稿：test disease IoU `0.4781`（阈值 0.32，bootstrap 95% CI `[0.4435, 0.5105]`，ECE `0.0028`），低于旧 0.7235 属预期内的纠偏而非退步——详见 `TECHNICAL_REPORT_v2.md` §3。
 
 ## 真实点云与域差诊断
 
@@ -329,9 +330,9 @@ roadmc/
     synthetic/             # 粗糙度、病害基元、标签和生成器
   models/
     attention/             # window attention
-    backbone/              # Swin3D / PointMamba
+    backbone/              # Swin3D / 门控 EMA mixer
     gan/                   # 实验性生成器和判别器（当前冻结）
-    mhc/                   # mHC 与谱分析
+    mhc/                   # DSCM 通道混合与谱分析（原 mHC）
     model_pl.py
   scripts/                 # 生成、验证、评估和域差诊断
   domain_gap.py
@@ -353,13 +354,15 @@ readmeimage/
 - 移除受控场景的固定 10% 目标类别配额，改为自然 prevalence 采样 + 最低存活保护，保护行为逐场景写入审计元数据。
 - 建立三层分辨率契约（表面网格 / 传感器输出 / 模型输入）与生成前内存预算校验，生成脚本拒绝混合采样体制或混合分辨率续跑。
 - 完成米制坐标 patch 切分模块（尚未接入训练）。
-- 在 RTX 5060 Laptop 8 GB 上完成带 mHC 的二分类 GPU 验证及 4/8/38 类迁移 smoke test。
-- `52/52` 项自动化测试通过。
+- 在 RTX 5060 Laptop 8 GB 上完成带 DSCM 的二分类 GPU 验证及 4/8/38 类迁移 smoke test。
+- 完成可信二分类基线 v2：自然 prevalence 数据 + 独立 train/val/test 三分，test disease IoU `0.4781` [0.4435, 0.5105]，ECE `0.0028`（旧 0.7235 双重失效，仅作历史）。
+- 实现 n 流 Hyper-Connections 消融臂（`--mixing {none,dscm,hc2,hc4}`）并启动 R2 消融矩阵。
+- `111/111` 项自动化测试通过。
 
 ### 路线图
 
-1. 在自然 prevalence 数据上重建可信二分类基线 v2：独立 train/val/test 三分、val 选阈值、test 一次性报告带 CI 的结果。
-2. 在冻结的 v2 数据上做 Swin3D / PointMamba × mHC × Muon/AdamW 统一协议消融。
+1. ~~重建可信二分类基线 v2~~ ✅ 已完成（test IoU 0.4781）。
+2. 在冻结的 v2 数据上做 Swin3D / 门控 EMA × DSCM / HC × Muon/AdamW 统一协议消融（⏳ 进行中，mixing 维已出 seed42 初步结果）。
 3. 接入 patch 管线，执行 `2048 / 4096 / 8192 / 16384` 输入密度消融（bootstrap 按源场景聚合）。
 4. 校准传感器层（扫描密度、强度物理模型）以收敛域差诊断中的剩余差距。
 5. 获取带可靠标签、坐标单位和 JTG 映射的真实道路点云，之后再评估域随机化或域适配。

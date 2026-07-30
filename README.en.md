@@ -4,7 +4,7 @@
 
 **Physics-grounded pavement point-cloud synthesis and damage segmentation**
 
-Synthetic point clouds · observable geometry · Swin3D / PointMamba · mHC · Muon / AdamW
+Synthetic point clouds · observable geometry · Swin3D / gated-EMA · DSCM · Muon / AdamW
 
 [中文](README.md)
 
@@ -37,13 +37,13 @@ The synthesis pipeline moves from pavement priors through surface realization, d
   <img src="readmeimage/training_pipeline.png" alt="RoadMC point-wise segmentation and evaluation pipeline" width="92%" />
 </p>
 
-The training pipeline moves from scene loading and split-aware sampling through input embedding, backbone encoding, mHC/decoding, and metric aggregation:
+The training pipeline moves from scene loading and split-aware sampling through input embedding, backbone encoding, DSCM/decoding, and metric aggregation:
 
 ```text
 road morphology + damage deformation + LiDAR observation
         -> labeled scene files (.npz)
         -> observable input features
-        -> Swin3D / PointMamba + mHC
+        -> Swin3D / gated-EMA + DSCM
         -> point-wise logits and global evaluation reports
 ```
 
@@ -54,9 +54,10 @@ road morphology + damage deformation + LiDAR observation
 | Task | Binary segmentation: background `0` / damage `1` |
 | Generator | Natural-prevalence sampling + resolution/protection audit contract (2026-07) |
 | Historical baseline | Disease IoU `0.7235`, produced by the removed fixed-10%-quota generator — **no longer valid evidence** |
-| Current baseline | v2 rebuild in progress: natural-prevalence data + independent train/val/test |
-| Current model | `Swin3D + mHC + Muon/AdamW` |
-| Automated tests | `52/52` passed |
+| Current baseline v2 | ✅ Disease IoU `0.4781` [0.4435, 0.5105] (independent test, threshold 0.32, ECE 0.0028) |
+| Current model | `Swin3D + DSCM + Muon/AdamW` |
+| R2 ablation | ⏳ In progress (mixing axis, seed42: none / dscm evaluated, hc2 pending) |
+| Automated tests | `111/111` passed |
 | Real-domain status | Unlabeled domain-gap diagnostics only; no real semantic mIoU yet |
 
 ## Installation
@@ -170,8 +171,8 @@ The same contract is used for synthetic scenes, legacy `.npz` files, and real po
 | Module | Choice | Role |
 | --- | --- | --- |
 | Backbone | `swin3d` | Windowed point-cloud Transformer with multi-stage features |
-| Backbone | `pointmamba` | Morton-order point sequence mixer with lower memory cost |
-| mHC | Enabled by default | Sinkhorn-style channel mixing for feature flow |
+| Backbone | `pointmamba` | Gated-EMA point sequence mixer (PointMamba-inspired), lower memory cost |
+| DSCM | Enabled by default | Doubly-stochastic channel mixing (Sinkhorn, formerly mHC); CLI alias `--use_mhc` / `--mixing dscm` |
 | Head | Per-point classifier | Produces point-wise class logits |
 | Loss | Focal + Dice + supervised BEV Edge | Handles imbalance and adds boundary supervision |
 | Optimizer | Hybrid Muon + AdamW | Muon for matrix parameters, AdamW for 1D parameters |
@@ -223,7 +224,7 @@ The supported label spaces are:
 binary -> four -> eight -> full38
 ```
 
-Each stage reuses the backbone and mHC weights while reinitializing the task-specific classifier head:
+Each stage reuses the backbone and DSCM weights while reinitializing the task-specific classifier head:
 
 ```powershell
 python roadmc/train.py baseline `
@@ -257,7 +258,7 @@ python roadmc/evaluate.py `
   --output-json ./output/evaluation.json
 ```
 
-**Historical baseline (superseded).** The pre-2026-07 binary evidence — independent Disease IoU `0.7235`, precision/recall `0.8874 / 0.7966`, ECE `0.0020`, bootstrap 95% CI `[0.7070, 0.7391]` — was produced by an earlier generator that force-retained roughly `10%` target-class points in every controlled scene. Validation prevalence was therefore artificially pinned, which contaminates IoU, calibration metrics, and threshold selection alike. That quota has been removed in favor of natural-prevalence sampling with an audited minimum-survival floor. The numbers above are kept for the historical record only and are no longer presented as current performance. Baseline v2 will be rebuilt on natural-prevalence data with an independent test split; its IoU is expected to be lower — a correction, not a regression.
+**Historical baseline (superseded).** The pre-2026-07 binary evidence — independent Disease IoU `0.7235`, precision/recall `0.8874 / 0.7966`, ECE `0.0020`, bootstrap 95% CI `[0.7070, 0.7391]` — was produced by an earlier generator that force-retained roughly `10%` target-class points in every controlled scene. Validation prevalence was therefore artificially pinned, which contaminates IoU, calibration metrics, and threshold selection alike. That quota has been removed in favor of natural-prevalence sampling with an audited minimum-survival floor. The numbers above are kept for the historical record only and are no longer presented as current performance. Baseline v2 has since been rebuilt and finalized on natural-prevalence data with an independent test split: test disease IoU `0.4781` (threshold 0.32, bootstrap 95% CI `[0.4435, 0.5105]`, ECE `0.0028`), lower than the old 0.7235 as an expected correction rather than a regression — see `TECHNICAL_REPORT_v2.md` §3.
 
 ## Real Point Clouds and Domain Diagnostics
 
@@ -327,9 +328,9 @@ roadmc/
     synthetic/             # roughness, primitives, labels, generator
   models/
     attention/             # window attention
-    backbone/              # Swin3D / PointMamba
+    backbone/              # Swin3D / gated-EMA mixer
     gan/                   # experimental generator and discriminator (frozen)
-    mhc/                   # mHC and spectral analysis
+    mhc/                   # DSCM channel mixing and spectral analysis (formerly mHC)
     model_pl.py
   scripts/                 # synthesis, validation, evaluation, diagnostics
   domain_gap.py
@@ -351,13 +352,15 @@ readmeimage/
 - Removed the fixed 10% target-class quota in controlled scenes in favor of natural-prevalence sampling with a minimum-survival floor; every protection intervention is written to per-scene audit metadata.
 - Established the three-tier resolution contract (surface grid / sensor output / model input) with pre-generation memory budgeting; generation scripts refuse mixed-regime or mixed-resolution resumes.
 - Implemented metric-coordinate patch extraction (not yet wired into training).
-- Completed GPU binary validation with mHC on an RTX 5060 Laptop and transfer smoke tests for the 4/8/38-class stages.
-- `52/52` automated tests pass.
+- Completed GPU binary validation with DSCM on an RTX 5060 Laptop and transfer smoke tests for the 4/8/38-class stages.
+- Completed the credible binary baseline v2: natural-prevalence data + independent train/val/test, test disease IoU `0.4781` [0.4435, 0.5105], ECE `0.0028` (the old 0.7235 is double-invalidated and kept for the record only).
+- Implemented n-stream Hyper-Connections as an ablation arm (`--mixing {none,dscm,hc2,hc4}`) and started the R2 ablation matrix.
+- `111/111` automated tests pass.
 
 ### Roadmap
 
-1. Rebuild a credible binary baseline v2 on natural-prevalence data: independent train/val/test splits, threshold selection on val, a single CI-reported evaluation on test.
-2. Run Swin3D / PointMamba × mHC × Muon/AdamW ablations under one protocol on the frozen v2 data.
+1. ~~Rebuild a credible binary baseline v2~~ ✅ Done (test IoU 0.4781).
+2. Run Swin3D / gated-EMA × DSCM / HC × Muon/AdamW ablations under one protocol on the frozen v2 data (⏳ in progress; the mixing axis has seed42 preliminary results).
 3. Wire in the patch pipeline and run the `2048 / 4096 / 8192 / 16384` input-density ablation (bootstrap aggregated by source scene).
 4. Calibrate the sensor layer (scan density, intensity physics) to close the remaining domain-gap terms.
 5. Acquire real road scans with reliable labels, coordinate units, and a verified JTG mapping before evaluating domain randomization or adaptation.
