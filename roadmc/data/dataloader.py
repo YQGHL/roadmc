@@ -44,6 +44,7 @@ class SyntheticPointCloudDataset(Dataset):
         binary: bool = False,
         label_stage: Optional[str] = None,
         recompute_legacy_features: bool = True,
+        train_disease_ratio: float = 0.5,
     ):
         self.data_dir = Path(data_dir)
         self.split = split
@@ -58,6 +59,9 @@ class SyntheticPointCloudDataset(Dataset):
         self._label_lut = torch.tensor(label_lut(self.label_stage), dtype=torch.long)
         self.recompute_legacy_features = recompute_legacy_features
         self._legacy_feature_warning_emitted = False
+        if not 0.0 < train_disease_ratio <= 1.0:
+            raise ValueError(f"train_disease_ratio must be in (0, 1], got {train_disease_ratio}")
+        self.train_disease_ratio = train_disease_ratio
 
         self.files = sorted((self.data_dir / split).glob("scene_*.npz"))
         if not self.files:
@@ -94,12 +98,30 @@ class SyntheticPointCloudDataset(Dataset):
                 disease_indices = torch.where(disease_mask)[0]
                 bg_indices = torch.where(~disease_mask)[0]
                 n_disease = len(disease_indices)
-                if n_disease > 0 and n_disease < n_keep:
-                    n_bg = n_keep - n_disease
-                    bg_selected = bg_indices[torch.randperm(len(bg_indices))[:n_bg]]
-                    idx_keep = torch.cat([disease_indices, bg_selected])
-                elif n_disease >= n_keep:
-                    idx_keep = disease_indices[torch.randperm(n_disease)[:n_keep]]
+                n_bg_total = len(bg_indices)
+
+                # 病害点封顶比例：大面病害场景（raw_surface 原生密度下
+                # slab shatter 等病害点可达 57%）若全部保留，max_points
+                # 采样后整张场景挤进病害区域，单窗口占用退化并触发
+                # window-attention 偏置显存守卫。封顶保证训练子集里
+                # 病害点占比不超过 train_disease_ratio，同时保留背景点
+                # 把空间分布撑开。v2（病害 ~2%）不受影响；v3 在 16384
+                # 点下自然低于封顶，在低 max_points 下同样被保护。
+                max_disease_keep = min(n_disease, int(n_keep * self.train_disease_ratio))
+                if n_keep - max_disease_keep > n_bg_total:
+                    # 背景不足时回退：不能取超过背景总量的背景点。
+                    max_disease_keep = max(0, n_keep - n_bg_total)
+
+                if max_disease_keep > 0:
+                    disease_selected = disease_indices[
+                        torch.randperm(n_disease)[:max_disease_keep]
+                    ]
+                    n_bg = n_keep - max_disease_keep
+                    if n_bg > 0:
+                        bg_selected = bg_indices[torch.randperm(n_bg_total)[:n_bg]]
+                        idx_keep = torch.cat([disease_selected, bg_selected])
+                    else:
+                        idx_keep = disease_selected
                 else:
                     idx_keep = torch.randperm(coords.shape[0])[:n_keep]
             else:

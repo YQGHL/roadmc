@@ -129,18 +129,25 @@ class Stage(nn.Module):
         self.use_checkpoint = use_checkpoint
 
     def _run_block(
-        self, block: ShiftedWindowTransformerBlock, coords: torch.Tensor, x: torch.Tensor
+        self,
+        block: ShiftedWindowTransformerBlock,
+        coords: torch.Tensor,
+        x: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_checkpoint and self.training:
-            return checkpoint(block, coords, x, use_reentrant=False)
-        return block(coords, x)
+            return checkpoint(block, coords, x, valid_mask, use_reentrant=False)
+        return block(coords, x, valid_mask=valid_mask)
 
     def forward(
-        self, coords: torch.Tensor, x: torch.Tensor
+        self,
+        coords: torch.Tensor,
+        x: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """blocks → pool. Returns (coords_out, x_out, skip, fine_to_coarse)."""
         for block in self.blocks:
-            x = self._run_block(block, coords, x)
+            x = self._run_block(block, coords, x, valid_mask)
         skip = x
         if self.downsample is None:
             return coords, x, skip, None
@@ -282,7 +289,10 @@ class Swin3D(nn.Module):
         self.decode = SegmentationHead(channels, num_classes)
 
     def forward(
-        self, coords: torch.Tensor, feats: torch.Tensor
+        self,
+        coords: torch.Tensor,
+        feats: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Patch embed → 4 stages (skip + 池化映射) → decode.
 
@@ -299,7 +309,7 @@ class Swin3D(nn.Module):
         mappings: List[Optional[torch.Tensor]] = []
         cur_coords = coords
         for stage in self.stages:
-            cur_coords, x, skip, mapping = stage(cur_coords, x)
+            cur_coords, x, skip, mapping = stage(cur_coords, x, valid_mask)
             if self.mixing_kind == "hc":
                 skip = HyperConnection.contract(skip)
             skip_features.append(skip)

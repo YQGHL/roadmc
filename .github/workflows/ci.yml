@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  MPLBACKEND: Agg
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    # Non-blocking for now: `ruff check .` reports 301 pre-existing violations
+    # (mostly UP pyupgrade modernization) across the codebase.  Flip to a
+    # required gate after a cleanup pass.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Run ruff
+        run: ruff check .
+
+  test:
+    name: Test (pytest, CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # pyproject pins torch to the cu128 index via [tool.uv.sources] (uv-only);
+      # plain pip would fetch ~2.5 GB CUDA wheels from PyPI.  Pre-install the
+      # CPU wheels so the test job stays fast and CUDA-free.
+      - name: Install CPU-only PyTorch
+        run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+      - name: Install package and pytest
+        run: pip install -e . pytest
+      - name: Run tests
+        run: python -m pytest -q

@@ -48,3 +48,18 @@ README.en.md
 # Sisyphus internal tracking
 .sisyphus/
 .deepseek/
+
+# 本地工具/环境配置：留在项目目录供 Claude Code 使用，但不提交 GitHub
+.claude/
+.agents/
+.playwright-mcp/
+
+# 权威文档：CLAUDE.md 引用，留在项目目录但不提交
+CLAUDE.md
+TECHNICAL_REPORT_v2.md
+RoadMC-研究状态报告.*
+archive/
+
+# 已搬移至 /home/yqghl/桌面/data/roadmc-data 的实验数据软链接
+/data
+/output

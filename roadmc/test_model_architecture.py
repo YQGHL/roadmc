@@ -286,26 +286,73 @@ class LossBoundTests(unittest.TestCase):
 
 
 class BiasBudgetTests(unittest.TestCase):
-    """退化窗口占用必须给出可诊断报错，而不是在算子内 OOM。"""
+    """退化窗口占用必须被占用上限（C1）处理，而不是在算子内 OOM。"""
 
-    def test_degenerate_occupancy_raises_before_allocating(self) -> None:
+    def test_degenerate_occupancy_is_capped_not_crashing(self) -> None:
         import roadmc.models.attention.window_attention as wa
-        # 所有点重合 → 单窗口吞下全部点 → M = N。生产维度
-        # (embed 48 → pos_hidden 12, heads 3) 下需要约 4.0 GiB，
-        # 预检必须在分配前报错而不是让算子 OOM。
+        # 所有点重合 → 单窗口吞下全部点 → 旧实现 M=N、偏置 4.0 GiB 直接
+        # OOM/守卫报错。C1 上限把超限点重切为有界窗口，M 被压到上限内，
+        # 注意力正常完成、输出形状正确、无 NaN。
         coords = torch.zeros(2, 4096, 3)
         attn = wa.WindowAttention3D(dim=48, num_heads=3, window_size=32)
         x = torch.randn(2, 4096, 48)
-        with self.assertRaises(RuntimeError) as ctx:
-            attn(coords, x)
-        self.assertIn("degenerate window occupancy", str(ctx.exception))
+        out = attn(coords, x)
+        self.assertEqual(out.shape, (2, 4096, 48))
+        self.assertFalse(torch.isnan(out).any())
 
-    def test_normal_cloud_passes_budget(self) -> None:
+    def test_cap_bounds_window_occupancy(self) -> None:
+        import roadmc.models.attention.window_attention as wa
+        # 稠密集群：600 点堆在 xy 一角 → 单窗口 600 点。上限后每个窗口
+        # 占用 ≤ 4×window_size。
+        torch.manual_seed(7)
+        coords = _road_cloud(1, 2048, seed=7)
+        cluster = torch.randn(600, 3) * 0.002
+        cluster[:, 2] *= 0.005
+        coords[0, :600] = coords[0, 0] + cluster
+        wid, _ = wa._window_partition(
+            coords, 32, shift=False, mode="columnar",
+            max_occupancy=32 * wa.MAX_OCCUPANCY_MULTIPLIER,
+        )
+        counts = torch.bincount(wid[0])
+        self.assertLessEqual(int(counts.max()), 32 * wa.MAX_OCCUPANCY_MULTIPLIER)
+
+    def test_well_behaved_window_ids_unchanged(self) -> None:
+        """正常云（无超窗）下上限路径与原始分区 bit-identical。
+
+        这是"已训练 checkpoint 不受影响"的机器保证：v2/v3 实测最大占用
+        远低于 4×window_size，故该路径对现有消融结果零改动。
+        """
         import roadmc.models.attention.window_attention as wa
         coords = _road_cloud(2, 2048, seed=21)
-        attn = wa.WindowAttention3D(dim=32, num_heads=2, window_size=32)
-        out = attn(coords, torch.randn(2, 2048, 32))
-        self.assertEqual(out.shape, (2, 2048, 32))
+        wid_raw, _ = wa._window_partition(coords, 32, shift=False, mode="columnar")
+        wid_cap, _ = wa._window_partition(
+            coords, 32, shift=False, mode="columnar",
+            max_occupancy=32 * wa.MAX_OCCUPANCY_MULTIPLIER,
+        )
+        self.assertTrue(torch.equal(wid_raw, wid_cap))
+        # shift 路径同样 bit-identical
+        wid_raw_s, _ = wa._window_partition(coords, 32, shift=True, mode="columnar")
+        wid_cap_s, _ = wa._window_partition(
+            coords, 32, shift=True, mode="columnar",
+            max_occupancy=32 * wa.MAX_OCCUPANCY_MULTIPLIER,
+        )
+        self.assertTrue(torch.equal(wid_raw_s, wid_cap_s))
+
+    def test_valid_mask_excludes_padding_from_windows(self) -> None:
+        """D1：collate padding 点(0,0,0) 不参与真实窗口分箱。"""
+        import roadmc.models.attention.window_attention as wa
+        coords = torch.zeros(1, 256, 3)
+        valid = torch.ones(1, 256, dtype=torch.bool)
+        valid[0, 100:] = False  # 156 padding
+        wid, num_w = wa._window_partition(
+            coords, 32, shift=False, mode="columnar", valid_mask=valid,
+            max_occupancy=32 * wa.MAX_OCCUPANCY_MULTIPLIER,
+        )
+        # padding 点落在独立窗口（id ≥ 名义窗口数），不污染真实窗口
+        nominal = 8 * 8
+        self.assertGreaterEqual(num_w, nominal + 1)
+        real_ids = wid[0, :100]
+        self.assertLess(int(real_ids.max()), nominal)
 
 
 class OptimizerRoutingTests(unittest.TestCase):

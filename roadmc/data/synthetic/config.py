@@ -526,9 +526,14 @@ class GeneratorConfig:
     max_surface_points: int = DEFAULT_MAX_SURFACE_POINTS
     max_surface_memory_mib: float = DEFAULT_MAX_SURFACE_MEMORY_MIB
     normalize: bool = True
+    retain_all_surface_points: bool = False
+    """When True, skip sensor output sampling (step 10) and keep every point
+    that survives the LiDAR noise / occlusion pipeline.  The resulting file
+    contains ~1.4M points at 5 mm grid spacing — useful for density-upper-bound
+    references in ablation studies.  ``num_points`` is ignored when this is set."""
 
     def __post_init__(self) -> None:
-        if self.num_points < 1:
+        if not self.retain_all_surface_points and self.num_points < 1:
             raise ValueError(f"num_points must be >= 1, got {self.num_points}")
         if self.target_density is not None and self.target_density < 0:
             raise ValueError(
