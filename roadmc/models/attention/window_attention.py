@@ -20,6 +20,13 @@ from roadmc.models.mhc.mhc import HyperConnection, MHCConnection
 # 窗口注意力偏置的显存上限（超出即判定为退化窗口占用而非正常配置）。
 _MAX_BIAS_BYTES: int = 3 * (1024 ** 3)
 
+# C1 每窗口占用上限乘数：window_size 是目标占用，退化场景（稠密病害
+# 集群、collate padding 塌缩）可把数百点塞进一个窗口。上限 = window_size
+# × 此乘数，超限点按序重切成新窗口。实测占用：v2 ≤71(ws=32)/98(ws=64)、
+# v3 ≤65/103，4× 上限不触发 → 结果 bit-identical；raw 稠密场景 1032 点
+# 被压到上限内，偏置内存从 22.7 GiB 降到 O(几 MB)。
+MAX_OCCUPANCY_MULTIPLIER: int = 4
+
 
 def parse_mixing(mixing: str) -> Tuple[str, int]:
     """解析混合模式字符串 → (kind, n_streams)。
@@ -41,11 +48,70 @@ def parse_mixing(mixing: str) -> Tuple[str, int]:
     raise ValueError(f"unknown mixing mode: {mixing!r} (expected none|dscm|hc2|hc4)")
 
 
+def _cap_window_occupancy(
+    window_id: torch.Tensor,
+    max_occupancy: int,
+    num_windows: int,
+) -> torch.Tensor:
+    """Re-chunk overflow points of crowded windows into fresh bounded windows.
+
+    ``window_size`` is a *target* occupancy, not an upper bound: the columnar
+    grid side ``g`` is derived from ``round(sqrt(N/window_size))``, so a
+    spatially concentrated cluster (e.g. a dense pothole interior, or all the
+    padding points of a short scene) can put hundreds of points into one bin.
+    ``_window_attention_sdpa`` then pads every window to the batch-global max
+    occupancy ``M``, and the relative-position-bias footprint ``W*M^2`` blows
+    up (measured 22.7 GiB for M=1056).
+
+    This cap keeps the *first* ``max_occupancy`` points of each crowded window
+    in place and re-chunks the rest into fresh windows of at most
+    ``max_occupancy`` points (consecutive overflow points stay adjacent, so the
+    new windows retain spatial locality).  No point is dropped and memory stays
+    bounded: both ``M`` and ``W`` grow only O(overflow / max_occupancy).  For
+    windows that never exceed the cap (all well-behaved scenes) the return is
+    bit-identical to the input, so existing checkpoints trained without the
+    cap are unaffected.
+
+    Fresh ids are assigned **per batch element** starting at ``num_windows``.
+    ``_window_attention_sdpa`` separates batch elements by adding
+    ``arange(B) * max_wid`` (max_wid = global max + 1), so an element's ids
+    must lie in ``[0, max_wid)``; per-element numbering keeps them disjoint
+    across elements regardless of differing overflow counts.
+    """
+    B, N = window_id.shape
+    device = window_id.device
+
+    def _rechunk(wid: torch.Tensor) -> torch.Tensor:
+        counts = torch.bincount(wid, minlength=num_windows)
+        overflow = torch.nonzero(counts > max_occupancy, as_tuple=False).squeeze(-1)
+        if overflow.numel() == 0:
+            return wid
+        new = wid.clone()
+        next_id = num_windows
+        for w in overflow.tolist():
+            positions = torch.nonzero(wid == w, as_tuple=False).squeeze(-1)
+            extra = positions[max_occupancy:]
+            n_extra = extra.numel()
+            n_chunks = (n_extra + max_occupancy - 1) // max_occupancy
+            for c in range(n_chunks):
+                lo = c * max_occupancy
+                hi = min(lo + max_occupancy, n_extra)
+                new[extra[lo:hi]] = next_id
+                next_id += 1
+        return new
+
+    if B == 1:
+        return _rechunk(window_id[0]).unsqueeze(0)
+    return torch.stack([_rechunk(window_id[b]) for b in range(B)], dim=0)
+
+
 def _window_partition(
     coords: torch.Tensor,
     window_size: int,
     shift: bool = False,
     mode: str = "columnar",
+    valid_mask: Optional[torch.Tensor] = None,
+    max_occupancy: Optional[int] = None,
 ) -> Tuple[torch.Tensor, int]:
     """Assign points to attention windows.
 
@@ -69,7 +135,7 @@ def _window_partition(
         window_id: (B, N) 整型窗口编号。
         num_windows: 编号上界（含空窗）。
     """
-    _, N, _ = coords.shape
+    B, N, _ = coords.shape
 
     coords_min = coords.amin(dim=1, keepdim=True)
     coords_max = coords.amax(dim=1, keepdim=True)
@@ -97,13 +163,36 @@ def _window_partition(
 
     if dims == 2:
         window_id = bin_idx[..., 0] * base + bin_idx[..., 1]
-        return window_id, base ** 2
-    window_id = (
-        bin_idx[..., 0] * (base * base)
-        + bin_idx[..., 1] * base
-        + bin_idx[..., 2]
-    )
-    return window_id, base ** 3
+        num_windows = base ** 2
+    else:
+        window_id = (
+            bin_idx[..., 0] * (base * base)
+            + bin_idx[..., 1] * base
+            + bin_idx[..., 2]
+        )
+        num_windows = base ** 3
+
+    # C1: 每窗口占用上限。退化场景（稠密病害集群 / collate padding 点
+    # 塌缩）可把数百点塞进一个窗口，把全局 M 撑爆（实测 1056 点 →
+    # 偏置 22.7 GiB）。超限点的多余部分按序重切为有界新窗口——不丢点、
+    # 内存有界。窗口不超限时返回 bit-identical 结果，已训练的 checkpoint
+    # 不受影响。
+    if valid_mask is not None and not bool(valid_mask.all()):
+        # D1: 无效点（collate padding）不参与分箱，统一并入独立窗口，
+        # 避免 (0,0,0) 塌缩进真实窗口。之后照常过占用上限。
+        invalid_mask = ~valid_mask.reshape(-1)
+        n_invalid = int(invalid_mask.sum())
+        if n_invalid:
+            window_id = window_id.reshape(-1).clone()
+            window_id[invalid_mask] = (
+                num_windows + torch.arange(n_invalid, device=coords.device)
+            ).to(window_id.dtype)
+            window_id = window_id.reshape(B, N)
+            num_windows += n_invalid
+    if max_occupancy is not None and max_occupancy > 0:
+        window_id = _cap_window_occupancy(window_id, max_occupancy, num_windows)
+
+    return window_id, num_windows
 
 
 def _window_attention_sdpa(
@@ -285,6 +374,7 @@ class WindowAttention3D(nn.Module):
         coords: torch.Tensor,
         x: torch.Tensor,
         shift: bool = False,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N, C = x.shape
         H, D = self.num_heads, self.head_dim
@@ -296,7 +386,9 @@ class WindowAttention3D(nn.Module):
         v = v.view(B, N, H, D).transpose(1, 2)
 
         window_id, _ = _window_partition(
-            coords, self.window_size, shift=shift, mode=self.partition_mode
+            coords, self.window_size, shift=shift, mode=self.partition_mode,
+            valid_mask=valid_mask,
+            max_occupancy=self.window_size * MAX_OCCUPANCY_MULTIPLIER,
         )
         out = _window_attention_sdpa(
             coords=coords,
@@ -443,18 +535,27 @@ class ShiftedWindowTransformerBlock(nn.Module):
             self.hc_ffn = None
         self.drop_path = DropPath(drop_path)
 
-    def forward(self, coords: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        coords: torch.Tensor,
+        x: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if self.mixing_kind == "hc":
             # x: (B, N, n, C) —— 每个子层读出 → 分支 → 双随机混合写回
             a_in = self.hc_attn.read(x)
-            branch = self.drop_path(self.attn(coords, self.norm1(a_in), shift=self.shift))
+            branch = self.drop_path(
+                self.attn(coords, self.norm1(a_in), shift=self.shift, valid_mask=valid_mask)
+            )
             x = self.hc_attn.write(x, branch)
             f_in = self.hc_ffn.read(x)
             branch_ffn = self.drop_path(self.ffn(self.norm2(f_in)))
             return self.hc_ffn.write(x, branch_ffn)
 
         B, N, C = x.shape
-        x_attn = x + self.drop_path(self.attn(coords, self.norm1(x), shift=self.shift))
+        x_attn = x + self.drop_path(
+            self.attn(coords, self.norm1(x), shift=self.shift, valid_mask=valid_mask)
+        )
         ffn_out = self.drop_path(self.ffn(self.norm2(x_attn)))
         if self.mhc is not None:
             mixed = self.mhc(x_attn.reshape(-1, C)).reshape(B, N, C)

@@ -700,7 +700,18 @@ class SyntheticRoadDataset(_DatasetBase):
             "protection_available": False,
             "protection_applied": False,
         }
-        if self.config.target_density is not None and self.config.target_density > 0:
+        if self.config.retain_all_surface_points:
+            # Raw-surface mode: keep every point that survived the sensor
+            # pipeline (noise + occlusion), no output sampling.  Used for
+            # density-upper-bound ablation references (~1.4M pts at 5 mm).
+            points_final = noisy_points
+            labels_final = labels
+            intensity_final = intensity
+            curvature_final = curvature
+            normals_final = normals
+            sensor_output_sampling_method = "none_full_surface"
+            protection_info["protection_available"] = True
+        elif self.config.target_density is not None and self.config.target_density > 0:
             road_area = width * length
             target_count = int(road_area * self.config.target_density)
             # 体素大小逼近目标点数：N_voxels ≈ area / voxel_size²

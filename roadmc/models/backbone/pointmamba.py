@@ -277,7 +277,12 @@ class PointMambaBackbone(nn.Module):
 
         self.decode = SegmentationHead(channels, num_classes)
 
-    def forward(self, coords: torch.Tensor, feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        coords: torch.Tensor,
+        feats: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         x = torch.cat([coords, feats], dim=-1)
         x = self.patch_embed(x)
 

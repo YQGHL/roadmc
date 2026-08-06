@@ -1,0 +1,15 @@
+# Normalize line endings for all text files.
+* text=auto
+
+# Force LF on check-in and check-out for source files.
+# Prevents Windows editors from silently re-committing whole files as CRLF.
+*.py   text eol=lf
+*.md   text eol=lf
+*.toml text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+
+# Batch scripts keep CRLF so they run on Windows cmd.
+*.bat text eol=crlf

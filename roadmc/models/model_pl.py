@@ -397,10 +397,18 @@ class RoadMCSegModel(pl.LightningModule):
         self._val_calibration = CalibrationAccumulator()
         self.last_validation_summary = {}
 
-    def forward(self, coords: torch.Tensor, feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        coords: torch.Tensor,
+        feats: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Forward pass through backbone.
+
+        ``valid_mask`` (B, N) 只用于窗口分窗/注意力，让 collate padding
+        点(0,0,0) 不进真实窗口（D1）。丢失该 mask 时行为与旧版一致。
         """
-        return self.backbone(coords, feats)
+        return self.backbone(coords, feats, valid_mask=valid_mask)
 
     def on_save_checkpoint(self, checkpoint: dict) -> None:
         """Persist the input contract outside hyperparameters for independent audit."""
@@ -422,7 +430,7 @@ class RoadMCSegModel(pl.LightningModule):
             coords, feats, labels = batch
             valid_mask = None
 
-        logits = self(coords, feats)
+        logits = self(coords, feats, valid_mask)
 
         fl = self.focal_loss(logits, labels, valid_mask)
         dl = self.dice_loss(logits, labels, valid_mask)
@@ -446,7 +454,7 @@ class RoadMCSegModel(pl.LightningModule):
             coords, feats, labels = batch
             valid_mask = None
 
-        logits = self(coords, feats)
+        logits = self(coords, feats, valid_mask)
 
         fl = self.focal_loss(logits, labels, valid_mask)
         dl = self.dice_loss(logits, labels, valid_mask)
