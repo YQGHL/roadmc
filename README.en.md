@@ -51,14 +51,58 @@ road morphology + damage deformation + LiDAR observation
 
 | Item | Current status |
 | --- | --- |
-| Task | Binary segmentation: background `0` / damage `1` |
+| Task | Binary segmentation: background `0` / damage `1` (38-class curriculum ready) |
 | Generator | Natural-prevalence sampling + resolution/protection audit contract (2026-07) |
 | Historical baseline | Disease IoU `0.7235`, produced by the removed fixed-10%-quota generator — **no longer valid evidence** |
-| Current baseline v2 | ✅ Disease IoU `0.4781` [0.4435, 0.5105] (independent test, threshold 0.32, ECE 0.0028) |
+| Current baseline v2 | ✅ Disease IoU `0.4781` [0.4435, 0.5105] (independent test, threshold 0.320, ECE 0.0028) |
 | Current model | `Swin3D + DSCM + Muon/AdamW` |
-| R2 ablation | ⏳ In progress (mixing axis, seed42: none / dscm evaluated, hc2 pending) |
-| Automated tests | `111/111` passed |
+| R2 mixing ablation | ✅ seed-42 four variants evaluated: `hc2` best at `0.5139` (single seed, directional) |
+| v3 high-resolution track | Stabilized after batch-crash fix; mixing gains pending re-test at aligned batch |
+| Automated tests | `112 passed / 4 skipped` (CI green) |
 | Real-domain status | Unlabeled domain-gap diagnostics only; no real semantic mIoU yet |
+
+## Results
+
+### Baseline v2 (credible anchor)
+
+Rebuilt and finalized under natural prevalence, no label leakage, and an independent train/val/test split with a frozen threshold:
+
+| Metric | Value |
+| --- | --- |
+| **Disease IoU** (supported-class mIoU) | **0.4781** |
+| Scene-block bootstrap 95% CI | [0.4435, 0.5105] |
+| Precision / Recall (foreground) | 0.7092 / 0.5947 |
+| Frozen binary threshold | 0.320 |
+| ECE / Brier / NLL | 0.0028 / 0.1061 / 0.1927 |
+| Background IoU | 0.9251 |
+| Evaluated points / damage support | 1,751,040 / 189,075 |
+
+The old `0.7235` is double-invalidated (fixed prevalence + intensity label leak) and kept for the historical record only; it must not be used in any comparison.
+
+### R2 mixing ablation (seed 42 · 20 epochs)
+
+Common protocol: `swin3d`, `muon`, `max-points 2048`, `batch 8`, `lr 1e-3`; threshold frozen on the first 170 val scenes, single evaluation on 855 test scenes with scene-block bootstrap 95% CI:
+
+| Mixing | Test IoU [95% CI] | Precision | Recall | ECE | Brier | NLL |
+| --- | --- | --- | --- | --- | --- | --- |
+| `none` | 0.4883 [0.4542, 0.5236] | 0.7550 | 0.5803 | 0.0096 | 0.1073 | 0.1970 |
+| `dscm` | 0.4817 [0.4476, 0.5168] | 0.7696 | 0.5628 | 0.0169 | 0.1072 | 0.1971 |
+| **`hc2`** | **0.5139** [0.4816, 0.5478] | **0.7822** | 0.5997 | **0.0052** | **0.0994** | **0.1835** |
+| `hc4` | 0.5040 [0.4702, 0.5388] | 0.7529 | **0.6039** | 0.0051 | 0.1025 | 0.1875 |
+
+> **Conclusion-strength red line:** only seed 42 has run so far; the `hc2` lead is directional until seeds 43/44 confirm it. `dscm` is the weakest (lowest IoU, highest ECE); `hc2/hc4` calibrate markedly better than `none/dscm`.
+
+### v3 high-resolution track (5 mm grid · 8192 points)
+
+Training is stable after fixing the effective-batch crash, but the protocol differs from v2 (grid 5 mm vs 2 cm, points 8192 vs 2048, batch 4 vs 8), so it is **not comparable** to `0.4781`:
+
+| Variant | disease IoU | 95% CI | ECE |
+| --- | --- | --- | --- |
+| `none` | **0.2738** | [0.2342, 0.3134] | 0.0624 |
+| `hc2` | 0.2662 | [0.2202, 0.3121] | 0.0639 |
+| `dscm` | 0.2625 | [0.2186, 0.3044] | 0.0628 |
+
+Open issues: ECE 0.06 is still far above the R2 0.005 (effective batch 4 vs 8); the mixing gain disappears (CIs overlap); class weights are neutralized to ≈1.0 by the effective-number formula at this scale.
 
 ## Installation
 
@@ -341,6 +385,8 @@ roadmc/
 readmeimage/
   synthesis_pipeline.png
   training_pipeline.png
+.github/
+  workflows/ci.yml       # GitHub Actions: pytest gate + ruff lint
 ```
 
 ## Completed Work and Roadmap
@@ -354,14 +400,15 @@ readmeimage/
 - Implemented metric-coordinate patch extraction (not yet wired into training).
 - Completed GPU binary validation with DSCM on an RTX 5060 Laptop and transfer smoke tests for the 4/8/38-class stages.
 - Completed the credible binary baseline v2: natural-prevalence data + independent train/val/test, test disease IoU `0.4781` [0.4435, 0.5105], ECE `0.0028` (the old 0.7235 is double-invalidated and kept for the record only).
-- Implemented n-stream Hyper-Connections as an ablation arm (`--mixing {none,dscm,hc2,hc4}`) and started the R2 ablation matrix.
-- `111/111` automated tests pass.
+- Implemented n-stream Hyper-Connections as an ablation arm (`--mixing {none,dscm,hc2,hc4}`); the R2 mixing ablation now has seed-42 results for all four variants (`hc2` best at 0.5139, directional).
+- Fixed the v3 (5 mm grid / 8192 points) effective-batch crash so training is stable; the raw-surface density-upper-bound dataset triggered the window-occupancy cap (C1) fix.
+- `112 passed / 4 skipped` automated tests pass (GitHub Actions CI green).
 
 ### Roadmap
 
 1. ~~Rebuild a credible binary baseline v2~~ ✅ Done (test IoU 0.4781).
-2. Run Swin3D / gated-EMA × DSCM / HC × Muon/AdamW ablations under one protocol on the frozen v2 data (⏳ in progress; the mixing axis has seed42 preliminary results).
-3. Wire in the patch pipeline and run the `2048 / 4096 / 8192 / 16384` input-density ablation (bootstrap aggregated by source scene).
+2. Finalize the R2 mixing ablation with seeds 43/44 (the current `hc2` lead is directional), then extend to backbone × optimizer axes.
+3. Fix the v3 class-weight neutralization (β tuning or inverse-frequency cap), re-test the mixing gain at aligned batch, then wire in the patch pipeline for the `4096 / 8192 / 16384` density ablation (bootstrap aggregated by source scene).
 4. Calibrate the sensor layer (scan density, intensity physics) to close the remaining domain-gap terms.
 5. Acquire real road scans with reliable labels, coordinate units, and a verified JTG mapping before evaluating domain randomization or adaptation.
 
