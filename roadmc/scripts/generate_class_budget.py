@@ -25,16 +25,13 @@ import numpy as np
 os.environ.setdefault("ROADMC_GENERATOR_NO_TORCH", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from roadmc.data.features import OBSERVABLE_FEATURE_SCHEMA, has_observable_feature_schema
 from roadmc.data.synthetic.config import (
-    DEFAULT_MAX_SURFACE_MEMORY_MIB,
-    DEFAULT_MAX_SURFACE_POINTS,
     DiseaseConfig,
     GeneratorConfig,
     RoadSurfaceConfig,
 )
 from roadmc.data.synthetic.labels import ALL_DISEASE_LABELS
-from roadmc.data.features import OBSERVABLE_FEATURE_SCHEMA, has_observable_feature_schema
-
 
 _WORKER_DATASET: Any = None
 _WORKER_SPLIT_DIR: Path | None = None
@@ -105,11 +102,11 @@ def _scan_coverage(
                 scene_labels = scene["labels"].astype(np.int64, copy=False)
                 target_label = int(scene["target_label"]) if "target_label" in scene.files else -1
         except Exception as exc:  # pragma: no cover - corrupt files are operational failures
-            warnings.warn(f"Skipping unreadable scene {path}: {exc}")
+            warnings.warn(f"Skipping unreadable scene {path}: {exc}", stacklevel=2)
             continue
 
         unique_labels, counts = np.unique(scene_labels, return_counts=True)
-        count_by_label = {int(label): int(count) for label, count in zip(unique_labels, counts)}
+        count_by_label = {int(label): int(count) for label, count in zip(unique_labels, counts, strict=False)}
         # A quota is evidence only when the scene was deliberately generated
         # for that label.  Counting incidental co-occurrences could otherwise
         # make a rare class appear covered without independent instances.
@@ -129,7 +126,7 @@ def _scan_coverage(
             )
         warnings.warn(
             f"{split_dir}: excluded {len(legacy_scenes)} legacy scene(s) without the "
-            "resolution contract from quota accounting."
+            "resolution contract from quota accounting.", stacklevel=2
         )
 
     return coverage

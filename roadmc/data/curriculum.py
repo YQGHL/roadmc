@@ -6,7 +6,6 @@ changes task granularity, never discards or duplicates a source label.
 
 from __future__ import annotations
 
-
 LABEL_STAGES: tuple[str, ...] = ("binary", "four", "eight", "full38")
 
 

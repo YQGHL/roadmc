@@ -373,7 +373,7 @@ def train_end2end(args):
     1. GAN discriminator steps (improve realism detection)
     2. GAN generator steps (produce more realistic stylized data)
     3. Segmentation training on stylized data
-    
+
     The segmentation model is trained on the fly as the GAN improves,
     creating a co-adaptation loop.
     """
@@ -410,8 +410,11 @@ def train_end2end(args):
     datamodule.setup("fit")
 
     print(f"[E2E] Starting end-to-end training for {args.max_epochs} epochs...")
-    gen.train(); disc.train(); seg_model.train()
-    n_critic = 3; lambda_gp = 10.0
+    gen.train()
+    disc.train()
+    seg_model.train()
+    n_critic = 3
+    lambda_gp = 10.0
 
     for epoch in range(args.max_epochs):
         for batch in datamodule.train_dataloader():
@@ -430,7 +433,8 @@ def train_end2end(args):
                     )
                 gp = _gradient_penalty(disc, ri, fi, device)
                 d_loss = -disc(ri).mean() + disc(fi).mean() + lambda_gp * gp
-                d_loss.backward(); d_opt.step()
+                d_loss.backward()
+                d_opt.step()
 
             # Generator (no torch.no_grad — gradients must flow through disc to gen)
             g_opt.zero_grad()
@@ -440,7 +444,8 @@ def train_end2end(args):
                 dim=-1,
             )
             g_loss = -disc(fi).mean()
-            g_loss.backward(); g_opt.step()
+            g_loss.backward()
+            g_opt.step()
 
             seg_opt.zero_grad()
             with torch.no_grad():

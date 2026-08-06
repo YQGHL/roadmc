@@ -8,8 +8,8 @@ privileged features.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 import numpy as np
 from scipy.stats import energy_distance, wasserstein_distance
@@ -20,7 +20,6 @@ from roadmc.data.features import (
     OBSERVABLE_FEATURE_SCHEMA,
     estimate_local_surface_geometry,
 )
-
 
 OBSERVABLE_NAMES = (
     "density_per_m2",

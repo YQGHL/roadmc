@@ -112,9 +112,9 @@ def _eval(model, loader, max_batches: int):
 
             flat_preds = preds[valid_mask]
             flat_labels = batch["labels"][valid_mask]
-            for cls, count in zip(*torch.unique(flat_preds, return_counts=True)):
+            for cls, count in zip(*torch.unique(flat_preds, return_counts=True), strict=False):
                 pred_counts[int(cls)] = pred_counts.get(int(cls), 0) + int(count)
-            for cls, count in zip(*torch.unique(flat_labels, return_counts=True)):
+            for cls, count in zip(*torch.unique(flat_labels, return_counts=True), strict=False):
                 label_counts[int(cls)] = label_counts.get(int(cls), 0) + int(count)
 
             probs = torch.softmax(logits, dim=-1)[valid_mask]

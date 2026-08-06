@@ -26,7 +26,6 @@ processed by a gated, per-channel exponential moving average"*。被实测
 from __future__ import annotations
 
 import warnings
-from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -49,7 +48,7 @@ def _expand_bits(v: torch.Tensor) -> torch.Tensor:
 
 def _morton_permutation(
     coords: torch.Tensor, levels: int = 10
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Sort points by Morton code with **isotropic** quantization.
 
     量化尺度各轴共享（取最大 extent）：Z-order 曲线的局部性界只在
@@ -174,8 +173,8 @@ class PointMambaStage(nn.Module):
 
     def __init__(
         self,
-        blocks: List[PointMambaBlock],
-        downsample: Optional[SerializedGridPool] = None,
+        blocks: list[PointMambaBlock],
+        downsample: SerializedGridPool | None = None,
         use_checkpoint: bool = False,
     ):
         super().__init__()
@@ -192,7 +191,7 @@ class PointMambaStage(nn.Module):
 
     def forward(
         self, coords: torch.Tensor, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         perm, inv_perm = _morton_permutation(coords)
         coords_ord = _gather_along_points(coords, perm)
         x_ord = _gather_along_points(x, perm)
@@ -215,14 +214,14 @@ class PointMambaBackbone(nn.Module):
         in_channels: int = 3,
         num_classes: int = 38,
         embed_dim: int = 96,
-        depths: Tuple[int, ...] = (2, 2, 6, 2),
-        num_heads: Tuple[int, ...] = (3, 6, 12, 24),
+        depths: tuple[int, ...] = (2, 2, 6, 2),
+        num_heads: tuple[int, ...] = (3, 6, 12, 24),
         window_size: int = 64,
         mlp_ratio: float = 4.0,
         use_checkpoint: bool = False,
         use_mhc: bool = True,
         drop_path_rate: float = 0.0,
-        mixing: Optional[str] = None,
+        mixing: str | None = None,
     ):
         super().__init__()
         # 本分支只支持 none / dscm；n 流 HC 的消融在 swin3d 主线上做
@@ -255,7 +254,7 @@ class PointMambaBackbone(nn.Module):
 
         self.stages = nn.ModuleList()
         for i in range(4):
-            blocks: List[PointMambaBlock] = []
+            blocks: list[PointMambaBlock] = []
             for _ in range(depths[i]):
                 blocks.append(
                     PointMambaBlock(
@@ -265,11 +264,8 @@ class PointMambaBackbone(nn.Module):
                 )
                 block_idx += 1
 
-            downsample: Optional[SerializedGridPool]
-            if i < 3:
-                downsample = SerializedGridPool(channels[i], channels[i + 1])
-            else:
-                downsample = None
+            downsample: SerializedGridPool | None
+            downsample = SerializedGridPool(channels[i], channels[i + 1]) if i < 3 else None
 
             self.stages.append(
                 PointMambaStage(blocks, downsample, use_checkpoint=use_checkpoint)
@@ -281,13 +277,13 @@ class PointMambaBackbone(nn.Module):
         self,
         coords: torch.Tensor,
         feats: torch.Tensor,
-        valid_mask: Optional[torch.Tensor] = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = torch.cat([coords, feats], dim=-1)
         x = self.patch_embed(x)
 
-        skip_features: List[torch.Tensor] = []
-        mappings: List[Optional[torch.Tensor]] = []
+        skip_features: list[torch.Tensor] = []
+        mappings: list[torch.Tensor | None] = []
         cur_coords = coords
         for stage in self.stages:
             cur_coords, x, skip, mapping = stage(cur_coords, x)

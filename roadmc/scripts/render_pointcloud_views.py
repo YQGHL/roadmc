@@ -172,7 +172,7 @@ def render_contact_sheet(
     titles: list[str],
 ) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(12, 9), dpi=180)
-    for ax, image_path, title in zip(axes.flat, image_paths, titles):
+    for ax, image_path, title in zip(axes.flat, image_paths, titles, strict=False):
         image = plt.imread(image_path)
         ax.imshow(image)
         ax.set_title(title, fontsize=12)

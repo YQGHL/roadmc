@@ -95,10 +95,7 @@ class MHCConnection(nn.Module):
         不在前向热路径写 buffer（旧实现每步 copy_ 触发 DDP 广播与
         functional 化不兼容）；stochastic_matrix 仅在 deploy() 时物化。
         """
-        if self._deployed:
-            H = self.stochastic_matrix
-        else:
-            H = self.current_H()
+        H = self.stochastic_matrix if self._deployed else self.current_H()
         return x @ H.T.to(x.dtype)
 
     def deploy(self) -> "MHCConnection":

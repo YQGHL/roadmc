@@ -4,9 +4,9 @@ import torch.nn as nn
 
 class WGANDiscriminator(nn.Module):
     """WGAN-GP discriminator for point cloud style detection.
-    
+
     PointNet-style: per-point MLP → max pooling → global MLP → logit
-    
+
     Input: (B, N, C_in) — cat(points, normals) or stylized output
     Output: (B, 1) — logits (no sigmoid, as required by WGAN-GP)
     """

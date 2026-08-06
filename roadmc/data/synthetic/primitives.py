@@ -24,7 +24,6 @@ RoadMC 数学与力学基元 —— Physics-Simulation-Driven Road Surface Primi
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
 
 import numpy as np
 from scipy import interpolate, spatial, stats
@@ -151,7 +150,7 @@ def _fractal_perturbation(
     xi = np.asarray(x)
     yi = np.asarray(y)
 
-    for o in range(octaves):
+    for _o in range(octaves):
         grid_size = 8
         noise_grid = rng.uniform(-1.0, 1.0, (grid_size, grid_size))
 
@@ -210,7 +209,7 @@ def _point_to_segment_distance(
 
 def _point_to_segment_distance_t(
     points: np.ndarray, seg_start: np.ndarray, seg_end: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Compute perpendicular distance and projection parameter from points to a line segment.
 
     Same as _point_to_segment_distance but also returns the local parameter t
@@ -275,14 +274,14 @@ def generate_road_surface(
     grid_res: float,
     pavement_type: str = "asphalt",
     roughness_class: str = "A",
-    seed: Optional[int] = None,
+    seed: int | None = None,
     *,
     texture_rms: float = 0.0,
     texture_hurst: float = 0.7,
     crossfall: float = 0.0,
     crossfall_shape: str = "crowned",
     longitudinal_grade: float = 0.0,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Generate a road surface via a piecewise isotropic radial PSD.
 
     高度场由三部分构成：确定性设计几何 + ISO 8608 宏观粗糙度 + 自仿射
@@ -416,8 +415,8 @@ def resample_to_lidar_pattern(
     scan_pattern: str = "rotating",
     range_decay: float = 0.3,
     incidence_angle_drop: float = 0.05,
-    rng: Optional[np.random.Generator] = None,
-    sensor_pose: Optional[np.ndarray] = None,
+    rng: np.random.Generator | None = None,
+    sensor_pose: np.ndarray | None = None,
     line_sigma_m: float = 0.02,
 ) -> np.ndarray:
     """P1-1: Resample uniform grid points to simulate LiDAR scan line density.
@@ -521,8 +520,8 @@ def add_micro_texture(
     amplitude: float,
     hurst: float,
     octaves: int = 0,
-    seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    seed: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Add spatially correlated self-affine macro-texture to a point set.
 
     通过 FFT 谱合成生成自仿射纹理场（二维 fBm 型表面，功率谱
@@ -640,8 +639,8 @@ def add_crack(
     crack_type: str,
     severity: str,
     params: dict,
-    seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    seed: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Add crack(s) to asphalt road surface.
 
     支持四种沥青裂缝类型：
@@ -955,13 +954,13 @@ def add_crack(
 def add_pothole(
     points: np.ndarray,
     labels: np.ndarray,
-    center: Tuple[float, float],
+    center: tuple[float, float],
     radius: float,
     depth: float,
     edge_quality: float,
     severity: str,
-    seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    seed: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Add a pothole (坑槽) via superellipsoid depression.
 
     超椭圆凹陷模型：
@@ -1005,10 +1004,7 @@ def add_pothole(
     r = np.sqrt((xy[:, 0] - cx) ** 2 + (xy[:, 1] - cy) ** 2)
 
     # 超椭圆指数 β
-    if severity == "light":
-        beta = 2.0
-    else:
-        beta = 3.0 + rng.random() * 2.0  # β ∈ [3, 5] 平底
+    beta = 2.0 if severity == "light" else 3.0 + rng.random() * 2.0  # β ∈ [3, 5] 平底
 
     # 坑槽主凹陷
     in_pothole = r <= radius
@@ -1064,8 +1060,8 @@ def add_edge_spalling_heavy_tail(
     hurst: float = 0.7,
     trigger_prob: float = 0.05,
     label_val: int = 0,
-    seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    seed: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """M3: Add heavy-tailed edge spalling via Lévy α-stable jumps.
 
     Unlike the standard fBm micro-texture where Lévy's heavy tail
@@ -1131,9 +1127,9 @@ def add_raveling(
     labels: np.ndarray,
     region_mask: np.ndarray,
     severity: str,
-    seed: Optional[int] = None,
+    seed: int | None = None,
     remove_nan: bool = False,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Add raveling (松散) — simulate fine aggregate loss.
 
     模拟细集料脱落：
@@ -1207,12 +1203,12 @@ def add_raveling(
 def add_depression(
     points: np.ndarray,
     labels: np.ndarray,
-    center: Tuple[float, float],
+    center: tuple[float, float],
     radius: float,
     depth: float,
     severity: str,
-    seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    seed: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Add depression (沉陷) — large-area low-frequency subsidence.
 
     高斯凹陷模型：
@@ -1272,8 +1268,8 @@ def add_rutting(
     depth: float,
     width: float,
     severity: str,
-    seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    seed: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Add rutting (车辙) — dual wheel-track depressions.
 
     左右轮迹由高斯凹陷叠加，纵向 (y) 截面用正弦调制模拟变化：
@@ -1350,8 +1346,8 @@ def add_corrugation(
     wavelength: float,
     amplitude: float,
     severity: str,
-    seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    seed: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Add corrugation (波浪拥包) — sinusoidal height modulation.
 
     正弦波高度调制：
@@ -1428,7 +1424,7 @@ def add_bleeding(
     points: np.ndarray,
     labels: np.ndarray,
     region_mask: np.ndarray,
-    seed: Optional[int] = None,
+    seed: int | None = None,
 ) -> np.ndarray:
     """Add bleeding (泛油) — reflectance change only, NO geometry change.
 
@@ -1460,14 +1456,14 @@ def add_bleeding(
 def add_patching(
     points: np.ndarray,
     labels: np.ndarray,
-    center: Tuple[float, float],
+    center: tuple[float, float],
     width: float,
     length: float,
     label: int,
     angle_rad: float = 0.0,
     elevation: float = 0.0,
     edge_width: float = 0.08,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Insert a finite-width repair patch with a smooth geometric transition.
 
     The patch is a rounded rectangle in the local road tangent plane. Its
@@ -1522,8 +1518,8 @@ def add_concrete_damage(
     damage_type: str,
     severity: str,
     params: dict,
-    seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    seed: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Add concrete pavement damage (10 种水泥路面损坏).
 
     水泥路面按板块 (slab) 组织，板块尺寸由 ``ConcreteDamageConfig`` 定义。
@@ -1979,14 +1975,14 @@ def simulate_lidar_noise(
     distance_noise_std: float,
     dropout_rate: float,
     angular_jitter_deg: float,
-    seed: Optional[int] = None,
+    seed: int | None = None,
     enable_edge_mixing: bool = True,
     mixed_pixel_prob: float = 0.01,
-    curvature: Optional[np.ndarray] = None,
+    curvature: np.ndarray | None = None,
     curvature_threshold: float = 0.5,
-    sensor_origin: Optional[np.ndarray] = None,
-    sigma_r: Optional[np.ndarray] = None,
-    drop_weight: Optional[np.ndarray] = None,
+    sensor_origin: np.ndarray | None = None,
+    sigma_r: np.ndarray | None = None,
+    drop_weight: np.ndarray | None = None,
 ) -> np.ndarray:
     """Simulate LiDAR measurement noise on point cloud.
 
@@ -2094,10 +2090,7 @@ def simulate_lidar_noise(
         if curvature is not None and len(curvature) > 0:
             # 曲率与 keep_mask 对齐：需要从原始 curvature 对应到保留后的点
             # 假设 curvature 在调用前已与输入 points 对齐
-            if len(curvature) == N:
-                cur = curvature[keep_mask]
-            else:
-                cur = curvature
+            cur = curvature[keep_mask] if len(curvature) == N else curvature
             # 高曲率区域的索引
             cur_abs = np.abs(cur)
             edge_candidates = np.where(cur_abs > curvature_threshold * np.std(cur_abs))[0]
@@ -2132,7 +2125,7 @@ if __name__ == "__main__":
     test_width = 0.5
     test_length = 0.5
     test_grid_res = 0.02
-    expected_N = int(test_width / test_grid_res) * int(test_length / test_grid_res)
+    expected_n = int(test_width / test_grid_res) * int(test_length / test_grid_res)
 
     print("\n[1/11] generate_road_surface ...", end=" ")
     try:

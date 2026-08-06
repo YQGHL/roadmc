@@ -13,10 +13,10 @@ Input:  coords (B, N, 3), feats (B, N, in_channels)
 Output: (B, N, num_classes) per-point logits
 """
 
+
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
-from typing import List, Optional, Tuple
 
 from roadmc.models.attention.window_attention import (
     ShiftedWindowTransformerBlock,
@@ -70,7 +70,7 @@ class SerializedGridPool(nn.Module):
 
     def forward(
         self, coords: torch.Tensor, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (coords_pooled, x_pooled, fine_to_coarse) with M = ceil(N/4).
 
         ``x`` 可以是 (B, N, C) 或带流维的 (B, N, n, C)——池化只作用在点维，
@@ -119,8 +119,8 @@ class Stage(nn.Module):
 
     def __init__(
         self,
-        blocks: List[ShiftedWindowTransformerBlock],
-        downsample: Optional[SerializedGridPool] = None,
+        blocks: list[ShiftedWindowTransformerBlock],
+        downsample: SerializedGridPool | None = None,
         use_checkpoint: bool = False,
     ):
         super().__init__()
@@ -133,7 +133,7 @@ class Stage(nn.Module):
         block: ShiftedWindowTransformerBlock,
         coords: torch.Tensor,
         x: torch.Tensor,
-        valid_mask: Optional[torch.Tensor] = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.use_checkpoint and self.training:
             return checkpoint(block, coords, x, valid_mask, use_reentrant=False)
@@ -143,8 +143,8 @@ class Stage(nn.Module):
         self,
         coords: torch.Tensor,
         x: torch.Tensor,
-        valid_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        valid_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """blocks → pool. Returns (coords_out, x_out, skip, fine_to_coarse)."""
         for block in self.blocks:
             x = self._run_block(block, coords, x, valid_mask)
@@ -165,7 +165,7 @@ class SegmentationHead(nn.Module):
         → unpool(map0) → cat f0 → fuse (C0) → cls (num_classes)
     """
 
-    def __init__(self, channels: List[int], num_classes: int):
+    def __init__(self, channels: list[int], num_classes: int):
         super().__init__()
         c0, c1, c2, c3 = channels
 
@@ -184,8 +184,8 @@ class SegmentationHead(nn.Module):
 
     def forward(
         self,
-        features: List[torch.Tensor],
-        mappings: List[Optional[torch.Tensor]],
+        features: list[torch.Tensor],
+        mappings: list[torch.Tensor | None],
     ) -> torch.Tensor:
         f0, f1, f2, f3 = features
         map0, map1, map2 = mappings[0], mappings[1], mappings[2]
@@ -231,14 +231,14 @@ class Swin3D(nn.Module):
         in_channels: int = 3,
         num_classes: int = 38,
         embed_dim: int = 96,
-        depths: Tuple[int, ...] = (2, 2, 6, 2),
-        num_heads: Tuple[int, ...] = (3, 6, 12, 24),
+        depths: tuple[int, ...] = (2, 2, 6, 2),
+        num_heads: tuple[int, ...] = (3, 6, 12, 24),
         window_size: int = 64,
         mlp_ratio: float = 4.0,
         use_checkpoint: bool = False,
         use_mhc: bool = True,
         drop_path_rate: float = 0.0,
-        mixing: Optional[str] = None,
+        mixing: str | None = None,
     ):
         super().__init__()
 
@@ -260,7 +260,7 @@ class Swin3D(nn.Module):
 
         self.stages = nn.ModuleList()
         for i in range(4):
-            blocks: List[ShiftedWindowTransformerBlock] = []
+            blocks: list[ShiftedWindowTransformerBlock] = []
             for j in range(depths[i]):
                 # Swin 约定 W-MSA → SW-MSA：偶数块不 shift。
                 shift = (j % 2 == 1)
@@ -278,11 +278,8 @@ class Swin3D(nn.Module):
                 )
                 block_idx += 1
 
-            downsample: Optional[SerializedGridPool]
-            if i < 3:
-                downsample = SerializedGridPool(channels[i], channels[i + 1])
-            else:
-                downsample = None
+            downsample: SerializedGridPool | None
+            downsample = SerializedGridPool(channels[i], channels[i + 1]) if i < 3 else None
 
             self.stages.append(Stage(blocks, downsample, use_checkpoint=use_checkpoint))
 
@@ -292,7 +289,7 @@ class Swin3D(nn.Module):
         self,
         coords: torch.Tensor,
         feats: torch.Tensor,
-        valid_mask: Optional[torch.Tensor] = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Patch embed → 4 stages (skip + 池化映射) → decode.
 
@@ -305,8 +302,8 @@ class Swin3D(nn.Module):
         if self.mixing_kind == "hc":
             x = HyperConnection.expand(x, self.n_streams)
 
-        skip_features: List[torch.Tensor] = []
-        mappings: List[Optional[torch.Tensor]] = []
+        skip_features: list[torch.Tensor] = []
+        mappings: list[torch.Tensor | None] = []
         cur_coords = coords
         for stage in self.stages:
             cur_coords, x, skip, mapping = stage(cur_coords, x, valid_mask)

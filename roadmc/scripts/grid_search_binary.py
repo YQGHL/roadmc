@@ -111,7 +111,7 @@ def main():
 
         # Find which version was created
         version_after = find_latest_version()
-        new_versions = [v for v in range(version_before + 1, version_after + 1)]
+        new_versions = list(range(version_before + 1, version_after + 1))
 
         print(f"       Completed in {elapsed:.0f}s")
         if result.returncode != 0:
