@@ -15,10 +15,10 @@ import re
 import sys
 import time
 import warnings
+from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 
@@ -131,7 +131,7 @@ def _save_scene(scene_id: int) -> dict:
         result["npoints"] = int(len(points))
         result["labels"] = [int(x) for x in np.unique(labels)]
     except Exception as exc:  # pragma: no cover - best-effort long job logging
-        warnings.warn(f"scene {scene_id} failed: {exc}")
+        warnings.warn(f"scene {scene_id} failed: {exc}", stacklevel=2)
     return result
 
 
@@ -283,7 +283,7 @@ def main() -> None:
             with open(metadata_file, encoding="utf-8") as handle:
                 recorded = json.load(handle).get("config", {}).get("grid_res")
         except (OSError, json.JSONDecodeError) as exc:
-            warnings.warn(f"Could not read {metadata_file}: {exc}")
+            warnings.warn(f"Could not read {metadata_file}: {exc}", stacklevel=2)
             continue
         if recorded is not None and not np.isclose(float(recorded), args.grid_res):
             message = (
@@ -294,7 +294,7 @@ def main() -> None:
             )
             if not args.allow_grid_res_mismatch:
                 raise SystemExit(message)
-            warnings.warn(message)
+            warnings.warn(message, stacklevel=2)
         break
 
     config = GeneratorConfig(

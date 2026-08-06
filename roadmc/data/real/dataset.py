@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,7 +14,6 @@ from roadmc.data.features import (
 )
 
 from .metadata import RoadPointCloudMetadata, load_scene_metadata, metadata_sidecar_path
-
 
 SUPPORTED_EXTENSIONS = {".npy", ".ply", ".pcd", ".las", ".laz"}
 
@@ -33,9 +31,9 @@ class RealRoadDataset(Dataset):
         self,
         data_dir: str | Path,
         file_pattern: str = "*.npy",
-        max_points: Optional[int] = 65536,
+        max_points: int | None = 65536,
         normalize: bool = True,
-        label_mapping: Optional[Dict[int, int]] = None,
+        label_mapping: dict[int, int] | None = None,
         require_metadata: bool = False,
     ) -> None:
         self.data_dir = Path(data_dir)
@@ -66,9 +64,9 @@ class RealRoadDataset(Dataset):
         cls,
         filepath: str | Path,
         *,
-        label_mapping: Optional[Dict[int, int]] = None,
+        label_mapping: dict[int, int] | None = None,
         require_metadata: bool = False,
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], RoadPointCloudMetadata]:
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None, RoadPointCloudMetadata]:
         """Load one raw scene, convert its units to meters, and normalize intensity."""
         path = Path(filepath)
         points, labels, normals, intensities = cls._load_file(path)
@@ -95,7 +93,7 @@ class RealRoadDataset(Dataset):
         return points, labels, normals, intensities, metadata
 
     @staticmethod
-    def _inferred_metadata(filepath: Path, intensities: Optional[np.ndarray]) -> RoadPointCloudMetadata:
+    def _inferred_metadata(filepath: Path, intensities: np.ndarray | None) -> RoadPointCloudMetadata:
         """Choose only a conservative fallback when a real scan lacks a sidecar."""
         suffix = filepath.suffix.lower()
         if suffix in {".las", ".laz"}:
@@ -106,7 +104,7 @@ class RealRoadDataset(Dataset):
             intensity_scale = "normalized_0_1"
         return RoadPointCloudMetadata(intensity_scale=intensity_scale)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         points, labels, normals, intensities, _ = self.load_scene(
             self.files[idx],
             label_mapping=self.label_mapping,
@@ -153,7 +151,7 @@ class RealRoadDataset(Dataset):
     @staticmethod
     def _load_file(
         filepath: Path,
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         ext = filepath.suffix.lower()
         if ext == ".npy":
             return RealRoadDataset._load_npy(filepath)
@@ -168,7 +166,7 @@ class RealRoadDataset(Dataset):
     @staticmethod
     def _load_npy(
         filepath: Path,
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         data = np.load(filepath, allow_pickle=True)
         if data.dtype.names:
             names = set(data.dtype.names)
@@ -190,7 +188,7 @@ class RealRoadDataset(Dataset):
     @staticmethod
     def _load_ply(
         filepath: Path,
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         try:
             from plyfile import PlyData
         except ImportError as exc:  # pragma: no cover - optional dependency guard
@@ -215,7 +213,7 @@ class RealRoadDataset(Dataset):
     @staticmethod
     def _load_las(
         filepath: Path,
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         try:
             import laspy
         except ImportError as exc:  # pragma: no cover - optional dependency guard
@@ -232,7 +230,7 @@ class RealRoadDataset(Dataset):
     @staticmethod
     def _load_pcd(
         filepath: Path,
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         header, encoding, payload = RealRoadDataset._read_pcd_header(filepath)
         fields = header.get("FIELDS", [])
         counts = [int(value) for value in header.get("COUNT", ["1"] * len(fields))]
@@ -245,7 +243,7 @@ class RealRoadDataset(Dataset):
                 values = values[None, :]
             offsets: dict[str, int] = {}
             offset = 0
-            for field, count in zip(fields, counts):
+            for field, count in zip(fields, counts, strict=False):
                 offsets[field] = offset
                 offset += count
             if not {"x", "y", "z"}.issubset(offsets):
@@ -282,7 +280,7 @@ class RealRoadDataset(Dataset):
         return points, None, normals, intensities
 
     @staticmethod
-    def _read_pcd_header(filepath: Path) -> Tuple[dict[str, list[str]], str, object]:
+    def _read_pcd_header(filepath: Path) -> tuple[dict[str, list[str]], str, object]:
         """Read a PCD header and return an open payload handle for ASCII parsing."""
         handle = filepath.open("rb")
         header: dict[str, list[str]] = {}
@@ -318,14 +316,14 @@ class RealRoadDataset(Dataset):
         names: set[str],
         candidates: tuple[str, ...],
         dtype: np.dtype,
-    ) -> Optional[np.ndarray]:
+    ) -> np.ndarray | None:
         for name in candidates:
             if name in names:
                 return np.asarray(source[name], dtype=dtype)  # type: ignore[index]
         return None
 
     @staticmethod
-    def _normals_from_fields(source: object, names: set[str]) -> Optional[np.ndarray]:
+    def _normals_from_fields(source: object, names: set[str]) -> np.ndarray | None:
         for candidates in (("nx", "ny", "nz"), ("normal_x", "normal_y", "normal_z")):
             if set(candidates).issubset(names):
                 return np.column_stack([source[name] for name in candidates]).astype(np.float32)  # type: ignore[index]
@@ -341,7 +339,7 @@ class RealRoadDataset(Dataset):
         return result
 
     @staticmethod
-    def map_to_jtg(labels_source: np.ndarray, mapping: Optional[Dict[int, int]] = None) -> np.ndarray:
+    def map_to_jtg(labels_source: np.ndarray, mapping: dict[int, int] | None = None) -> np.ndarray:
         """Map source semantic IDs to JTG IDs; unmapped IDs become background."""
         if mapping is None:
             return labels_source.astype(np.int64, copy=False)

@@ -15,7 +15,6 @@ from typing import Any
 
 import numpy as np
 
-
 UNIT_TO_METERS = {"m": 1.0, "cm": 0.01, "mm": 0.001}
 INTENSITY_SCALES = {"normalized_0_1", "uint8", "uint16", "raw_range"}
 
@@ -74,7 +73,7 @@ class RoadPointCloudMetadata:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "RoadPointCloudMetadata":
+    def from_dict(cls, data: dict[str, Any]) -> RoadPointCloudMetadata:
         allowed = {field.name for field in cls.__dataclass_fields__.values()}
         return cls(**{key: value for key, value in data.items() if key in allowed})
 

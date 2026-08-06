@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Literal
 
 # 全局常量
 
@@ -27,15 +27,15 @@ SURFACE_PEAK_BYTES_PER_POINT: int = 320
 DEFAULT_MAX_SURFACE_POINTS: int = 10_000_000
 DEFAULT_MAX_SURFACE_MEMORY_MIB: float = 4096.0
 
-ASPHALT_LABELS: Tuple[int, ...] = tuple(range(0, 21))
-CONCRETE_LABELS: Tuple[int, ...] = tuple(range(21, 38))
+ASPHALT_LABELS: tuple[int, ...] = tuple(range(0, 21))
+CONCRETE_LABELS: tuple[int, ...] = tuple(range(21, 38))
 
 # ISO 8608 拟合有效带上限 (cycle/m)：波长 0.354 m。更短波长属于 ISO 13473
 # 纹理域，由生成器的纹理谱段负责，两带互补不重叠。
 ISO8608_BAND_MAX_CYCLES_PER_M: float = 2.83
 
 # ISO 8608 路面功率谱密度参数 — 各粗糙度等级对应的不平整度系数 (×10⁻⁶ m³/cycle)
-ISO_ROUGHNESS: Dict[str, float] = {
+ISO_ROUGHNESS: dict[str, float] = {
     "A": 16,      # 极好
     "B": 64,      # 好
     "C": 256,     # 一般
@@ -45,7 +45,7 @@ ISO_ROUGHNESS: Dict[str, float] = {
 
 # JTG 5210-2018 病害标签定义
 
-LABEL_MAP: Dict[int, Dict[str, str]] = {
+LABEL_MAP: dict[int, dict[str, str]] = {
     0:  {"type": "背景",       "severity": "-",  "pavement": "通用"},
     1:  {"type": "龟裂",       "severity": "轻", "pavement": "沥青"},
     2:  {"type": "龟裂",       "severity": "重", "pavement": "沥青"},
@@ -149,7 +149,7 @@ class RoadSurfaceConfig:
         return float(self.width * self.length)
 
     @property
-    def surface_grid_shape(self) -> Tuple[int, int]:
+    def surface_grid_shape(self) -> tuple[int, int]:
         """Exact shape produced by ``np.arange(0, extent, grid_res)``."""
 
         nx = max(1, int(math.ceil(self.width / self.grid_res)))
@@ -200,7 +200,7 @@ class CrackConfig:
         fractal_perturbation: Perlin 噪声分形扰动幅度。
     """
 
-    crack_types: List[str] = field(
+    crack_types: list[str] = field(
         default_factory=lambda: ["longitudinal", "transverse", "alligator", "block"]
     )
     severity_ratio: float = 0.6
@@ -225,7 +225,7 @@ class PotholeConfig:
     max_radius_severe: float = 0.30
     max_depth_light: float = 0.025
     max_depth_severe: float = 0.10
-    beta_range: Tuple[float, float] = (2.0, 4.0)
+    beta_range: tuple[float, float] = (2.0, 4.0)
     edge_spall_prob: float = 0.3
 
 
@@ -256,9 +256,9 @@ class CorrugationConfig:
         amplitude_severe: 重度振幅 (米)，JTG > 25mm。
     """
 
-    wavelength_range: Tuple[float, float] = (0.3, 1.0)
-    amplitude_light: Tuple[float, float] = (0.010, 0.025)
-    amplitude_severe: Tuple[float, float] = (0.025, 0.050)
+    wavelength_range: tuple[float, float] = (0.3, 1.0)
+    amplitude_light: tuple[float, float] = (0.010, 0.025)
+    amplitude_severe: tuple[float, float] = (0.025, 0.050)
 
 
 @dataclass
@@ -272,8 +272,8 @@ class DepressionConfig:
     """
 
     max_radius: float = 2.0
-    depth_light: Tuple[float, float] = (0.010, 0.025)
-    depth_severe: Tuple[float, float] = (0.025, 0.080)
+    depth_light: tuple[float, float] = (0.010, 0.025)
+    depth_severe: tuple[float, float] = (0.025, 0.080)
 
 
 @dataclass
@@ -395,7 +395,7 @@ class LiDARScanConfig:
     vertical_fov_deg: float = 40.0
     range_decay: float = 0.3
     incidence_angle_drop: float = 0.05
-    sensor_pose: Optional[Tuple[float, float, float]] = None
+    sensor_pose: tuple[float, float, float] | None = None
     line_sigma_m: float = 0.02
 
     def __post_init__(self) -> None:
@@ -423,7 +423,7 @@ class DiseaseConfig:
         max_diseases_per_scene: 每场景最大病害数，默认 3。
     """
 
-    disease_probs: Dict[str, float] = field(default_factory=lambda: {
+    disease_probs: dict[str, float] = field(default_factory=lambda: {
         # 沥青路面病害
         "crack": 0.25,           # 裂缝（含纵向、横向、龟裂、块状）
         "pothole": 0.10,          # 坑槽
@@ -454,12 +454,12 @@ class DiseaseConfig:
 class SurfaceGenerationEstimate:
     """Preflight estimate for the full-resolution synthesis surface."""
 
-    grid_shape: Tuple[int, int]
+    grid_shape: tuple[int, int]
     point_count: int
     estimated_peak_memory_mib: float
     bytes_per_point_assumption: int = SURFACE_PEAK_BYTES_PER_POINT
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
 
         return {
@@ -517,10 +517,10 @@ class GeneratorConfig:
     concrete_damage: ConcreteDamageConfig = field(default_factory=ConcreteDamageConfig)
     lidar_noise: LidarNoiseConfig = field(default_factory=LidarNoiseConfig)
     lidar_scan: LiDARScanConfig = field(default_factory=LiDARScanConfig)
-    seed: Optional[int] = None
+    seed: int | None = None
     num_points: int = 65536
-    target_density: Optional[float] = None  # P1-2: 点/㎡
-    model_target_points: Optional[int] = None
+    target_density: float | None = None  # P1-2: 点/㎡
+    model_target_points: int | None = None
     target_label_min_output_points: int = 1
     point_count_tolerance: float = 0.20  # P1-2: ±20%
     max_surface_points: int = DEFAULT_MAX_SURFACE_POINTS
@@ -592,7 +592,7 @@ class GeneratorConfig:
         return int(self.num_points)
 
     @property
-    def sensor_output_density_points_per_m2(self) -> Optional[float]:
+    def sensor_output_density_points_per_m2(self) -> float | None:
         """Requested sensor density, or ``None`` for fixed-count output."""
 
         if self.sensor_output_mode == "density_voxel":
@@ -655,7 +655,7 @@ class GeneratorConfig:
             )
         return total_mib
 
-    def resolution_metadata(self, actual_output_points: Optional[int] = None) -> Dict[str, Any]:
+    def resolution_metadata(self, actual_output_points: int | None = None) -> dict[str, Any]:
         """Describe distinct surface, sensor-output, and model resolutions.
 
         The returned structure is JSON-safe and intentionally states that

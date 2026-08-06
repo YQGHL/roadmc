@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -30,32 +29,32 @@ else:
     _DatasetBase = torch.utils.data.Dataset
 
 try:
-    from .config import (
-        NUM_CLASSES,
-        GeneratorConfig,
-    )
-    from .labels import TargetLabelSpec, target_spec_for_label
     from ..features import (
         DEFAULT_GEOMETRY_K_NEIGHBORS,
         OBSERVABLE_FEATURE_NAMES,
         OBSERVABLE_FEATURE_SCHEMA,
         compute_observable_features,
     )
+    from .config import (
+        NUM_CLASSES,
+        GeneratorConfig,
+    )
+    from .labels import TargetLabelSpec, target_spec_for_label
     from .primitives import (
-        generate_road_surface,
+        add_bleeding,
+        add_concrete_damage,
+        add_corrugation,
         add_crack,
+        add_depression,
+        add_patching,
         add_pothole,
         add_raveling,
-        add_depression,
         add_rutting,
-        add_corrugation,
-        add_bleeding,
-        add_patching,
-        add_concrete_damage,
-        simulate_lidar_noise,
-        resample_to_lidar_pattern,
-        local_depression_depth,
+        generate_road_surface,
         geometric_occlusion_keep_mask,
+        local_depression_depth,
+        resample_to_lidar_pattern,
+        simulate_lidar_noise,
     )
 except ImportError:
     # Fallback for standalone / -m execution
@@ -71,30 +70,31 @@ except ImportError:
         GeneratorConfig,
     )
     from labels import TargetLabelSpec, target_spec_for_label  # type: ignore[no-redef]
+    from primitives import (  # type: ignore[no-redef]
+        add_bleeding,
+        add_concrete_damage,
+        add_corrugation,
+        add_crack,
+        add_depression,
+        add_patching,
+        add_pothole,
+        add_raveling,
+        add_rutting,
+        generate_road_surface,
+        geometric_occlusion_keep_mask,
+        local_depression_depth,
+        resample_to_lidar_pattern,
+        simulate_lidar_noise,
+    )
+
     from roadmc.data.features import (  # type: ignore[no-redef]
         DEFAULT_GEOMETRY_K_NEIGHBORS,
         OBSERVABLE_FEATURE_NAMES,
         OBSERVABLE_FEATURE_SCHEMA,
         compute_observable_features,
     )
-    from primitives import (  # type: ignore[no-redef]
-        generate_road_surface,
-        add_crack,
-        add_pothole,
-        add_raveling,
-        add_depression,
-        add_rutting,
-        add_corrugation,
-        add_bleeding,
-        add_patching,
-        add_concrete_damage,
-        simulate_lidar_noise,
-        resample_to_lidar_pattern,
-        local_depression_depth,
-        geometric_occlusion_keep_mask,
-    )
 
-CONCRETE_DAMAGE_TYPES: List[str] = [
+CONCRETE_DAMAGE_TYPES: list[str] = [
     "slab_shatter",
     "slab_crack",
     "corner_break",
@@ -112,7 +112,7 @@ CONCRETE_DAMAGE_TYPES: List[str] = [
 CONCRETE_NO_SEVERITY: set = {"pumping", "pitting", "blowup", "exposed_aggregate"}
 
 # 沥青路面可用的病害 key（对应 disease_probs 字典）
-ASPHALT_DISEASE_KEYS: List[str] = [
+ASPHALT_DISEASE_KEYS: list[str] = [
     "crack",
     "pothole",
     "raveling",
@@ -124,7 +124,7 @@ ASPHALT_DISEASE_KEYS: List[str] = [
 ]
 
 # 病害应用的自然顺序（大尺度 → 小尺度）
-DISEASE_APPLY_ORDER: Dict[str, int] = {
+DISEASE_APPLY_ORDER: dict[str, int] = {
     "corrugation": 0,
     "rutting": 1,
     "depression": 2,
@@ -140,7 +140,7 @@ DISEASE_APPLY_ORDER: Dict[str, int] = {
 # 当多个病害覆盖同一区域时，仅保留优先级最高的标签
 # 设计原则：坑槽 > 龟裂 > 纵向裂缝 > 块状裂缝 > 横向裂缝，
 # 大面积病害（车辙、沉陷、波浪拥包）优先级低于局部病害
-LABEL_PRIORITY: Dict[int, int] = {
+LABEL_PRIORITY: dict[int, int] = {
     0: 0,    # 背景
     # 沥青路面 — 局部破损优先级最高，大面积病害较低
     10: 10,  # 重坑槽 — 最高优先级
@@ -216,7 +216,7 @@ class SyntheticRoadDataset(_DatasetBase):
     def __len__(self) -> int:
         return self.dataset_size
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         """生成第 ``idx`` 个场景并返回 torch 张量字典。"""
         if torch is None:
             raise RuntimeError("torch is disabled for this generator process")
@@ -229,7 +229,7 @@ class SyntheticRoadDataset(_DatasetBase):
             "pavement_type": scene["pavement_type"],
         }
 
-    def generate_scene(self, idx: int, target_label: int | None = None) -> Dict:
+    def generate_scene(self, idx: int, target_label: int | None = None) -> dict:
         """生成一个完整的合成道路场景。
 
         内部流程按以下顺序执行：
@@ -259,10 +259,7 @@ class SyntheticRoadDataset(_DatasetBase):
         if target_label is not None:
             target_spec = target_spec_for_label(target_label)
 
-        if self.config.seed is not None:
-            scene_seed = self.config.seed + idx
-        else:
-            scene_seed = None
+        scene_seed = self.config.seed + idx if self.config.seed is not None else None
         rng = np.random.default_rng(scene_seed)
 
         grid_res = self.config.road.grid_res
@@ -491,10 +488,7 @@ class SyntheticRoadDataset(_DatasetBase):
                         rng=rng,
                     )
                 else:
-                    if damage_type in CONCRETE_NO_SEVERITY:
-                        sev = "-"
-                    else:
-                        sev = severity
+                    sev = "-" if damage_type in CONCRETE_NO_SEVERITY else severity
                     params = {
                         "slab_length": self.config.concrete_damage.slab_length,
                         "slab_width": self.config.concrete_damage.slab_width,
@@ -694,7 +688,7 @@ class SyntheticRoadDataset(_DatasetBase):
         # protection_available stays False on the density_voxel path: voxel
         # majority voting offers no minimum-survival guarantee, and the audit
         # record must not imply one.
-        protection_info: Dict = {
+        protection_info: dict = {
             "protected_label": -1 if target_label is None else int(target_label),
             "protected_min_points": int(self.config.target_label_min_output_points),
             "protection_available": False,
@@ -867,23 +861,20 @@ class SyntheticRoadDataset(_DatasetBase):
         self,
         rng: np.random.Generator,
         pavement_type: str,
-    ) -> List[Tuple[str, str]]:
+    ) -> list[tuple[str, str]]:
         """根据路面类型和配置概率随机选择病害组合。"""
         disease_probs = self.config.disease.disease_probs
         max_diseases = self.config.disease.max_diseases_per_scene
         severity_ratio = self.config.disease.severity_ratio
         use_stratified = self.config.disease.use_stratified
 
-        if pavement_type == "asphalt":
-            available = ASPHALT_DISEASE_KEYS
-        else:
-            available = ["concrete_damage"]
+        available = ASPHALT_DISEASE_KEYS if pavement_type == "asphalt" else ["concrete_damage"]
 
         if use_stratified:
             weighted = [(d, disease_probs.get(d, 0.0)) for d in available]
             weights = np.array([w for _, w in weighted], dtype=np.float64)
             valid = weights > 0.0
-            weighted = [item for item, keep in zip(weighted, valid) if keep]
+            weighted = [item for item, keep in zip(weighted, valid, strict=False) if keep]
             weights = weights[valid]
             if len(weighted) == 0:
                 selected = []
@@ -903,7 +894,7 @@ class SyntheticRoadDataset(_DatasetBase):
         if len(selected) > max_diseases:
             selected = list(rng.choice(selected, size=max_diseases, replace=False))
 
-        result: List[Tuple[str, str]] = []
+        result: list[tuple[str, str]] = []
         for disease in selected:
             if disease == "bleeding":
                 result.append((disease, "light"))
@@ -921,7 +912,7 @@ class SyntheticRoadDataset(_DatasetBase):
         width: float,
         length: float,
         rng: np.random.Generator,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Sample and apply one physically continuous repair patch."""
         cfg = self.config.patching
         max_patch_width = min(cfg.max_width, width * 0.8)
@@ -983,8 +974,8 @@ class SyntheticRoadDataset(_DatasetBase):
         pavement_type: str,
         sensor_origin: np.ndarray,
         rng: np.random.Generator,
-        depression_depth: Optional[np.ndarray] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        depression_depth: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """辐射强度模型：I ∝ ρ(x,y)·cosθ / R²，加斑点噪声与 8-bit 量化。
 
         激光雷达方程 (Jelalian 1992) 的朗伯近似。类别信息只能通过
@@ -1080,7 +1071,7 @@ class SyntheticRoadDataset(_DatasetBase):
         rng: np.random.Generator,
         protected_label: int | None = None,
         protected_min_points: int = 1,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
         """重采样到目标点数。多于目标则随机下采样，少于目标则随机重复补齐。
 
         受控场景 (protected_label 非 None) 先做自然随机下采样，只有当目标
@@ -1095,10 +1086,10 @@ class SyntheticRoadDataset(_DatasetBase):
             "protection_available": True,
             "protection_applied": False,
         }
-        if N == target_num:
+        if target_num == N:
             return points, labels, intensity, curvature, normals, protection_info
 
-        if N > target_num:
+        if target_num < N:
             idx = rng.choice(N, size=target_num, replace=False)
             if protected_label is not None and protected_min_points > 0:
                 protected_idx = np.flatnonzero(labels == protected_label)
@@ -1143,14 +1134,14 @@ class SyntheticRoadDataset(_DatasetBase):
         curvature: np.ndarray,
         normals: np.ndarray,
         voxel_size: float = 0.01,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """P1-2: 体素质心下采样，保留密度结构。"""
         if points.shape[0] < 10:
             return points, labels, intensity, curvature, normals
 
         # 体素索引仅使用 xy 维度（路面高度变化不应用于体素分割）
         voxel_indices = np.floor(points[:, :2] / voxel_size).astype(np.int64)
-        voxel_dict: Dict[Tuple[int, int], List[int]] = {}
+        voxel_dict: dict[tuple[int, int], list[int]] = {}
         for i, vi in enumerate(voxel_indices):
             key = (int(vi[0]), int(vi[1]))
             if key not in voxel_dict:
@@ -1166,7 +1157,7 @@ class SyntheticRoadDataset(_DatasetBase):
         result_curvature = np.zeros(N_voxels, dtype=np.float32)
         result_normals = np.zeros((N_voxels, 3), dtype=np.float32)
 
-        for vi, (key, idx_list) in enumerate(voxel_dict.items()):
+        for vi, (_key, idx_list) in enumerate(voxel_dict.items()):
             idx_arr = np.array(idx_list)
             result_pts[vi] = np.mean(points[idx_arr], axis=0)
             lbl_counts = np.bincount(labels[idx_arr].astype(np.int64))
@@ -1199,7 +1190,7 @@ class SyntheticRoadDataset(_DatasetBase):
     @staticmethod
     def _normalize_with_metadata(
         points: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, float]:
+    ) -> tuple[np.ndarray, np.ndarray, float]:
         """Normalize points while retaining the metric inverse transform."""
         centroid = np.mean(points, axis=0)
         centered = points - centroid
@@ -1296,9 +1287,9 @@ if __name__ == "__main__":
 
     # 小尺寸测试配置
     try:
-        from .config import GeneratorConfig, RoadSurfaceConfig, DiseaseConfig
+        from .config import DiseaseConfig, GeneratorConfig, RoadSurfaceConfig
     except ImportError:
-        from config import GeneratorConfig, RoadSurfaceConfig, DiseaseConfig
+        from config import DiseaseConfig, GeneratorConfig, RoadSurfaceConfig
 
     cfg = GeneratorConfig(
         road=RoadSurfaceConfig(
@@ -1324,7 +1315,7 @@ if __name__ == "__main__":
     print(f"normalize: {cfg.normalize}")
     print(f"seed: {cfg.seed}")
 
-    pavement_counts: Dict[str, int] = {"asphalt": 0, "concrete": 0}
+    pavement_counts: dict[str, int] = {"asphalt": 0, "concrete": 0}
     all_labels: set = set()
 
     for i in range(len(dataset)):
@@ -1343,7 +1334,7 @@ if __name__ == "__main__":
             ptype = data["pavement_type"]
 
             N = pts.shape[0]
-            assert N == cfg.num_points, (
+            assert cfg.num_points == N, (
                 f"points.shape[0]={N} != {cfg.num_points}"
             )
             assert pts.shape == (N, 3), f"points shape: {pts.shape}"

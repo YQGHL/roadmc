@@ -12,10 +12,6 @@ env:
 jobs:
   lint:
     name: Lint (ruff)
-    # Non-blocking for now: `ruff check .` reports 301 pre-existing violations
-    # (mostly UP pyupgrade modernization) across the codebase.  Flip to a
-    # required gate after a cleanup pass.
-    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

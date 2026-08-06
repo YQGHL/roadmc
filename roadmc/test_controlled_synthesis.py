@@ -10,6 +10,7 @@ import numpy as np
 
 os.environ.setdefault("ROADMC_GENERATOR_NO_TORCH", "1")
 
+from roadmc.data.features import OBSERVABLE_FEATURE_SCHEMA  # noqa: E402
 from roadmc.data.synthetic.config import (  # noqa: E402
     GeneratorConfig,
     LidarNoiseConfig,
@@ -18,7 +19,6 @@ from roadmc.data.synthetic.config import (  # noqa: E402
 )
 from roadmc.data.synthetic.generator import SyntheticRoadDataset  # noqa: E402
 from roadmc.data.synthetic.labels import ALL_DISEASE_LABELS, TARGET_LABEL_SPECS  # noqa: E402
-from roadmc.data.features import OBSERVABLE_FEATURE_SCHEMA  # noqa: E402
 from roadmc.data.synthetic.primitives import add_patching  # noqa: E402
 
 

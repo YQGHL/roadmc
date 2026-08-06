@@ -13,7 +13,6 @@ from roadmc.data.features import compute_observable_features
 from roadmc.data.real.dataset import RealRoadDataset
 from roadmc.data.real.metadata import RoadPointCloudMetadata, write_scene_metadata
 
-
 HAS_PLY = importlib.util.find_spec("plyfile") is not None
 HAS_LAS = importlib.util.find_spec("laspy") is not None
 HAS_OPEN3D = importlib.util.find_spec("open3d") is not None

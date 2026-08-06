@@ -249,7 +249,7 @@ def evaluate(args: argparse.Namespace) -> dict:
         evaluation_targets = binary_targets[selection_scene_count:] if calibration_scene_count else binary_targets
         confusion.zero_()
         scene_confusions = []
-        for probabilities, targets_array in zip(evaluation_probabilities, evaluation_targets):
+        for probabilities, targets_array in zip(evaluation_probabilities, evaluation_targets, strict=False):
             prediction_tensor = torch.from_numpy((probabilities >= threshold).astype(np.int64))
             target_tensor = torch.from_numpy(targets_array.astype(np.int64))
             scene_confusion = confusion_matrix_from_predictions(

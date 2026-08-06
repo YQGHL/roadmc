@@ -45,7 +45,7 @@ include = ["roadmc*"]
 target-version = "py311"
 line-length = 100
 lint.select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
-lint.ignore = ["E501", "N802", "N803", "N806"]
+lint.ignore = ["E501", "N802", "N803", "N806", "N812"]
 
 [tool.mypy]
 python_version = "3.11"

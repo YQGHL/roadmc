@@ -5,15 +5,20 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from roadmc.data.real.dataset import RealRoadDataset
-from roadmc.domain_gap import OBSERVABLE_NAMES, PointCloudRecord, compare_domains, dominant_ground_surface
+from roadmc.domain_gap import (
+    OBSERVABLE_NAMES,
+    PointCloudRecord,
+    compare_domains,
+    dominant_ground_surface,
+)
 
 
 def _scene_paths(root: Path, split: str, pattern: str, max_scenes: int) -> list[Path]:

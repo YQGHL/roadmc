@@ -9,7 +9,11 @@ from pathlib import Path
 import numpy as np
 
 from roadmc.data.features import OBSERVABLE_FEATURE_SCHEMA
-from roadmc.scripts.generate_class_budget import _feature_contract_errors, _parse_labels, _scan_coverage
+from roadmc.scripts.generate_class_budget import (
+    _feature_contract_errors,
+    _parse_labels,
+    _scan_coverage,
+)
 
 
 class ClassBudgetTests(unittest.TestCase):

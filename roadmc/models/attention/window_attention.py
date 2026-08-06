@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -14,8 +13,10 @@ _HERE = Path(__file__).resolve().parents[3]
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from roadmc.models.mhc.mhc import HyperConnection, MHCConnection
-
+from roadmc.models.mhc.mhc import (  # noqa: E402 — sys.path bootstrap above
+    HyperConnection,
+    MHCConnection,
+)
 
 # 窗口注意力偏置的显存上限（超出即判定为退化窗口占用而非正常配置）。
 _MAX_BIAS_BYTES: int = 3 * (1024 ** 3)
@@ -28,7 +29,7 @@ _MAX_BIAS_BYTES: int = 3 * (1024 ** 3)
 MAX_OCCUPANCY_MULTIPLIER: int = 4
 
 
-def parse_mixing(mixing: str) -> Tuple[str, int]:
+def parse_mixing(mixing: str) -> tuple[str, int]:
     """解析混合模式字符串 → (kind, n_streams)。
 
     - ``none``：标准残差（无混合）
@@ -79,7 +80,6 @@ def _cap_window_occupancy(
     across elements regardless of differing overflow counts.
     """
     B, N = window_id.shape
-    device = window_id.device
 
     def _rechunk(wid: torch.Tensor) -> torch.Tensor:
         counts = torch.bincount(wid, minlength=num_windows)
@@ -110,9 +110,9 @@ def _window_partition(
     window_size: int,
     shift: bool = False,
     mode: str = "columnar",
-    valid_mask: Optional[torch.Tensor] = None,
-    max_occupancy: Optional[int] = None,
-) -> Tuple[torch.Tensor, int]:
+    valid_mask: torch.Tensor | None = None,
+    max_occupancy: int | None = None,
+) -> tuple[torch.Tensor, int]:
     """Assign points to attention windows.
 
     两种分窗模式：
@@ -374,7 +374,7 @@ class WindowAttention3D(nn.Module):
         coords: torch.Tensor,
         x: torch.Tensor,
         shift: bool = False,
-        valid_mask: Optional[torch.Tensor] = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, N, C = x.shape
         H, D = self.num_heads, self.head_dim
@@ -500,7 +500,7 @@ class ShiftedWindowTransformerBlock(nn.Module):
         shift: bool = False,
         use_mhc: bool = True,
         drop_path: float = 0.0,
-        mixing: Optional[str] = None,
+        mixing: str | None = None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -539,7 +539,7 @@ class ShiftedWindowTransformerBlock(nn.Module):
         self,
         coords: torch.Tensor,
         x: torch.Tensor,
-        valid_mask: Optional[torch.Tensor] = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.mixing_kind == "hc":
             # x: (B, N, n, C) —— 每个子层读出 → 分支 → 双随机混合写回

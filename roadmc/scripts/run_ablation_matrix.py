@@ -30,7 +30,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PYTHON = sys.executable
@@ -70,7 +70,7 @@ def cell_name(dim: str, value: str, seed: int) -> str:
     return f"{dim}={value}_seed{seed}"
 
 
-def train_one(cell_dir: Path, cfg: Dict[str, Any], args) -> Path:
+def train_one(cell_dir: Path, cfg: dict[str, Any], args) -> Path:
     """训练一格，返回最佳 checkpoint 路径。"""
     cmd = [
         PYTHON, str(REPO_ROOT / "roadmc" / "train.py"), "baseline",
@@ -113,7 +113,7 @@ def train_one(cell_dir: Path, cfg: Dict[str, Any], args) -> Path:
     return max(ckpts, key=score)
 
 
-def evaluate_one(ckpt: Path, cell_dir: Path, args) -> Dict[str, Any]:
+def evaluate_one(ckpt: Path, cell_dir: Path, args) -> dict[str, Any]:
     """val 扫阈值冻结 → test 单次评估。返回汇总指标。"""
     val_json = cell_dir / "eval_val.json"
     test_json = cell_dir / "eval_test.json"
@@ -148,7 +148,7 @@ def evaluate_one(ckpt: Path, cell_dir: Path, args) -> Dict[str, Any]:
     }
 
 
-def _extract_threshold(report: Dict[str, Any]) -> float:
+def _extract_threshold(report: dict[str, Any]) -> float:
     """从 val 报告取在校准前缀场景上选出的阈值。
 
     优先 ``threshold_selection.selected_threshold``（前缀校准 + 独立
@@ -162,7 +162,7 @@ def _extract_threshold(report: Dict[str, Any]) -> float:
     raise KeyError("no threshold found in val report; inspect the JSON schema")
 
 
-def _summarize(report: Dict[str, Any]) -> Dict[str, Any]:
+def _summarize(report: dict[str, Any]) -> dict[str, Any]:
     metrics = report.get("metrics") or {}
     calibration = report.get("calibration") or {}
     bootstrap = report.get("scene_bootstrap") or {}
@@ -198,11 +198,11 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "ablation_summary.json"
-    summary: Dict[str, Any] = {}
+    summary: dict[str, Any] = {}
     if summary_path.exists():
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
 
-    cells: List[Dict[str, Any]] = []
+    cells: list[dict[str, Any]] = []
     for dim in args.dims:
         for value in DIM_VALUES[dim]:
             for seed in args.seeds:

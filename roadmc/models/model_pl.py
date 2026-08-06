@@ -4,19 +4,19 @@ Combines FocalLoss + DiceLoss + EdgeLoss for training
 Swin3D backbone with macro mIoU evaluation.
 """
 
+
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
-from typing import Optional, Tuple
 
+from roadmc.data.features import OBSERVABLE_FEATURE_SCHEMA, require_observable_checkpoint_schema
 from roadmc.metrics import (
     CalibrationAccumulator,
     bootstrap_scene_confidence_intervals,
     confusion_matrix_from_predictions,
     metrics_from_confusion,
 )
-from roadmc.data.features import OBSERVABLE_FEATURE_SCHEMA, require_observable_checkpoint_schema
 
 
 class HybridMuonAdamW(torch.optim.Optimizer):
@@ -62,7 +62,7 @@ class FocalLoss(nn.Module):
     α = class_weights (inverse frequency) to balance class distribution.
     """
 
-    def __init__(self, gamma: float = 2.0, alpha: Optional[torch.Tensor] = None):
+    def __init__(self, gamma: float = 2.0, alpha: torch.Tensor | None = None):
         super().__init__()
         self.gamma = gamma
         if alpha is not None:
@@ -71,7 +71,7 @@ class FocalLoss(nn.Module):
             self.alpha = None
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor,
-                valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                valid_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Compute focal loss. -1 targets are ignored unconditionally.
 
         无 valid_mask 路径下的 -1 padding 若不过滤，gather(-1) 会回绕到
@@ -126,7 +126,7 @@ class DiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor,
-                valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                valid_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Compute dice loss. -1 targets are ignored unconditionally
         (F.one_hot(-1) raises; the docstring contract is now enforced).
         """
@@ -186,7 +186,7 @@ class EdgeLoss(nn.Module):
 
     def _scatter_to_bev(
         self, values: torch.Tensor, coords: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Scatter per-point values to a BEV grid (mean aggregation).
 
         - 保持纵横比的 (gs_y, gs_x) 栅格；Sobel 直接在非方形网格上做
@@ -248,7 +248,7 @@ class EdgeLoss(nn.Module):
         logits: torch.Tensor,
         targets: torch.Tensor,
         coords: torch.Tensor,
-        valid_mask: Optional[torch.Tensor] = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute a differentiable damage-boundary loss for valid point sets."""
         B = logits.shape[0]
@@ -322,10 +322,10 @@ class RoadMCSegModel(pl.LightningModule):
         lambda_focal: float = 1.0,
         lambda_dice: float = 1.0,
         lambda_edge: float = 0.5,
-        class_weights: Optional[torch.Tensor] = None,
-        crack_dist_feat_idx: Optional[int] = None,
+        class_weights: torch.Tensor | None = None,
+        crack_dist_feat_idx: int | None = None,
         feature_schema: str = OBSERVABLE_FEATURE_SCHEMA,
-        input_point_count: Optional[int] = None,
+        input_point_count: int | None = None,
         t_max: int = 50,  # Cosine annealing period
         use_checkpoint: bool = False,  # gradient checkpointing to reduce VRAM
         use_mhc: bool = True,
@@ -334,7 +334,7 @@ class RoadMCSegModel(pl.LightningModule):
         validation_bootstrap_samples: int = 0,
         validation_bootstrap_seed: int = 42,
         drop_path_rate: float = 0.0,
-        mixing: Optional[str] = None,
+        mixing: str | None = None,
     ):
         super().__init__()
         if feature_schema != OBSERVABLE_FEATURE_SCHEMA:
@@ -401,7 +401,7 @@ class RoadMCSegModel(pl.LightningModule):
         self,
         coords: torch.Tensor,
         feats: torch.Tensor,
-        valid_mask: Optional[torch.Tensor] = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass through backbone.
 
@@ -545,7 +545,7 @@ class RoadMCSegModel(pl.LightningModule):
         optimizer, scheduler = self.build_optimizer_and_scheduler()
         return [optimizer], [scheduler]
 
-    def build_optimizer_and_scheduler(self, optimizer_name: Optional[str] = None):
+    def build_optimizer_and_scheduler(self, optimizer_name: str | None = None):
         """Build the optimizer and scheduler used by both Lightning and manual training."""
         optimizer_name = (optimizer_name or self.optimizer_name).lower()
         matrix_params = []
@@ -647,8 +647,8 @@ class RoadMCSegModel(pl.LightningModule):
     @staticmethod
     def compute_miou(
         preds: torch.Tensor, targets: torch.Tensor, num_classes: int,
-        valid_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        valid_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute macro mean IoU + per-class IoU, recall, precision. -1 target entries ignored.
         """
         if valid_mask is not None:
@@ -697,10 +697,7 @@ class RoadMCSegModel(pl.LightningModule):
         per_class_precision = torch.stack(precisions)
 
         # macro mIoU: skip background to match evaluation/reporting convention
-        if num_classes > 1:
-            miou = per_class_iou[1:].mean()
-        else:
-            miou = per_class_iou.mean()
+        miou = per_class_iou[1:].mean() if num_classes > 1 else per_class_iou.mean()
 
         return miou, per_class_iou, per_class_recall, per_class_precision
 

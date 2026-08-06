@@ -6,7 +6,12 @@ import unittest
 
 import numpy as np
 
-from roadmc.domain_gap import PointCloudRecord, compare_domains, dominant_ground_surface, observable_descriptors
+from roadmc.domain_gap import (
+    PointCloudRecord,
+    compare_domains,
+    dominant_ground_surface,
+    observable_descriptors,
+)
 
 
 class DomainGapTests(unittest.TestCase):

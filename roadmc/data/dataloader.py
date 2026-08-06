@@ -8,14 +8,13 @@ Supports:
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 import warnings
+from pathlib import Path
 
 import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
+import torch
+from torch.utils.data import DataLoader, Dataset
 
 from roadmc.data.curriculum import label_lut, normalize_label_stage
 from roadmc.data.features import (
@@ -39,10 +38,10 @@ class SyntheticPointCloudDataset(Dataset):
         self,
         data_dir: str | Path,
         split: str = "train",
-        max_points: Optional[int] = 65536,
+        max_points: int | None = 65536,
         augment: bool = False,
         binary: bool = False,
-        label_stage: Optional[str] = None,
+        label_stage: str | None = None,
         recompute_legacy_features: bool = True,
         train_disease_ratio: float = 0.5,
     ):
@@ -70,7 +69,7 @@ class SyntheticPointCloudDataset(Dataset):
     def __len__(self) -> int:
         return len(self.files)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         """Load a single scene."""
         data = np.load(self.files[idx], allow_pickle=True)
 
@@ -173,7 +172,7 @@ class SyntheticPointCloudDataset(Dataset):
 def _augment_point_cloud(
     coords: torch.Tensor,
     normals: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply feature-preserving augmentation: z-rotation + translation.
 
     只使用保持可观测特征不变的增广群：绕 z 旋转（两个几何特征均
@@ -194,8 +193,8 @@ def _augment_point_cloud(
 
 
 def collate_pointcloud_batch(
-    batch: List[Dict[str, torch.Tensor]],
-) -> Dict[str, torch.Tensor]:
+    batch: list[dict[str, torch.Tensor]],
+) -> dict[str, torch.Tensor]:
     """Collate function that pads variable-length point clouds to same N.
 
     Uses the maximum N in this batch as target, pads smaller scenes
@@ -211,26 +210,23 @@ def collate_pointcloud_batch(
             if t.shape[0] < max_N:
                 pad_size = max_N - t.shape[0]
                 # P0-2: pad labels with -1 (ignored in loss), others with 0
-                if t.ndim == 2:
-                    pad = (0, 0, 0, pad_size)
-                else:
-                    pad = (0, pad_size)
+                pad = (0, 0, 0, pad_size) if t.ndim == 2 else (0, pad_size)
                 pad_value = -1 if key == "labels" else 0
                 t = torch.nn.functional.pad(t, pad) if pad_value == 0 else \
                     torch.nn.functional.pad(t, pad, value=pad_value)
             tensors.append(t)
         batch_dict[key] = torch.stack(tensors)
-    
+
     # Add valid_mask: 1 for real points, 0 for padded
     valid_mask = []
     for item in batch:
         N = item["labels"].shape[0]
         vm = torch.ones(max_N, dtype=torch.bool)
-        if N < max_N:
+        if max_N > N:
             vm[N:] = False
         valid_mask.append(vm)
     batch_dict["valid_mask"] = torch.stack(valid_mask)
-    
+
     return batch_dict
 
 
@@ -244,7 +240,7 @@ class RoadMCDataModule(pl.LightningDataModule):
         max_points: int = 65536,
         num_workers: int = 0,
         binary: bool = False,
-        label_stage: Optional[str] = None,
+        label_stage: str | None = None,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -258,7 +254,7 @@ class RoadMCDataModule(pl.LightningDataModule):
             raise ValueError("binary=True cannot be combined with a non-binary label_stage")
         self.binary = self.label_stage == "binary"
 
-    def setup(self, stage: Optional[str] = None):
+    def setup(self, stage: str | None = None):
         """Initialize datasets."""
         if stage in (None, "fit"):
             self.train_dataset = SyntheticPointCloudDataset(
@@ -307,13 +303,16 @@ class RoadMCDataModule(pl.LightningDataModule):
 
 
 if __name__ == '__main__':
-    import sys; from pathlib import Path
+    import sys
+    from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
     # Create a small synthetic dataset for testing
-    from roadmc.data.synthetic.config import GeneratorConfig, RoadSurfaceConfig, DiseaseConfig
+    import os
+    import tempfile
+
+    from roadmc.data.synthetic.config import DiseaseConfig, GeneratorConfig, RoadSurfaceConfig
     from roadmc.data.synthetic.generator import SyntheticRoadDataset
-    import tempfile, os
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Generate 2 test scenes

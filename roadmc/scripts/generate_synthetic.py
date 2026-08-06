@@ -10,7 +10,6 @@ import warnings
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
 
 import numpy as np
 
@@ -19,10 +18,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from roadmc.data.synthetic.config import (
     DEFAULT_MAX_SURFACE_MEMORY_MIB,
     DEFAULT_MAX_SURFACE_POINTS,
-    DiseaseConfig,
-    GeneratorConfig,
     LABEL_MAP,
     NUM_CLASSES,
+    DiseaseConfig,
+    GeneratorConfig,
     RoadSurfaceConfig,
 )
 
@@ -88,7 +87,7 @@ def _save_one_scene(dataset, split_dir: Path, scene_id: int) -> dict:
         result["npoints"] = int(len(pts))
         result["labels"] = list(np.unique(lbls).astype(int))
     except Exception as exc:  # pragma: no cover
-        warnings.warn(f"Scene {scene_id} failed: {exc}")
+        warnings.warn(f"Scene {scene_id} failed: {exc}", stacklevel=2)
     return result
 
 
@@ -103,7 +102,7 @@ def generate_dataset(
     output_dir: Path,
     use_stratified: bool = True,
     num_workers: int = 1,
-) -> Dict:
+) -> dict:
     from roadmc.data.synthetic.generator import SyntheticRoadDataset
 
     split_dir = output_dir / split
@@ -117,7 +116,7 @@ def generate_dataset(
         disease=replace(scene_config.disease, use_stratified=use_stratified),
     )
 
-    class_counts = {i: 0 for i in range(NUM_CLASSES)}
+    class_counts = dict.fromkeys(range(NUM_CLASSES), 0)
     point_counts: list[int] = []
     failed = 0
     scene_ids = list(range(count))
@@ -175,13 +174,13 @@ def generate_dataset(
     }
 
 
-def verify_class_distribution(output_dir: Path, split: str) -> Dict[int, int]:
+def verify_class_distribution(output_dir: Path, split: str) -> dict[int, int]:
     split_dir = output_dir / split
     if not split_dir.exists():
         print(f"[WARN] {split} 目录不存在: {split_dir}")
         return {}
 
-    class_counts = {i: 0 for i in range(NUM_CLASSES)}
+    class_counts = dict.fromkeys(range(NUM_CLASSES), 0)
     total_scenes = 0
 
     print(f"\n=== {split.upper()} 类别分布 ===")
