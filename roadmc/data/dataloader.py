@@ -176,9 +176,10 @@ def _augment_point_cloud(
     """Apply feature-preserving augmentation: z-rotation + translation.
 
     只使用保持可观测特征不变的增广群：绕 z 旋转（两个几何特征均
-    旋转不变）与平移。各向同性缩放会改变 signed_local_height_residual
-    的物理量纲而 feats 未重算——违反"特征必须对应喂给模型的那个
-    点云"的契约，故移除。
+    旋转不变）与平移。移除各向同性缩放的理由是物理合理性而非特征
+    对应被破坏：几何通道（曲率、高度残差）对均匀缩放精确不变，但
+    缩放后的路面不是真实路面，且强度与几何的耦合不再自洽——故不放
+    入增广群。
     """
     angle = torch.rand(1).item() * 2 * torch.pi
     c, s = float(torch.cos(torch.tensor(angle))), float(torch.sin(torch.tensor(angle)))

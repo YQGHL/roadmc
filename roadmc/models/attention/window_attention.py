@@ -25,7 +25,8 @@ _MAX_BIAS_BYTES: int = 3 * (1024 ** 3)
 # 集群、collate padding 塌缩）可把数百点塞进一个窗口。上限 = window_size
 # × 此乘数，超限点按序重切成新窗口。实测占用：v2 ≤71(ws=32)/98(ws=64)、
 # v3 ≤65/103，4× 上限不触发 → 结果 bit-identical；raw 稠密场景 1032 点
-# 被压到上限内，偏置内存从 22.7 GiB 降到 O(几 MB)。
+# 被压到上限内，偏置内存从 22.7 GiB 降到 ≈0.059 GiB（≈63 MB，
+# W=65 名义窗的守卫公式估计值）。
 MAX_OCCUPANCY_MULTIPLIER: int = 4
 
 
@@ -271,7 +272,18 @@ def _window_attention_sdpa(
     neg_fill = torch.finfo(bias.dtype).min / 2
     attn_mask = bias.masked_fill(~valid[:, None, None, :], neg_fill)
 
-    out_pad = F.scaled_dot_product_attention(q_pad, k_pad, v_pad, attn_mask=attn_mask)
+    # 显式固定 math（组合算子）后端：与 train.py/evaluate.py 的 Blackwell
+    # (sm_120) 平台加固一致——mem-efficient 后端在训练路径上出现过两次
+    # 异步 CUDA illegal memory access（根因未确证），故全链路固定 math。
+    # CPU 上 math 是唯一后端，行为不受影响。
+    # torch < 2.6 的 SDPA 不接受 backend kwarg（仅依赖全局后端开关），
+    # 此时回退到不传参；2.6+ 显式 math。
+    try:
+        out_pad = F.scaled_dot_product_attention(
+            q_pad, k_pad, v_pad, attn_mask=attn_mask, backend="math"
+        )
+    except TypeError:
+        out_pad = F.scaled_dot_product_attention(q_pad, k_pad, v_pad, attn_mask=attn_mask)
 
     out_flat = out_pad.permute(0, 2, 1, 3)[w_of, slot]            # (B·N, H, D)
     # argsort 而非 empty+scatter：后者的正确性依赖"order 必为完整置换"

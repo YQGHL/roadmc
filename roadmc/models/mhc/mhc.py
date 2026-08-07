@@ -137,10 +137,13 @@ class HyperConnection(nn.Module):
         out   = F(x_in)                         # 分支（注意力 / FFN）
         h'    = H_res h + w_post ⊗ out          # H_res ∈ Birkhoff 多胞体
 
-    **恒等初始化是 bit-exact 的**：h 各流初始化为输入的副本，
-    w_pre = 1/n·1（读出 = x），H_res = I，w_post = 1（每条流都加上
-    分支输出）——此时 n 条流恒等且整网严格等价于标准 pre-norm 残差
-    网络，训练从已知良好解出发（HC 论文的 identity-init 原则）。
+    **恒等初始化在机器精度内等价于标准 pre-norm 残差**：h 各流初始化
+    为输入的副本，w_pre = 1/n·1（读出 = x），H_res ≈ I（近恒等，
+    n=2/4 偏差 ≈4.5e-5/1.4e-4），w_post = 1（每条流都加上分支输出）
+    ——此时 n 条流近乎恒等且整网在 ~1e-5 相对误差内严格等价于标准
+    pre-norm 残差网络，训练从已知良好解出发（HC 论文的 identity-init
+    原则）。非逐位 bit-exact（H_res 为近恒等而非精确 I，n≥4 的读出
+    最坏有 ≤1 ulp 舍入），相关测试断言 rel<1e-5。
 
     Args:
         channels: 通道数（仅用于诊断/记录，混合不作用在通道上）。
@@ -243,7 +246,7 @@ if __name__ == "__main__":
         # 恒等初始化：read 恢复输入
         x_in = hc.read(h)
         assert torch.allclose(x_in, h[..., 0, :], atol=1e-5), "identity read broken"
-        # 一层更新后各流仍应几乎相同（bit-exact identity init 的可观测后果）
+        # 一层更新后各流仍应几乎相同（恒等初始化的可观测后果）
         branch = torch.randn(2, 16, C)
         h2 = hc.write(h, branch)
         spread = (h2 - h2.mean(dim=-2, keepdim=True)).abs().max()
