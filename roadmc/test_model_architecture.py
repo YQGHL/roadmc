@@ -153,8 +153,8 @@ class DscmTests(unittest.TestCase):
 class HyperConnectionTests(unittest.TestCase):
     """文献口径 n 流 mHC（消融对照，xHC 语境下的必答题）。"""
 
-    def test_identity_init_is_bit_exact_standard_residual(self) -> None:
-        """恒等初始化下 HC 骨干必须与标准残差骨干逐值一致。"""
+    def test_identity_init_machine_precision_standard_residual(self) -> None:
+        """恒等初始化下 HC 骨干必须在机器精度（~1e-5 相对误差）内等价于标准残差骨干。"""
         coords = _road_cloud(2, 256, seed=11)
         feats = torch.rand(2, 256, 3)
         for mixing in ("hc2", "hc4"):
@@ -356,6 +356,9 @@ class BiasBudgetTests(unittest.TestCase):
 
 
 class OptimizerRoutingTests(unittest.TestCase):
+    @unittest.skipIf(
+        not hasattr(torch.optim, "Muon"), "torch.optim.Muon requires torch>=2.9"
+    )
     def test_muon_excludes_head_embed_and_dscm(self) -> None:
         from roadmc.models.model_pl import RoadMCSegModel
         model = RoadMCSegModel(
@@ -372,6 +375,58 @@ class OptimizerRoutingTests(unittest.TestCase):
         # adjust_lr_fn 必须是 match_rms_adamw
         for g in optimizer.muon.param_groups:
             self.assertEqual(g["adjust_lr_fn"], "match_rms_adamw")
+        del scheduler
+
+    def test_is_muon_excluded_covers_hc_log_kernels(self) -> None:
+        """mHC 的 hc_attn/hc_ffn.log_kernel 必须与 DSCM log-核一样归 AdamW。
+
+        M04 验证发现旧排除规则只匹配 ``.mhc.log_kernel``，mixing=hc 时
+        n×n 小核会被误路由进 Muon——这里静态锁定排除集覆盖全部 log_kernel。
+        """
+        from roadmc.models.model_pl import RoadMCSegModel
+        excluded = RoadMCSegModel._is_muon_excluded
+        for name in (
+            "backbone.stage1.block0.attn.hc_attn.log_kernel",
+            "backbone.stage1.block0.mlp.hc_ffn.log_kernel",
+            "backbone.stage1.block0.attn.mhc.log_kernel",
+            "patch_embed.proj.weight",
+        ):
+            self.assertTrue(excluded(name), f"{name} should be Muon-excluded")
+        for name in (
+            "backbone.stage1.block0.attn.qkv.weight",
+            "backbone.stage1.block0.mlp.fc1.weight",
+            "backbone.stage1.block0.attn.pos_mlp.0.weight",
+        ):
+            self.assertFalse(excluded(name), f"{name} should stay in Muon")
+
+    def test_adamw_head_lr_matches_muon_branch(self) -> None:
+        """adamw 分支的分类头 lr 必须与 muon 分支一致（消除 3× 消融混杂）。"""
+        from roadmc.models.model_pl import RoadMCSegModel
+        model = RoadMCSegModel(
+            embed_dim=32, depths=(1, 1, 1, 1), num_heads=(2, 2, 4, 4),
+            window_size=32, optimizer_name="adamw", lr=1e-3, t_max=5,
+        )
+        optimizer, scheduler = model.build_optimizer_and_scheduler()
+        # scheduler 创建时把各组的 lr 统一乘 warmup start_factor，因此直接
+        # 比较同一次构造内的相对基准：头组 lr 必须等于矩阵组 lr（旧实现为 3×）。
+        head_ids = {id(p) for name, p in model.named_parameters()
+                    if "decode.cls_head" in name and p.ndim == 2}
+        self.assertTrue(head_ids, "model must expose 2-D cls_head params")
+        head_lr = matrix_lr = None
+        matrix_ids = {
+            id(p) for name, p in model.named_parameters()
+            if p.ndim == 2 and not model._is_muon_excluded(name)
+            and "decode.cls_head" not in name
+        }
+        for g in optimizer.param_groups:
+            gids = {id(p) for p in g["params"]}
+            if head_ids & gids:
+                head_lr = g["lr"]
+            if matrix_ids & gids:
+                matrix_lr = g["lr"]
+        self.assertIsNotNone(head_lr)
+        self.assertIsNotNone(matrix_lr)
+        self.assertEqual(head_lr, matrix_lr)
         del scheduler
 
 

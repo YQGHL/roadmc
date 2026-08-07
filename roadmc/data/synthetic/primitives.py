@@ -824,7 +824,9 @@ def add_crack(
 
         # 深度剖面
         # d(depth_ratio) = d_max * exp(-(depth_ratio)^p)
-        lambda_param = half_width / 2.0  # λ 与宽度相关
+        # λ = half_width/2 = w/4（w 为插值缝宽）：高斯槽在物理带边缘
+        # (r=w/2) 处深度 = d_max·e⁻⁴ ≈ 0.018·d_max，比 λ=w/2 的表述窄得多。
+        lambda_param = half_width / 2.0  # λ = w/4
         p_param = 2.0  # 高斯槽 (p=2)
 
         # 裂缝区域掩码
@@ -960,6 +962,7 @@ def add_pothole(
     edge_quality: float,
     severity: str,
     seed: int | None = None,
+    beta_range: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Add a pothole (坑槽) via superellipsoid depression.
 
@@ -988,6 +991,8 @@ def add_pothole(
         edge_quality: 边缘质量因子 [0,1]，1 为完整，0 为严重剥落。
         severity: 严重程度 'light' | 'severe'。
         seed: 随机种子。
+        beta_range: 重度坑槽的 β 采样区间 (lo, hi)；轻度恒为 2（椭球）。
+            None 时重度取 [3, 5]（默认口径，与 PotholeConfig.beta_range 一致）。
 
     Returns:
         points_modified:  修改后点云 (N, 3)。
@@ -1003,8 +1008,14 @@ def add_pothole(
     xy = pts[:, :2]
     r = np.sqrt((xy[:, 0] - cx) ** 2 + (xy[:, 1] - cy) ** 2)
 
-    # 超椭圆指数 β
-    beta = 2.0 if severity == "light" else 3.0 + rng.random() * 2.0  # β ∈ [3, 5] 平底
+    # 超椭圆指数 β：轻度恒为 2（椭球）；重度按 beta_range 采样（平底）。
+    if severity == "light":
+        beta = 2.0
+    elif beta_range is not None:
+        lo, hi = beta_range
+        beta = float(rng.uniform(lo, hi))
+    else:
+        beta = 3.0 + rng.random() * 2.0  # β ∈ [3, 5] 平底
 
     # 坑槽主凹陷
     in_pothole = r <= radius

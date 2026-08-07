@@ -146,7 +146,8 @@ class DiceLoss(nn.Module):
         # L2 fix: vectorized per-class dice (no Python loop)
         # intersection: (C,) sum over B,N
         intersection = (probs * targets_one_hot).sum(dim=0)  # (C,)
-        # union: (C,)
+        # union 变量实为 |P|+|T|（Dice 分母项），非集合并集 |P∪T|——命名
+        # 易误读，但对 Dice 公式是正确的。
         union = probs.sum(dim=0) + targets_one_hot.sum(dim=0)  # (C,)
         dice = (2.0 * intersection + self.smooth) / (union + self.smooth)  # (C,)
         dice_loss = 1.0 - dice  # (C,)
@@ -608,8 +609,12 @@ class RoadMCSegModel(pl.LightningModule):
                     {"params": matrix_params, "lr": self.lr, "weight_decay": self.weight_decay}
                 )
             if head_params:
+                # 头 lr 与 muon 分支保持一致（muon 分支的头同样归 AdamW、
+                # lr=self.lr、wd=wd*0.5）。旧实现给 adamw 分支的头 3× lr，
+                # 使 Muon-vs-AdamW 消融同时混杂了头学习率——干净对比要求
+                # 两条分支的分类头采用同一超参。
                 param_groups.append(
-                    {"params": head_params, "lr": self.lr * 3.0, "weight_decay": self.weight_decay * 0.5}
+                    {"params": head_params, "lr": self.lr, "weight_decay": self.weight_decay * 0.5}
                 )
             if adamw_params:
                 param_groups.append(
@@ -637,11 +642,16 @@ class RoadMCSegModel(pl.LightningModule):
 
     @staticmethod
     def _is_muon_excluded(name: str) -> bool:
-        """Hidden-matrix filter: embeddings and non-linear-operator params go to AdamW."""
+        """Hidden-matrix filter: embeddings and non-linear-operator params go to AdamW.
+
+        Muon 只作用于 hidden 2D 矩阵。patch_embed（嵌入首层）与全部
+        log_kernel（DSCM 的 ``.mhc.log_kernel``、mHC 的
+        ``hc_attn.log_kernel`` / ``hc_ffn.log_kernel``——经 Sinkhorn
+        非线性作用）都归 AdamW，避免 n×n 小核被误路由进 Muon。
+        """
         return (
             "patch_embed" in name
-            or ".mhc.log_kernel" in name
-            or name.endswith("mhc.log_kernel")
+            or "log_kernel" in name
         )
 
     @staticmethod

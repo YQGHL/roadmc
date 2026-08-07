@@ -81,8 +81,9 @@ def _chunked_ema_scan(x: torch.Tensor, alpha: torch.Tensor, chunk: int = 64) -> 
 
     块内用下三角幂矩阵一次张量积完成，块间只串行传递 carry 状态——
     串行步数从 N 降到 N/chunk。数学与逐 token 递推严格一致（回归
-    测试断言逐点相等）。不使用 α^t·cumsum(x/α^t) 的朴素技巧：α^N
-    在长序列下溢为 0。
+    测试断言逐点相等）。不使用 α^t·cumsum(x/α^t) 的朴素技巧：α<1 时
+    α^t 下溢（长序列 α^N→0），且 1/α^t 先上溢（实测 0.9**-16384
+    抛 OverflowError）——后者是真正致命项。
     """
     B, N, C = x.shape
     L = chunk

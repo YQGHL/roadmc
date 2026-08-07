@@ -197,7 +197,8 @@ class CrackConfig:
         crack_types: 允许生成的裂缝类型列表。
         severity_ratio: 轻度裂缝占比，默认 0.6 (重度 0.4)。
         bezier_points: Bézier 曲线控制点数，默认 4。
-        fractal_perturbation: Perlin 噪声分形扰动幅度。
+        fractal_perturbation: value-noise 分形扰动幅度（fBm 型多倍频
+            value noise，非 Perlin 梯度噪声——见 primitives.py 实现）。
     """
 
     crack_types: list[str] = field(
@@ -217,7 +218,8 @@ class PotholeConfig:
         max_radius_severe: 重度坑槽最大半径 (米)。
         max_depth_light: 轻度坑槽最大深度 (米)，JTG ≤ 25mm。
         max_depth_severe: 重度坑槽最大深度 (米)，JTG > 25mm。
-        beta_range: 超椭圆指数范围，β=2 为椭球，β>2 为平底坑。
+        beta_range: 重度坑槽超椭圆指数 β 的采样区间 (lo, hi)。轻度恒为
+            β=2（椭球凹陷）；重度在此区间采样（β>2 为平底坑）。
         edge_spall_prob: 边缘剥落概率。
     """
 
@@ -225,8 +227,13 @@ class PotholeConfig:
     max_radius_severe: float = 0.30
     max_depth_light: float = 0.025
     max_depth_severe: float = 0.10
-    beta_range: tuple[float, float] = (2.0, 4.0)
+    beta_range: tuple[float, float] = (3.0, 5.0)
     edge_spall_prob: float = 0.3
+
+    def __post_init__(self) -> None:
+        lo, hi = self.beta_range
+        if not 0.0 < lo <= hi:
+            raise ValueError(f"beta_range must satisfy 0 < lo <= hi, got {self.beta_range}")
 
 
 @dataclass

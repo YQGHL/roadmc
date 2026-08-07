@@ -401,6 +401,7 @@ class SyntheticRoadDataset(_DatasetBase):
                     center=(cx, cy), radius=radius, depth=depth,
                     edge_quality=edge_quality, severity=severity,
                     seed=seed,
+                    beta_range=self.config.pothole.beta_range,
                 )
 
             elif disease_type == "depression":

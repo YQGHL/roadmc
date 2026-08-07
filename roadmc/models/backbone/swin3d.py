@@ -295,7 +295,7 @@ class Swin3D(nn.Module):
 
         HC 模式下残差被扩展为 n 条流 (B,N,n,C) 贯穿骨干，skip 在进入
         解码器前按流维取均值收缩——恒等初始化时该 expand/contract 对
-        使整网 bit-exact 等价于标准残差网络。
+        使整网在机器精度内等价于标准残差网络（rel<1e-5，非逐位 bit-exact）。
         """
         x = torch.cat([coords, feats], dim=-1)
         x = self.patch_embed(x)

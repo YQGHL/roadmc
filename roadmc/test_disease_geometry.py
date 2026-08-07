@@ -22,6 +22,7 @@ from roadmc.data.synthetic.config import (  # noqa: E402
     GeneratorConfig,
     LidarNoiseConfig,
     MicroTextureConfig,
+    PotholeConfig,
     RoadSurfaceConfig,
 )
 from roadmc.data.synthetic.generator import SyntheticRoadDataset  # noqa: E402
@@ -30,6 +31,7 @@ from roadmc.data.synthetic.primitives import (  # noqa: E402
     add_concrete_damage,
     add_corrugation,
     add_crack,
+    add_pothole,
     add_rutting,
 )
 
@@ -282,6 +284,45 @@ class RuttingObservabilityTests(unittest.TestCase):
         left_track = labeled & (pts[:, 0] < 3.5)
         band = pts[left_track, 0]
         self.assertLess(float(band.max() - band.min()), 0.85)
+
+
+class PotholeBetaRangeTests(unittest.TestCase):
+    """坑槽超椭圆指数 β 由 beta_range 配置驱动（G06-D1/D2 修复）。
+
+    轻度恒为 β=2（椭球）；重度按 beta_range 采样（β>2 平底）。
+    β 越大，r=0.5R 处相对深度 |z|/d 越大（底部更平）。
+    """
+
+    def _depth_ratio(self, severity: str, beta_range: tuple[float, float] | None,
+                     radius: float = 0.2, depth: float = 0.05) -> float:
+        pts = _flat_grid(1.0, 1.0, 0.005)
+        labels = np.zeros(len(pts), dtype=np.int64)
+        out_pts, _ = add_pothole(
+            pts, labels, center=(0.5, 0.5), radius=radius, depth=depth,
+            edge_quality=1.0, severity=severity, seed=0, beta_range=beta_range,
+        )
+        r = np.hypot(out_pts[:, 0] - 0.5, out_pts[:, 1] - 0.5)
+        ring = (r > 0.099) & (r < 0.101)  # r/R ≈ 0.5
+        return float(np.median(out_pts[ring, 2]) / depth)
+
+    def test_light_pothole_is_ellipsoid_beta2(self) -> None:
+        # 椭球剖面 z(r=0.5R) = -d·(1-0.5²)^0.5 = -0.866d
+        self.assertAlmostEqual(self._depth_ratio("light", None), -0.866, delta=0.04)
+
+    def test_beta_range_governs_severe_profile(self) -> None:
+        # β 越大底部越平 → 0.5R 处更负
+        d3 = self._depth_ratio("severe", (3.0, 3.0))
+        d5 = self._depth_ratio("severe", (5.0, 5.0))
+        self.assertLess(d5, d3)
+        # 理论：β=3 → -(1-0.5³)^(1/3) = -0.956；β=5 → -(1-0.5⁵)^0.2 = -0.994
+        self.assertAlmostEqual(d3, -0.956, delta=0.04)
+        self.assertAlmostEqual(d5, -0.994, delta=0.04)
+
+    def test_config_beta_range_validated(self) -> None:
+        # 死配置修复：beta_range 成为有效参数，非法区间在构造时拒绝。
+        with self.assertRaises(ValueError):
+            PotholeConfig(beta_range=(5.0, 3.0))
+        self.assertEqual(PotholeConfig().beta_range, (3.0, 5.0))
 
 
 if __name__ == "__main__":
