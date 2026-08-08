@@ -275,14 +275,18 @@ def _window_attention_sdpa(
     # 显式固定 math（组合算子）后端：与 train.py/evaluate.py 的 Blackwell
     # (sm_120) 平台加固一致——mem-efficient 后端在训练路径上出现过两次
     # 异步 CUDA illegal memory access（根因未确证），故全链路固定 math。
-    # CPU 上 math 是唯一后端，行为不受影响。
-    # torch < 2.6 的 SDPA 不接受 backend kwarg（仅依赖全局后端开关），
-    # 此时回退到不传参；2.6+ 显式 math。
-    try:
-        out_pad = F.scaled_dot_product_attention(
-            q_pad, k_pad, v_pad, attn_mask=attn_mask, backend="math"
-        )
-    except TypeError:
+    # torch 2.1+ 提供 sdpa_kernel 上下文（内部即 SDPBackend.MATH）；更早
+    # 版本没有该 API，只能依赖 train.py/evaluate.py 的全局后端开关
+    # （enable_math_sdp），此处回退为空上下文。
+    _SDPA_MATH_CTX = getattr(
+        torch.nn.attention, "sdpa_kernel", None
+    )
+    if _SDPA_MATH_CTX is not None:
+        with _SDPA_MATH_CTX(torch.nn.attention.SDPBackend.MATH):
+            out_pad = F.scaled_dot_product_attention(
+                q_pad, k_pad, v_pad, attn_mask=attn_mask
+            )
+    else:
         out_pad = F.scaled_dot_product_attention(q_pad, k_pad, v_pad, attn_mask=attn_mask)
 
     out_flat = out_pad.permute(0, 2, 1, 3)[w_of, slot]            # (B·N, H, D)

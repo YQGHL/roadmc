@@ -318,6 +318,19 @@ class PotholeBetaRangeTests(unittest.TestCase):
         self.assertAlmostEqual(d3, -0.956, delta=0.04)
         self.assertAlmostEqual(d5, -0.994, delta=0.04)
 
+    def test_invalid_beta_range_rejected(self) -> None:
+        # 直调 primitive 也防御：lo<=0 或 lo>hi 直接拒绝，避免 β∈(0,1)
+        # 产生坑心 cusp 或反序区间静默出错。
+        pts = _flat_grid(0.4, 0.4, 0.01)
+        labels = np.zeros(len(pts), dtype=np.int64)
+        for bad in ((0.0, 3.0), (4.0, 3.0)):
+            with self.assertRaises(ValueError):
+                add_pothole(
+                    pts, labels, center=(0.2, 0.2), radius=0.1, depth=0.03,
+                    edge_quality=1.0, severity="severe", seed=0,
+                    beta_range=bad,
+                )
+
     def test_config_beta_range_validated(self) -> None:
         # 死配置修复：beta_range 成为有效参数，非法区间在构造时拒绝。
         with self.assertRaises(ValueError):
