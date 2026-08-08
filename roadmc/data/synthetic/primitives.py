@@ -1009,6 +1009,8 @@ def add_pothole(
     r = np.sqrt((xy[:, 0] - cx) ** 2 + (xy[:, 1] - cy) ** 2)
 
     # 超椭圆指数 β：轻度恒为 2（椭球）；重度按 beta_range 采样（平底）。
+    if beta_range is not None and not 0.0 < beta_range[0] <= beta_range[1]:
+        raise ValueError(f"beta_range must satisfy 0 < lo <= hi, got {beta_range}")
     if severity == "light":
         beta = 2.0
     elif beta_range is not None:
