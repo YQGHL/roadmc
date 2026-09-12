@@ -113,6 +113,7 @@ def observable_descriptors(
     k_neighbors: int = 16,
     max_points: int | None = 4096,
     seed: int = 42,
+    normal_source: str = "pca",
 ) -> dict[str, np.ndarray]:
     """Compute sensor-observable local geometry descriptors for one scene.
 
@@ -121,33 +122,34 @@ def observable_descriptors(
     ``lambda_0 / sum(lambda)``. The height residual is the orthogonal distance
     from the query point to its neighbors' PCA tangent plane. Surface density
     uses ``k / (pi r_k^2)``, appropriate for a locally two-dimensional road.
+
+    Local geometry is always estimated on the full finite cloud so that
+    density and neighborhood scale carry no subsampling bias; ``max_points``
+    only caps how many per-point descriptor values are returned.
+    ``normal_source="pca"`` (default) derives the tilt descriptor from the same
+    PCA estimator that real scans must use; ``"supplied"`` overrides with
+    stored per-point normals where present (legacy behaviour; only comparable
+    when every domain stores normals from the same source).
     """
+    if normal_source not in ("pca", "supplied"):
+        raise ValueError(f"unknown normal_source: {normal_source!r}")
     original_points = np.asarray(record.points)
     valid = np.isfinite(original_points).all(axis=1)
-    points = _validated_points(original_points, max_points, seed)
-    if len(points) != int(valid.sum()):
-        # Sampling happened after finite filtering. Reproduce the selected rows
-        # below only for optional per-point fields by matching through indices.
-        finite_indices = np.flatnonzero(valid)
-        rng = np.random.default_rng(seed)
-        selected_indices = finite_indices[rng.choice(len(finite_indices), size=len(points), replace=False)]
-    else:
-        selected_indices = np.flatnonzero(valid)
+    points = original_points[valid]
+    if len(points) < 4:
+        raise ValueError("at least four finite points are required for geometric diagnostics")
 
     geometry = estimate_local_surface_geometry(points, k_neighbors=k_neighbors)
-    curvature = geometry.pca_curvature
-    pca_normals = geometry.normals
-
-    normals = pca_normals
-    if record.normals is not None:
+    normals = geometry.normals
+    if normal_source == "supplied" and record.normals is not None:
         supplied = np.asarray(record.normals, dtype=np.float64)
         if supplied.ndim == 2 and supplied.shape == original_points.shape:
-            supplied = supplied[selected_indices]
+            supplied = supplied[valid]
             supplied_norm = np.linalg.norm(supplied, axis=1)
             supplied_valid = supplied_norm > 1e-8
             supplied[supplied_valid] /= supplied_norm[supplied_valid, None]
             supplied[supplied[:, 2] < 0.0] *= -1.0
-            normals = pca_normals.copy()
+            normals = normals.copy()
             normals[supplied_valid] = supplied[supplied_valid]
 
     normal_tilt = np.arccos(np.clip(normals[:, 2], -1.0, 1.0))
@@ -159,18 +161,23 @@ def observable_descriptors(
         DEFAULT_HEIGHT_RESIDUAL_CLIP,
     )
 
+    selection = np.arange(len(points))
+    if max_points is not None and len(points) > max_points:
+        rng = np.random.default_rng(seed)
+        selection = rng.choice(len(points), size=max_points, replace=False)
+
     output = {
-        "density_per_m2": density.astype(np.float64),
-        "normal_tilt_rad": normal_tilt.astype(np.float64),
-        "pca_curvature": curvature.astype(np.float64),
-        "height_residual_m": height_residual.astype(np.float64),
-        "signed_height_residual_over_radius": scaled_signed_residual.astype(np.float64),
+        "density_per_m2": density[selection].astype(np.float64),
+        "normal_tilt_rad": normal_tilt[selection].astype(np.float64),
+        "pca_curvature": geometry.pca_curvature[selection].astype(np.float64),
+        "height_residual_m": height_residual[selection].astype(np.float64),
+        "signed_height_residual_over_radius": scaled_signed_residual[selection].astype(np.float64),
     }
     if record.intensities is not None:
         intensities = np.asarray(record.intensities, dtype=np.float64)
         if intensities.ndim == 1 and len(intensities) == len(original_points):
-            intensity = intensities[selected_indices]
-            output["intensity"] = np.clip(intensity[np.isfinite(intensity)], 0.0, 1.0)
+            selected = np.clip(intensities[valid][selection], 0.0, 1.0)
+            output["intensity"] = selected[np.isfinite(selected)]
     return output
 
 
@@ -242,6 +249,7 @@ def compare_domains(
     max_points_per_scene: int = 4096,
     mmd_max_samples: int = 512,
     seed: int = 42,
+    normal_source: str = "pca",
 ) -> dict:
     """Compare two scene collections using W1, energy distance, and MMD."""
     source_records = list(source_records)
@@ -257,6 +265,7 @@ def compare_domains(
                 k_neighbors=k_neighbors,
                 max_points=max_points_per_scene,
                 seed=seed + seed_offset + index,
+                normal_source=normal_source,
             )
             for name, values in descriptors.items():
                 if len(values):
@@ -303,6 +312,7 @@ def compare_domains(
         "model_input_feature_names": list(OBSERVABLE_FEATURE_NAMES),
         "k_neighbors": k_neighbors,
         "max_points_per_scene": max_points_per_scene,
+        "normal_source": normal_source,
         "descriptors": descriptors,
         "joint_rbf_mmd": joint_mmd,
         "joint_descriptor_names": common_names,
