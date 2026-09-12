@@ -186,6 +186,8 @@ def main() -> None:
     parser.add_argument("--out-dir", default="./output/ablation_r2")
     parser.add_argument("--dims", nargs="+", default=["mixing"],
                         choices=sorted(DIM_VALUES))
+    parser.add_argument("--values", nargs="+", default=None,
+                        help="只跑这些取值（默认每个维度全部取值）")
     parser.add_argument("--seeds", nargs="+", type=int, default=[42])
     parser.add_argument("--max-epochs", type=int, default=15)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -205,6 +207,8 @@ def main() -> None:
     cells: list[dict[str, Any]] = []
     for dim in args.dims:
         for value in DIM_VALUES[dim]:
+            if args.values and value not in args.values:
+                continue
             for seed in args.seeds:
                 cfg = dict(BASE)
                 cfg[dim] = value

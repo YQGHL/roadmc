@@ -103,19 +103,37 @@ def _print_summary(report: dict) -> None:
 
 
 def _apply_ground_filter(
-    records: Iterable[PointCloudRecord], distance_threshold: float, seed: int
-) -> tuple[list[PointCloudRecord], list[dict]]:
+    records: Iterable[PointCloudRecord],
+    distance_threshold: float,
+    seed: int,
+    *,
+    skip_invalid: bool = False,
+) -> tuple[list[PointCloudRecord], list[dict], list[dict]]:
+    """Ground-plane ROI over a domain.
+
+    With ``skip_invalid`` the frames whose dominant plane is not ground-like
+    (``abs(normal_z) < 0.7``, e.g. a wall-dominant scan) are dropped and
+    reported instead of aborting the whole batch; the default keeps the strict
+    fail-fast behaviour so single-frame analyses stay reproducible.
+    """
     filtered = []
     details = []
+    skipped = []
     for index, record in enumerate(records):
-        selected, info = dominant_ground_surface(
-            record,
-            distance_threshold=distance_threshold,
-            seed=seed + index,
-        )
+        try:
+            selected, info = dominant_ground_surface(
+                record,
+                distance_threshold=distance_threshold,
+                seed=seed + index,
+            )
+        except ValueError as exc:
+            if not skip_invalid:
+                raise
+            skipped.append({"name": record.name, "reason": str(exc)})
+            continue
         filtered.append(selected)
         details.append({"name": record.name, **info})
-    return filtered, details
+    return filtered, details, skipped
 
 
 def main() -> None:
@@ -132,9 +150,15 @@ def main() -> None:
     parser.add_argument("--max-points-per-scene", type=int, default=4096)
     parser.add_argument("--k-neighbors", type=int, default=16)
     parser.add_argument("--mmd-max-samples", type=int, default=512)
+    parser.add_argument("--normal-source", choices=("pca", "supplied"), default="pca")
     parser.add_argument("--source-ground-plane", action="store_true")
     parser.add_argument("--target-ground-plane", action="store_true")
     parser.add_argument("--ground-distance-threshold", type=float, default=0.15)
+    parser.add_argument(
+        "--skip-non-ground-frames",
+        action="store_true",
+        help="drop frames whose dominant plane is not ground-like instead of aborting",
+    )
     parser.add_argument("--require-real-metadata", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-json", default="")
@@ -158,13 +182,17 @@ def main() -> None:
     )
     source_ground = []
     target_ground = []
+    source_skipped = []
+    target_skipped = []
     if args.source_ground_plane:
-        source, source_ground = _apply_ground_filter(
-            source, args.ground_distance_threshold, args.seed
+        source, source_ground, source_skipped = _apply_ground_filter(
+            source, args.ground_distance_threshold, args.seed,
+            skip_invalid=args.skip_non_ground_frames,
         )
     if args.target_ground_plane:
-        target, target_ground = _apply_ground_filter(
-            target, args.ground_distance_threshold, args.seed + 100000
+        target, target_ground, target_skipped = _apply_ground_filter(
+            target, args.ground_distance_threshold, args.seed + 100000,
+            skip_invalid=args.skip_non_ground_frames,
         )
     report = compare_domains(
         source,
@@ -173,12 +201,15 @@ def main() -> None:
         max_points_per_scene=args.max_points_per_scene,
         mmd_max_samples=args.mmd_max_samples,
         seed=args.seed,
+        normal_source=args.normal_source,
     )
     report["source_kind"] = args.source_kind
     report["target_kind"] = args.target_kind
     report["warnings"] = source_warnings + target_warnings
     report["source_ground_filter"] = source_ground
     report["target_ground_filter"] = target_ground
+    report["source_ground_skipped"] = source_skipped
+    report["target_ground_skipped"] = target_skipped
     _print_summary(report)
     for warning in report["warnings"]:
         print(f"WARNING: {warning}")
