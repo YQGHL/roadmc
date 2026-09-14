@@ -484,8 +484,10 @@ roadmc/
   evaluate.py
   test_*.py
 readmeimage/
-  synthesis_pipeline.png
-  training_pipeline.png
+  synthesis_pipeline.png   # 生成端管线（TikZ 源在 tex/，用 build_diagrams.sh 重生成）
+  training_pipeline.png    # 训练与评测管线
+  tex/                     # 两张图的 TikZ 源（与论文插图同一套风格）
+  build_diagrams.sh        # xelatex + pdftoppm 出 300 dpi PNG
 .github/
   workflows/ci.yml         # GitHub Actions：pytest 门槛 + ruff lint
 ```
