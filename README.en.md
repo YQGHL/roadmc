@@ -484,8 +484,10 @@ roadmc/
   evaluate.py
   test_*.py
 readmeimage/
-  synthesis_pipeline.png
-  training_pipeline.png
+  synthesis_pipeline.png   # synthesis pipeline (TikZ source in tex/, rebuild with build_diagrams.sh)
+  training_pipeline.png    # training and evaluation pipeline
+  tex/                     # TikZ sources, same house style as the paper figures
+  build_diagrams.sh        # xelatex + pdftoppm, writes 300 dpi PNGs
 .github/
   workflows/ci.yml         # GitHub Actions: pytest gate + ruff lint
 ```
