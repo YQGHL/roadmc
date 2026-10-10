@@ -60,7 +60,6 @@ RoadMC 包含两个同等重要的模块：
 | 通道混合消融 | ✅ 4 个变体 × 3 个种子全部完成，变体间平均差小于组内波动，**不作机制性结论** |
 | 生成器真实性选项 | ✅ 粗糙度混合、纹理沿程不均匀、缘石条带、辐射标定四项已入码，全部默认关闭，不改变 v2 行为 |
 | 域差距诊断 | ✅ v2 联合 MMD `0.136`（41 帧），441 帧扩展复核 `0.1368`；开启上述选项后重建的数据集在同一规则降到 `0.0398` |
-| 自动化测试 | `120 passed / 6 skipped`（GitHub Actions `ruff` + `pytest` 全绿） |
 | 真实域性能 | 无真实语义 mIoU。可用的 M2S-RoAD 样本不带标签，只用于域差距诊断 |
 
 ## 实验结果
@@ -202,17 +201,7 @@ python roadmc/scripts/generate_synthetic.py `
   --workers 16
 ```
 
-默认表面网格下每 worker 峰值内存约数百 MiB；脚本启动前打印三层分辨率与并行内存估算，超出 `--max-parallel-memory-mib` 预算会在生成前报错。扩展已有数据集时，脚本复用已有场景、校验既有 `grid_res` 一致性以避免混合分辨率，并补足缺失数量：
-
-```powershell
-python roadmc/scripts/expand_synthetic_dataset.py `
-  --output-dir ./data/synthetic_output `
-  --target-total 5000 `
-  --num-points 2048 `
-  --workers 16 `
-  --pavement mixed `
-  --roughness B
-```
+默认表面网格下每 worker 峰值内存约数百 MiB；脚本启动前打印三层分辨率与并行内存估算，超出 `--max-parallel-memory-mib` 预算会在生成前报错。
 
 ### 受控类别预算
 
@@ -228,12 +217,6 @@ python roadmc/scripts/generate_class_budget.py `
   --workers 16 `
   --pavement mixed `
   --roughness B
-
-python roadmc/scripts/validate_synthetic_dataset.py `
-  --data-dir ./data/credibility_v2 `
-  --split both `
-  --feature-check-scenes 64 `
-  --output-json ./output/data_validation.json
 ```
 
 类别预算脚本可断点续跑，只有在类别配额、点数配额和特征校验都满足后才报告完成。三个与统计效度相关的行为：
@@ -331,17 +314,7 @@ python roadmc/train.py baseline `
 - 默认 `--embed_dim 96` 对应约 26.9M 参数，上表的 7.3M 模型需要显式 `--embed_dim 48`。
 - 每场景 4096 点时批次 8 会在 8 GB 上溢出；与 `8 × 2048` 等 token 量的写法是 `--batch_size 4 --gradient_checkpointing`，并设 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
 
-如果环境不提供 Muon，改用 `--optimizer adamw`。快速诊断用较少点数和步数：
-
-```powershell
-python roadmc/scripts/quick_diagnose.py `
-  --binary `
-  --backbone pointmamba `
-  --steps 200 `
-  --batch_size 2 `
-  --max_points 1024 `
-  --binary_class_weights 1.0,3.0
-```
+如果环境不提供 Muon，改用 `--optimizer adamw`。
 
 ### 课程迁移到 38 类
 
@@ -477,19 +450,16 @@ roadmc/
     gan/                   # 实验性生成器和判别器（当前冻结）
     mhc/                   # DSCM 通道混合与谱分析
     model_pl.py
-  scripts/                 # 生成、验证、评估、域差距诊断
+  scripts/                 # 生成与域差距诊断
   domain_gap.py            # 描述子与距离（合成/真实两侧同法计算）
   metrics.py
   train.py
   evaluate.py
-  test_*.py
 readmeimage/
-  synthesis_pipeline.png   # 生成端管线（TikZ 源在 tex/，用 build_diagrams.sh 重生成）
+  synthesis_pipeline.png   # 生成端管线
   training_pipeline.png    # 训练与评测管线
-  tex/                     # 两张图的 TikZ 源（与论文插图同一套风格）
-  build_diagrams.sh        # xelatex + pdftoppm 出 300 dpi PNG
 .github/
-  workflows/ci.yml         # GitHub Actions：pytest 门槛 + ruff lint
+  workflows/ci.yml         # GitHub Actions：ruff lint
 ```
 
 ## 已完成与路线图
@@ -508,7 +478,6 @@ readmeimage/
 - 修正域差距诊断中三类导致读数不可比的缺陷（法向来源、强度量程、采样窗口），联合 MMD 由 0.458 降到 0.136，并在 441 帧的扩展子集上复现。
 - 在生成器上加入四项真实性配置（粗糙度混合、纹理沿程不均匀、缘石条带、辐射标定），默认关闭；开启后重建数据集的联合 MMD 降到 0.0337。
 - 定位并规避 M2S-RoAD 的 `range == 0` 无效回波编码问题。
-- 自动化测试 `120 passed / 6 skipped`，GitHub Actions CI 全绿。
 
 ### 路线图
 

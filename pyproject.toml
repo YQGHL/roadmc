@@ -56,6 +56,3 @@ ignore_missing_imports = true
 disallow_untyped_defs = false
 allow_redefinition = true
 
-[tool.pytest.ini_options]
-testpaths = ["roadmc"]
-python_files = ["test_*.py"]
