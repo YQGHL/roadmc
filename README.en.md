@@ -60,7 +60,6 @@ road morphology + damage deformation + LiDAR observation
 | Channel-mixing ablation | ✅ Four variants × three seeds complete; between-variant differences are smaller than within-variant spread, **no mechanistic claim** |
 | Generator realism options | ✅ Roughness mixture, along-track texture heterogeneity, curb strip, radiometric calibration — all implemented, all off by default, v2 behaviour unchanged |
 | Domain-gap diagnostics | ✅ v2 joint MMD `0.136` (41 frames), replicated at `0.1368` on a 441-frame subset; `0.0398` for the dataset rebuilt with the realism options on under the same rule |
-| Automated tests | `120 passed / 6 skipped` (GitHub Actions `ruff` + `pytest` green) |
 | Real-domain performance | No real semantic mIoU. The available M2S-RoAD samples are unlabelled and used only for domain-gap diagnostics |
 
 ## Results
@@ -202,17 +201,7 @@ python roadmc/scripts/generate_synthetic.py `
   --workers 16
 ```
 
-At the default surface grid each worker peaks at several hundred MiB; the script prints the resolution summary and the aggregate parallel-memory estimate before starting, and refuses to run past the `--max-parallel-memory-mib` budget. To extend an existing dataset, the expansion script reuses existing scenes, validates that the recorded `grid_res` matches (preventing mixed-resolution splits), and fills the missing files:
-
-```powershell
-python roadmc/scripts/expand_synthetic_dataset.py `
-  --output-dir ./data/synthetic_output `
-  --target-total 5000 `
-  --num-points 2048 `
-  --workers 16 `
-  --pavement mixed `
-  --roughness B
-```
+At the default surface grid each worker peaks at several hundred MiB; the script prints the resolution summary and the aggregate parallel-memory estimate before starting, and refuses to run past the `--max-parallel-memory-mib` budget.
 
 ### Controlled class budgets
 
@@ -228,12 +217,6 @@ python roadmc/scripts/generate_class_budget.py `
   --workers 16 `
   --pavement mixed `
   --roughness B
-
-python roadmc/scripts/validate_synthetic_dataset.py `
-  --data-dir ./data/credibility_v2 `
-  --split both `
-  --feature-check-scenes 64 `
-  --output-json ./output/data_validation.json
 ```
 
 The budget generator is resumable and reports completion only after scene quotas, point quotas, and feature checks all pass. Three behaviors matter for statistical validity:
@@ -331,17 +314,7 @@ Defaults that bite:
 - The default `--embed_dim 96` gives a ~26.9M parameter model; the 7.3M model in the tables above needs `--embed_dim 48`.
 - With 4096 points per scene, batch 8 does not fit in 8 GB. The token-equivalent of `8 × 2048` is `--batch_size 4 --gradient_checkpointing`, plus `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
-If the active environment does not provide Muon, use `--optimizer adamw` explicitly. For a short diagnostic run:
-
-```powershell
-python roadmc/scripts/quick_diagnose.py `
-  --binary `
-  --backbone pointmamba `
-  --steps 200 `
-  --batch_size 2 `
-  --max_points 1024 `
-  --binary_class_weights 1.0,3.0
-```
+If the active environment does not provide Muon, use `--optimizer adamw` explicitly.
 
 ### Curriculum transfer to 38 classes
 
@@ -477,19 +450,16 @@ roadmc/
     gan/                   # experimental generator and discriminator (frozen)
     mhc/                   # DSCM channel mixing and spectral analysis
     model_pl.py
-  scripts/                 # synthesis, validation, evaluation, domain-gap diagnostics
+  scripts/                 # synthesis and domain-gap diagnostics
   domain_gap.py            # descriptors and distances, computed identically on both sides
   metrics.py
   train.py
   evaluate.py
-  test_*.py
 readmeimage/
-  synthesis_pipeline.png   # synthesis pipeline (TikZ source in tex/, rebuild with build_diagrams.sh)
+  synthesis_pipeline.png   # synthesis pipeline
   training_pipeline.png    # training and evaluation pipeline
-  tex/                     # TikZ sources, same house style as the paper figures
-  build_diagrams.sh        # xelatex + pdftoppm, writes 300 dpi PNGs
 .github/
-  workflows/ci.yml         # GitHub Actions: pytest gate + ruff lint
+  workflows/ci.yml         # GitHub Actions: ruff lint
 ```
 
 ## Completed Work and Roadmap
@@ -508,7 +478,6 @@ readmeimage/
 - Corrected three defects that made domain-gap readings non-comparable (normal source, intensity range, sampling window), reducing joint MMD from 0.458 to 0.136, and replicated the result on a 441-frame subset.
 - Added four realism option groups to the generator (roughness mixture, along-track texture heterogeneity, curb strip, radiometric calibration), all off by default; a dataset rebuilt with them reaches joint MMD 0.0337.
 - Located and worked around the M2S-RoAD `range == 0` no-return encoding issue.
-- `120 passed / 6 skipped` automated tests pass (GitHub Actions CI green).
 
 ### Roadmap
 
