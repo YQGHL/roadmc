@@ -28,6 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from roadmc.data.features import OBSERVABLE_FEATURE_SCHEMA, has_observable_feature_schema
 from roadmc.data.synthetic.config import (
+    DEFAULT_MAX_SURFACE_MEMORY_MIB,
+    DEFAULT_MAX_SURFACE_POINTS,
     ISO_ROUGHNESS,
     CurbConfig,
     DiseaseConfig,
@@ -455,6 +457,18 @@ def main() -> None:
     parser.add_argument("--width", type=float, default=7.0, help="路面宽度 (米)，默认 7.0（双车道口径）")
     parser.add_argument("--length", type=float, default=5.0, help="路面长度（里程向）(米)，默认 5.0")
     parser.add_argument(
+        "--max-surface-points",
+        type=int,
+        default=DEFAULT_MAX_SURFACE_POINTS,
+        help="单场景传感器采样前允许的最大表面网格点数（off 体制下超出自动分段）",
+    )
+    parser.add_argument(
+        "--max-surface-memory-mib",
+        type=float,
+        default=DEFAULT_MAX_SURFACE_MEMORY_MIB,
+        help="单 worker 表面合成估算峰值内存上限 (MiB)",
+    )
+    parser.add_argument(
         "--observation-model",
         choices=["on", "off"],
         default="off",
@@ -592,6 +606,8 @@ def main() -> None:
         disease=DiseaseConfig(max_diseases_per_scene=args.max_diseases),
         seed=args.seed,
         num_points=args.num_points,
+        max_surface_points=args.max_surface_points,
+        max_surface_memory_mib=args.max_surface_memory_mib,
         # 与 generate_synthetic.py 同一冻结体制：CLI 默认 off（直出全表面），
         # on 为 legacy 回归口径（显式传值时与历史版本逐位一致）。
         observation_model=args.observation_model,
