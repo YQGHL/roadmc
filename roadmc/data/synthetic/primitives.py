@@ -3,19 +3,20 @@ RoadMC 数学与力学基元 —— Physics-Simulation-Driven Road Surface Primi
 
 严格遵循 JTG 5210-2018《公路技术状况评定标准》，共 38 个标签 (0-37)。
 
-本文件实现了 11 个数学与力学基元函数，通过物理学仿真生成路面点云数据：
+本文件实现了 12 个数学与力学基元函数，通过物理学仿真生成路面点云数据：
   1. generate_road_surface()   — 分段各向同性径向 PSD (ISO 8608 段 + 自仿射
                                   纹理段) + 横坡/纵坡设计几何 (FFT 谱合成)
-  2. add_micro_texture()       — 自仿射纹理谱合成 (散点兼容路径)
-  3. add_crack()               — 裂缝 (纵向/横向 Bézier + 龟裂/块状 Voronoi)
-  4. add_pothole()             — 超椭圆坑槽
-  5. add_raveling()            — 松散 (细集料脱落)
-  6. add_depression()          — 沉陷 (高斯凹陷)
-  7. add_rutting()             — 车辙 (双轮迹高斯槽)
-  8. add_corrugation()         — 波浪拥包 (正弦调制)
-  9. add_bleeding()            — 泛油 (反射率/标签修改)
-  10. add_concrete_damage()     — 水泥路面 10 种损坏
-  11. simulate_lidar_noise()    — LiDAR 噪声仿真 (球坐标 + Dropout)
+  2. generate_curb_strip()     — 行车道外侧缘石顶面条带 (确定性几何，非路面点)
+  3. add_micro_texture()       — 自仿射纹理谱合成 (散点兼容路径)
+  4. add_crack()               — 裂缝 (纵向/横向 Bézier + 龟裂/块状 Voronoi)
+  5. add_pothole()             — 超椭圆坑槽
+  6. add_raveling()            — 松散 (细集料脱落)
+  7. add_depression()          — 沉陷 (高斯凹陷)
+  8. add_rutting()             — 车辙 (双轮迹高斯槽)
+  9. add_corrugation()         — 波浪拥包 (正弦调制)
+  10. add_bleeding()            — 泛油 (反射率/标签修改)
+  11. add_concrete_damage()     — 水泥路面 10 种损坏
+  12. simulate_lidar_noise()    — LiDAR 噪声仿真 (球坐标 + Dropout)
 
 所有函数使用 numpy + scipy，不使用 torch。
 随机状态统一使用 ``np.random.default_rng(seed)``。
@@ -26,7 +27,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from scipy import interpolate, spatial, stats
+from scipy import interpolate, ndimage, spatial, stats
 
 try:
     from .config import ISO8608_BAND_MAX_CYCLES_PER_M, ISO_ROUGHNESS
@@ -281,6 +282,8 @@ def generate_road_surface(
     crossfall: float = 0.0,
     crossfall_shape: str = "crowned",
     longitudinal_grade: float = 0.0,
+    texture_het_sigma_ln: float = 0.0,
+    texture_het_corr_len_m: float = 2.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate a road surface via a piecewise isotropic radial PSD.
 
@@ -308,9 +311,17 @@ def generate_road_surface(
     等级间可比性（样本方差的自然涨落被抑制，见项目文档声明）。
 
     **设计几何** — 排水横坡（双向路拱或单向坡）与纵坡：
-    :math:`z_c(x) = -i_c\\,|x - W/2|` (crowned) 或 :math:`-i_c\\,x` (plane)，
+    :math:`z_c(x) = -i_c\\,|x - W/2|` (crowned) 或 `-i_c\\,x` (plane)，
     :math:`z_g(y) = i_g\\,y`。法向量从叠加后的最终高度场统一重算，
     因此包含坡度与纹理的贡献。
+
+    **纹理沿程不均匀** — ``texture_het_sigma_ln > 0`` 时（默认 0 = 关闭，
+    行为与历史逐位一致），先以 ISO 带边界 :math:`f_{\\mathrm{iso,max}}`
+    做高低通分解，仅对短波（纹理段）施加沿里程 y 的均值为 1 对数正态
+    幅值调制 :math:`M(y)`；调制场由一维高斯低通白噪声标准化得到，
+    相关长度 ``texture_het_corr_len_m``。ISO 长波段不被调制，且
+    :math:`M` 按 :math:`\\mathrm{mean}(M^2)=1` 归一，重组后经既有全局
+    Parseval 再定标，总方差仍精确等于目标 :math:`\\sigma^2`。
 
     Args:
         width:  路面宽度 (m)，x 方向。
@@ -324,6 +335,12 @@ def generate_road_surface(
         crossfall: 排水横坡坡率 (如 0.02 = 2%)。0 表示水平。
         crossfall_shape: 'crowned' 双向路拱 | 'plane' 单向坡。
         longitudinal_grade: 纵坡坡率。
+        texture_het_sigma_ln: 纹理沿程不均匀的对数域调制强度 σ_ln。
+            0.0 = 关闭（默认），此时不做分解、不抽取额外随机数，输出
+            与合并谱单次 FFT 的历史路径逐位一致。
+        texture_het_corr_len_m: 沿里程 y 的高斯低通相关长度 (米)，
+            仅在 ``texture_het_sigma_ln > 0`` 时生效。
+
 
     Returns:
         points:  点云 (N, 3) = [x, y, z]。
@@ -378,7 +395,26 @@ def generate_road_surface(
 
     white_noise = rng.normal(0.0, 1.0, (nx, ny))
     W_hat = np.fft.fft2(white_noise)
-    h_field = np.real(np.fft.ifft2(np.sqrt(psd_2d) * W_hat))
+    if texture_het_sigma_ln > 0.0:
+        # 纹理沿程不均匀：高低通分解后仅调制短波分量。两分量共用同一
+        # W_hat，分解本身确定；调制场 M(y) 为中位数 1 且 mean(M²)=1
+        # （二阶矩归一，非算术均值 1：归一后 mean(M)≈exp(-σ²/2)<1），
+        # 只沿里程轴 (indexing='ij' 的轴 1) 变化并广播到横向。h_tex 零均值
+        # 使乘积均值≈0，方差由 E[M²]=1 决定，故总方差不变。
+        h_iso = np.real(np.fft.ifft2(np.sqrt(psd_iso) * W_hat))
+        h_tex = np.real(np.fft.ifft2(np.sqrt(psd_tex) * W_hat))
+        e = rng.normal(0.0, 1.0, ny)
+        g = ndimage.gaussian_filter1d(
+            e, sigma=texture_het_corr_len_m / grid_res, mode="reflect"
+        )
+        z = (g - g.mean()) / max(float(g.std()), 1e-15)
+        M = np.exp(texture_het_sigma_ln * z)
+        M = M / np.sqrt(np.mean(M**2))
+        h_field = h_iso + h_tex * M[None, :]
+    else:
+        # 关闭态：合并谱单次 FFT，与历史路径逐位一致（不得改写为分解式，
+        # sqrt(a)+sqrt(b) ≠ sqrt(a+b) 会破坏逐位一致性）。
+        h_field = np.real(np.fft.ifft2(np.sqrt(psd_2d) * W_hat))
     h_field = h_field - np.mean(h_field)
 
     # Parseval 定标：σ² = ΣΦ·Δfx·Δfy (m²)，实现级精确缩放（受控方差）。
@@ -401,6 +437,87 @@ def generate_road_surface(
 
     points = np.stack([X.ravel(), Y.ravel(), h_field.ravel()], axis=1)  # (N, 3)
     normals = normals_grid.reshape(-1, 3)  # (N, 3)
+
+    return points, normals
+
+
+# 1.1.3 — 缘石条带 (非路面点)
+
+
+def generate_curb_strip(
+    road_width: float,
+    length: float,
+    grid_res: float,
+    curb_width_m: float,
+    curb_height_m: float,
+    *,
+    crossfall: float = 0.0,
+    crossfall_shape: str = "crowned",
+    longitudinal_grade: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """生成行车道横向外侧的两条缘石顶面条带（几何确定性，零 rng）。
+
+    该函数存在的目的不是"好看的路缘"，而是让非路面点进入下游的密度与
+    法向倾角统计（域差距诊断需要非路面点），因此它只采样**顶面**：
+    没有竖直 riser 立面点，台阶棱线处的法向异常由下游 KDTree 统计自然
+    呈现，不人为构造立面采样——这是诚实口径，避免把一条假想的立面当作
+    实测几何。
+
+    几何：
+
+    - 条带位于行车道外侧两段：``x ∈ [-curb_width_m, 0)`` 与
+      ``x ∈ (road_width, road_width + curb_width_m]``，y 与路面同网格
+      （``np.arange(0, length, grid_res)``）。x 向格点数
+      ``nx_c = max(1, ceil(curb_width_m / grid_res))``，与
+      ``RoadSurfaceConfig.surface_grid_shape`` 同一取整规则，因此总点数
+      恰为 ``2 * nx_c * ny``（= ``GeneratorConfig.curb_grid_point_count``）。
+    - 顶面高程与相邻路面边缘的**设计几何**对齐并抬高 ``curb_height_m``：
+      crowned 时两侧边缘高程为 ``-crossfall * road_width / 2``；plane 时
+      x<0 侧为 0、x>road_width 侧为 ``-crossfall * road_width``；再叠加
+      ``longitudinal_grade * y``。顶面横向水平（不继承路拱斜率）。
+    - 顶面法向取 ``(0, 0, 1)``，与 ``generate_road_surface`` 对平坦区的
+      法向一致。
+
+    调用方在拼接后初始化标签，因此本函数返回的点自动获得背景标签 0，
+    不占用 38 类中任何病害标签；同时因点数增加会**稀释自然 prevalence
+    分母**——这是缘石选项的预期效应，不是缺陷。
+
+    Args:
+        road_width: 行车道宽度 (m)，条带据此贴边。
+        length: 沿里程长度 (m)。
+        grid_res: 网格分辨率 (m)，与路面网格一致。
+        curb_width_m: 单侧条带横向宽度 (m)，须 > 0（调用方保证）。
+        curb_height_m: 顶面相对相邻路面设计边缘的抬高量 (m)。
+        crossfall: 排水横坡坡率，用于与路面边缘高程对齐。
+        crossfall_shape: 'crowned' 双向路拱 | 'plane' 单向坡。
+        longitudinal_grade: 纵坡坡率，叠加到顶面高程。
+
+    Returns:
+        points:  (N_c, 3) = [x, y, z]，N_c = 2 * nx_c * ny。
+        normals: (N_c, 3)，顶面法向恒为 (0, 0, 1)。
+    """
+
+    y = np.arange(0.0, length, grid_res)
+    nx_c = max(1, int(math.ceil(curb_width_m / grid_res)))
+
+    # x<0 侧取 [-w, 0)（含 -w，不含 0）；x>road_width 侧取 (W, W+w]（含 W+w，不含 W）。
+    x_neg = -curb_width_m + np.arange(nx_c) * grid_res
+    x_pos = road_width + (np.arange(nx_c) + 1) * grid_res
+    x_c = np.concatenate([x_neg, x_pos])
+
+    if crossfall_shape == "crowned":
+        edge_neg = -crossfall * road_width / 2.0
+        edge_pos = -crossfall * road_width / 2.0
+    else:  # plane：单向坡，x<0 侧基准 0，x>W 侧 -i_c·W
+        edge_neg = 0.0
+        edge_pos = -crossfall * road_width
+    edge = np.concatenate([np.full(nx_c, edge_neg), np.full(nx_c, edge_pos)])
+
+    Xc, Yc = np.meshgrid(x_c, y, indexing="ij")  # (2*nx_c, ny)
+    Zc = edge[:, None] + curb_height_m + longitudinal_grade * Yc
+
+    points = np.stack([Xc.ravel(), Yc.ravel(), Zc.ravel()], axis=1)  # (N_c, 3)
+    normals = np.tile(np.array([0.0, 0.0, 1.0]), (points.shape[0], 1))
 
     return points, normals
 

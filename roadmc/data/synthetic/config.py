@@ -106,6 +106,10 @@ class RoadSurfaceConfig:
         crossfall_shape: 'crowned' 双向路拱（默认，7m 双车道口径）或
             'plane' 单向坡（超高段）。
         longitudinal_grade: 纵坡坡率，默认 0（生成时可采样小坡度）。
+        roughness_mix: ISO 8608 等级 → 非负权重的混合抽样规格（如
+            {'D': 0.5, 'E': 0.5}）。None 表示关闭（默认），此时按
+            roughness_class 单等级生成；键取值域复用 ISO_ROUGHNESS 的
+            键集合。权重不在此处归一化存储，抽样时归一。
     """
 
     width: float = 7.0
@@ -116,6 +120,7 @@ class RoadSurfaceConfig:
     crossfall: float = 0.02
     crossfall_shape: Literal["crowned", "plane"] = "crowned"
     longitudinal_grade: float = 0.0
+    roughness_mix: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.width) or self.width <= 0:
@@ -130,6 +135,25 @@ class RoadSurfaceConfig:
             raise ValueError(
                 f"longitudinal_grade must be in [-0.10, 0.10], got {self.longitudinal_grade}"
             )
+        if self.roughness_mix is not None:
+            invalid_keys = sorted(
+                key for key in self.roughness_mix if key not in ISO_ROUGHNESS
+            )
+            if invalid_keys:
+                raise ValueError(
+                    f"roughness_mix keys must be ISO 8608 classes "
+                    f"{sorted(ISO_ROUGHNESS)}, got {invalid_keys}"
+                )
+            for key, weight in self.roughness_mix.items():
+                if not math.isfinite(weight) or weight < 0:
+                    raise ValueError(
+                        f"roughness_mix['{key}'] must be finite and >= 0, got {weight}"
+                    )
+            total_weight = sum(self.roughness_mix.values())
+            if total_weight <= 0:
+                raise ValueError(
+                    f"roughness_mix weights must sum to > 0, got {total_weight}"
+                )
 
     @property
     def surface_grid_spacing_m(self) -> float:
@@ -182,11 +206,32 @@ class MicroTextureConfig:
             实测 H ≈ 0.6-0.9，默认 0.7。
         octaves: 已弃用（旧逐点噪声实现的参数），保留仅为向后
             兼容，谱合成路径不使用。
+        het_sigma_ln: 纹理沿程不均匀的对数域调制强度 σ。0.0 表示关闭
+            （默认，行为与历史一致）；> 0 时纹理段幅值乘以均值为 1 的
+            对数正态沿程调制场。
+        het_corr_len_m: 沿里程 y 的高斯低通相关长度 (米)，仅在
+            het_sigma_ln > 0 时生效。
     """
 
     amplitude: float = 0.0008
     hurst: float = 0.7
     octaves: int = 6
+    het_sigma_ln: float = 0.0
+    het_corr_len_m: float = 2.0
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.het_sigma_ln) or self.het_sigma_ln < 0.0:
+            raise ValueError(
+                f"het_sigma_ln must be finite and ≥ 0, got {self.het_sigma_ln}"
+            )
+        # het 关闭时（sigma_ln == 0）不校验相关长度——与既有行为一致。
+        if self.het_sigma_ln > 0.0 and (
+            not math.isfinite(self.het_corr_len_m) or self.het_corr_len_m <= 0.0
+        ):
+            raise ValueError(
+                "het_corr_len_m must be finite and > 0 when het_sigma_ln > 0, "
+                f"got {self.het_corr_len_m}"
+            )
 
 
 @dataclass
@@ -378,6 +423,68 @@ class LidarNoiseConfig:
 
 
 @dataclass
+class CurbConfig:
+    """缘石条带参数（行车道横向外侧的抬高顶面条带）。
+
+    width_m = 0 表示关闭（默认）：不生成任何缘石点，行为与历史版本
+    逐点一致。开启时每场景新增 2 × nx_c × ny 个背景标签点（见
+    ``GeneratorConfig.curb_grid_point_count``），会稀释自然 prevalence
+    分母——这是该选项的预期效应。
+
+    Attributes:
+        width_m: 单侧条带横向宽度 (米)。0 = 关闭。
+        height_m: 顶面相对相邻路面设计边缘的抬高量 (米)，仅在
+            width_m > 0 时生效。
+    """
+
+    width_m: float = 0.0
+    height_m: float = 0.13
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.width_m) or self.width_m < 0:
+            raise ValueError(f"width_m must be finite and >= 0, got {self.width_m}")
+        if not math.isfinite(self.height_m):
+            raise ValueError(f"height_m must be finite, got {self.height_m}")
+        if self.width_m > 0 and self.height_m <= 0:
+            raise ValueError(
+                f"height_m must be > 0 when width_m > 0, got {self.height_m}"
+            )
+
+
+@dataclass
+class RadiometricConfig:
+    """辐射强度模型的分布参数（对数正态反照率场 + Gamma 斑点）。
+
+    默认值逐字等于 _compute_intensity 的历史硬编码（corr 0.3 m、
+    sigma_ln 0.25、Gamma M=12），因此默认构造时强度输出与历史版本
+    逐点一致——本选项的"关闭"语义是"参数化但取值不变"。
+
+    Attributes:
+        albedo_sigma_ln: 对数正态反照率场的对数域标准差 σ_ln。
+        albedo_corr_len_m: 反照率场的高斯低通空间相关长度 (米)。
+        speckle_m: 乘性 Gamma 斑点的形状参数 M（均值 1、方差 1/M）。
+    """
+
+    albedo_sigma_ln: float = 0.25
+    albedo_corr_len_m: float = 0.3
+    speckle_m: float = 12.0
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.albedo_sigma_ln) or self.albedo_sigma_ln < 0:
+            raise ValueError(
+                f"albedo_sigma_ln must be finite and >= 0, got {self.albedo_sigma_ln}"
+            )
+        if not math.isfinite(self.albedo_corr_len_m) or self.albedo_corr_len_m <= 0:
+            raise ValueError(
+                f"albedo_corr_len_m must be finite and > 0, got {self.albedo_corr_len_m}"
+            )
+        if not math.isfinite(self.speckle_m) or self.speckle_m < 1:
+            raise ValueError(
+                f"speckle_m must be finite and >= 1 (Gamma shape), got {self.speckle_m}"
+            )
+
+
+@dataclass
 class LiDARScanConfig:
     """LiDAR 扫描几何配置 — 模拟真实扫描线密度分布 (P1-1).
 
@@ -497,6 +604,8 @@ class GeneratorConfig:
         concrete_damage: 水泥损坏配置。
         lidar_noise: LiDAR 噪声配置。
         lidar_scan: LiDAR 扫描几何配置 (P1-1)。
+        curb: 缘石条带配置（默认关闭）。
+        radiometric: 辐射强度模型参数配置（默认值等于历史硬编码）。
         seed: 全局随机种子，默认 None (非确定性)。
         num_points: 传感器输出目标点数 (兼容旧名称)，默认 65536。
         target_density: 传感器输出目标密度 (点/㎡，兼容旧名称)。
@@ -524,6 +633,8 @@ class GeneratorConfig:
     concrete_damage: ConcreteDamageConfig = field(default_factory=ConcreteDamageConfig)
     lidar_noise: LidarNoiseConfig = field(default_factory=LidarNoiseConfig)
     lidar_scan: LiDARScanConfig = field(default_factory=LiDARScanConfig)
+    curb: CurbConfig = field(default_factory=CurbConfig)
+    radiometric: RadiometricConfig = field(default_factory=RadiometricConfig)
     seed: int | None = None
     num_points: int = 65536
     target_density: float | None = None  # P1-2: 点/㎡
@@ -579,6 +690,11 @@ class GeneratorConfig:
                 f"output point count ({self.sensor_output_target_points}), got "
                 f"{self.target_label_min_output_points}"
             )
+        if self.curb.width_m > 0 and 2 * self.curb.width_m >= self.road.width:
+            raise ValueError(
+                f"curb strips of {self.curb.width_m} m per side leave no carriageway: "
+                f"2 * curb.width_m must be < road.width ({self.road.width} m)"
+            )
 
         self.validate_surface_budget()
 
@@ -606,10 +722,37 @@ class GeneratorConfig:
             return float(self.target_density)
         return None
 
-    def estimate_surface_generation(self) -> SurfaceGenerationEstimate:
-        """Estimate point allocation and conservative peak RAM per worker."""
+    @property
+    def curb_grid_point_count(self) -> int:
+        """Analytic point count contributed by the optional curb strips.
 
-        point_count = self.road.surface_grid_point_count
+        Single shared formula for every curb point-count consumer (per the
+        curb-strip design: ``2 * nx_c * ny`` with
+        ``nx_c = max(1, ceil(curb_width_m / grid_res))``, same rounding rule
+        as ``RoadSurfaceConfig.surface_grid_shape`` and the same y-grid as
+        the road).  ``estimate_surface_generation`` derives its allocation
+        and peak-memory budget from this property; the ``generate_scene``
+        point-count guard and the curvature fast-path decision must use the
+        same formula once the curb strips are merged into the surface cloud.
+        Returns 0 when the curb is disabled.
+        """
+
+        if self.curb.width_m <= 0:
+            return 0
+        nx_c = max(1, int(math.ceil(self.curb.width_m / self.road.grid_res)))
+        _, ny = self.road.surface_grid_shape
+        return 2 * nx_c * ny
+
+    def estimate_surface_generation(self) -> SurfaceGenerationEstimate:
+        """Estimate point allocation and conservative peak RAM per worker.
+
+        The allocation covers the road synthesis grid plus the optional curb
+        strips (0 points when disabled), so per-worker and parallel memory
+        budgets keep covering the true peak once the curb points are merged
+        into the surface cloud.
+        """
+
+        point_count = self.road.surface_grid_point_count + self.curb_grid_point_count
         memory_mib = point_count * SURFACE_PEAK_BYTES_PER_POINT / (1024.0 ** 2)
         return SurfaceGenerationEstimate(
             grid_shape=self.road.surface_grid_shape,
@@ -712,6 +855,25 @@ class GeneratorConfig:
                 ],
                 "texture_rms_m": float(self.micro_texture.amplitude),
                 "texture_hurst": float(self.micro_texture.hurst),
+                "texture_het_sigma_ln": float(self.micro_texture.het_sigma_ln),
+                "texture_het_corr_len_m": float(self.micro_texture.het_corr_len_m),
+                # 粗糙度混合开启时逐场景实际抽到的等级在场景字段
+                # roughness_class 里；这里记录配置层面的抽样规格。
+                "roughness_class": (
+                    "per_scene_draw (see per-scene roughness_class)"
+                    if self.road.roughness_mix is not None
+                    else str(self.road.roughness_class)
+                ),
+                "roughness_mix": (
+                    None
+                    if self.road.roughness_mix is None
+                    else ",".join(
+                        f"{key}:{self.road.roughness_mix[key]:g}"
+                        for key in sorted(self.road.roughness_mix)
+                    )
+                ),
+                "curb_width_m": float(self.curb.width_m),
+                "curb_height_m": float(self.curb.height_m),
                 "crossfall": float(self.road.crossfall),
                 "crossfall_shape": str(self.road.crossfall_shape),
                 "longitudinal_grade": float(self.road.longitudinal_grade),

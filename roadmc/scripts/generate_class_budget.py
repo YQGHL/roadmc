@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import multiprocessing as mp
 import os
 import re
@@ -27,8 +28,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from roadmc.data.features import OBSERVABLE_FEATURE_SCHEMA, has_observable_feature_schema
 from roadmc.data.synthetic.config import (
+    ISO_ROUGHNESS,
+    CurbConfig,
     DiseaseConfig,
     GeneratorConfig,
+    MicroTextureConfig,
+    RadiometricConfig,
     RoadSurfaceConfig,
 )
 from roadmc.data.synthetic.labels import ALL_DISEASE_LABELS
@@ -58,6 +63,55 @@ def _parse_labels(raw: str) -> tuple[int, ...]:
     if not labels:
         raise ValueError("At least one target label is required")
     return tuple(sorted(labels))
+
+
+def _parse_roughness_mix(text: str | None) -> dict[str, float] | None:
+    """Parse a ``'D:0.5,E:0.5'`` ISO 8608 mixture spec into class weights.
+
+    ``None`` / an empty string returns ``None`` (mixing disabled).  Each
+    comma-separated item must be ``<LEVEL>:<weight>`` with LEVEL one of the
+    uppercase ISO 8608 classes, a finite non-negative weight, no repeated
+    classes, and a strictly positive total weight; any violation raises
+    ``ValueError``.
+    """
+
+    if text is None or not text.strip():
+        return None
+
+    mix: dict[str, float] = {}
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            raise ValueError(
+                f"--roughness-mix contains an empty item in {text!r}; "
+                'expected e.g. "D:0.5,E:0.5"'
+            )
+        level, sep, weight_text = item.partition(":")
+        level = level.strip()
+        if not sep or level not in ISO_ROUGHNESS:
+            raise ValueError(
+                f"--roughness-mix level must be one of {sorted(ISO_ROUGHNESS)}, "
+                f"got {item!r}"
+            )
+        if level in mix:
+            raise ValueError(f"--roughness-mix repeats level {level!r}")
+        try:
+            weight = float(weight_text.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"--roughness-mix weight must be a float, got {item!r}"
+            ) from exc
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError(
+                f"--roughness-mix weight must be finite and >= 0, got {item!r}"
+            )
+        mix[level] = weight
+
+    if not mix or sum(mix.values()) <= 0:
+        raise ValueError(
+            f"--roughness-mix weights must sum to > 0, got {text!r}"
+        )
+    return mix
 
 
 def _scene_id_from_path(path: Path) -> int | None:
@@ -210,6 +264,7 @@ def _save_forced_scene(task: tuple[int, int]) -> dict[str, int | bool | str]:
             feats=feats.astype(np.float32),
             normals=normals.astype(np.float32),
             pavement_type=scene["pavement_type"],
+            roughness_class=scene["roughness_class"],
             scene_id=scene_id,
             target_label=target_label,
             feature_schema=scene["feature_schema"],
@@ -396,6 +451,66 @@ def main() -> None:
     parser.add_argument("--num-points", type=int, default=8192)
     parser.add_argument("--pavement", choices=("asphalt", "concrete", "mixed"), default="mixed")
     parser.add_argument("--roughness", choices=("A", "B", "C", "D", "E"), default="B")
+    parser.add_argument(
+        "--roughness-mix",
+        type=str,
+        default=None,
+        metavar='"D:0.5,E:0.5"',
+        help=(
+            "per-scene ISO 8608 class mixture (keys A-E, non-negative weights, "
+            "positive sum); when set, the class is drawn per scene and takes "
+            "precedence over --roughness, which then only acts as the "
+            "dataclass fallback"
+        ),
+    )
+    parser.add_argument(
+        "--texture-rms",
+        type=float,
+        default=0.0008,
+        help="宏观纹理位移 RMS (m)，映射 micro_texture.amplitude；0 关闭纹理段",
+    )
+    parser.add_argument(
+        "--texture-het-sigma",
+        type=float,
+        default=0.0,
+        help="纹理沿程不均匀的对数域调制强度 σ_ln；0 = 关闭（默认）",
+    )
+    parser.add_argument(
+        "--texture-het-corr",
+        type=float,
+        default=2.0,
+        help="纹理沿程调制的里程向高斯相关长度 (m)，仅 het-sigma > 0 时生效",
+    )
+    parser.add_argument(
+        "--curb-width",
+        type=float,
+        default=0.0,
+        help="缘石条带横向宽度 (m)，0=关闭",
+    )
+    parser.add_argument(
+        "--curb-height",
+        type=float,
+        default=0.13,
+        help="缘石顶面抬高 (m)",
+    )
+    parser.add_argument(
+        "--albedo-sigma-ln",
+        type=float,
+        default=0.25,
+        help="对数正态反照率场 σ_ln（默认 0.25 = 历史硬编码值）",
+    )
+    parser.add_argument(
+        "--speckle-m",
+        type=float,
+        default=12.0,
+        help="乘性 Gamma 斑点形状参数 M（默认 12 = 历史硬编码值）",
+    )
+    parser.add_argument(
+        "--max-diseases",
+        type=int,
+        default=1,
+        help="每场景最多病害数（默认 1 = 历史硬编码值）",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -407,6 +522,29 @@ def main() -> None:
         raise ValueError("--val-ratio must be in (0, 1)")
     if args.wave_size < 1:
         raise ValueError("--wave-size must be >= 1")
+    if args.texture_rms < 0:
+        raise ValueError("--texture-rms must be >= 0")
+    if args.texture_het_sigma < 0:
+        raise ValueError("--texture-het-sigma must be >= 0")
+    if args.texture_het_sigma > 0 and args.texture_het_corr <= 0:
+        raise ValueError("--texture-het-corr must be > 0 when --texture-het-sigma > 0")
+    if args.curb_width < 0:
+        raise ValueError("--curb-width must be >= 0")
+    if args.curb_width > 0 and args.curb_height <= 0:
+        raise ValueError("--curb-height must be > 0 when --curb-width > 0")
+    if args.albedo_sigma_ln < 0:
+        raise ValueError("--albedo-sigma-ln must be >= 0")
+    if args.speckle_m < 1:
+        raise ValueError("--speckle-m must be >= 1")
+    if args.max_diseases < 1:
+        raise ValueError("--max-diseases must be >= 1")
+    if args.roughness_mix is not None and args.roughness_mix.strip():
+        print(
+            "[note] --roughness-mix is set: the ISO 8608 class is drawn per scene "
+            "from the mixture and takes precedence; --roughness "
+            f"({args.roughness}) remains only as the dataclass fallback value.",
+            file=sys.stderr,
+        )
 
     labels = _parse_labels(args.labels)
     workers = _auto_workers() if args.workers <= 0 else args.workers
@@ -419,8 +557,19 @@ def main() -> None:
             grid_res=args.grid_res,
             pavement_type=args.pavement,
             roughness_class=args.roughness,
+            roughness_mix=_parse_roughness_mix(args.roughness_mix),
         ),
-        disease=DiseaseConfig(max_diseases_per_scene=1),
+        micro_texture=MicroTextureConfig(
+            amplitude=args.texture_rms,
+            het_sigma_ln=args.texture_het_sigma,
+            het_corr_len_m=args.texture_het_corr,
+        ),
+        curb=CurbConfig(width_m=args.curb_width, height_m=args.curb_height),
+        radiometric=RadiometricConfig(
+            albedo_sigma_ln=args.albedo_sigma_ln,
+            speckle_m=args.speckle_m,
+        ),
+        disease=DiseaseConfig(max_diseases_per_scene=args.max_diseases),
         seed=args.seed,
         num_points=args.num_points,
     )

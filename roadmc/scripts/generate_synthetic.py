@@ -62,6 +62,7 @@ def _save_one_scene(dataset, split_dir: Path, scene_id: int) -> dict:
             feats=feats.astype(np.float32),
             normals=normals.astype(np.float32),
             pavement_type=pavement_type,
+            roughness_class=scene["roughness_class"],
             scene_id=scene_id,
             feature_schema=scene["feature_schema"],
             feature_names=scene["feature_names"],

@@ -50,6 +50,7 @@ try:
         add_pothole,
         add_raveling,
         add_rutting,
+        generate_curb_strip,
         generate_road_surface,
         geometric_occlusion_keep_mask,
         local_depression_depth,
@@ -80,6 +81,7 @@ except ImportError:
         add_pothole,
         add_raveling,
         add_rutting,
+        generate_curb_strip,
         generate_road_surface,
         geometric_occlusion_keep_mask,
         local_depression_depth,
@@ -227,6 +229,7 @@ class SyntheticRoadDataset(_DatasetBase):
             "feats": torch.from_numpy(scene["feats"]).float(),
             "normals": torch.from_numpy(scene["normals"]).float(),
             "pavement_type": scene["pavement_type"],
+            "roughness_class": scene["roughness_class"],
         }
 
     def generate_scene(self, idx: int, target_label: int | None = None) -> dict:
@@ -235,9 +238,12 @@ class SyntheticRoadDataset(_DatasetBase):
         内部流程按以下顺序执行：
 
         1. 选择路面类型 (asphalt / concrete)
+        1.5 粗糙度等级抽取（roughness_mix 开启时逐场景按权重抽样）
         2. ISO 8608 PSD 路面轮廓 + fBm 微观纹理
-        2.5 LiDAR 扫描线重采样 (可选, P1-1)
+        2.4 缘石条带生成（可选，暂不并入）
+        2.5 LiDAR 扫描线重采样 (可选, P1-1；缘石点经临时合并云同模型通过)
         3. 病害组合随机选择 & 应用（按 DISEASE_APPLY_ORDER 排序 + LABEL_PRIORITY）
+        3.5 缘石条带并入（可选，curb.width_m > 0；背景标签 0 的非路面点）
         4. KDTree 局部曲率计算 (P2-2)
         5. 应用松散 (raveling) — 产生 NaN 点
         6. 松散标签膨胀 + NaN 过滤 (P0-3)
@@ -252,7 +258,8 @@ class SyntheticRoadDataset(_DatasetBase):
             idx: 场景索引，用于种子生成 (config.seed + idx)。
 
         Returns:
-            包含 points, labels, feats, normals, pavement_type 的字典。
+            包含 points, labels, feats, normals, pavement_type,
+            roughness_class 的字典。
         """
         # 种子管理
         target_spec: TargetLabelSpec | None = None
@@ -274,6 +281,19 @@ class SyntheticRoadDataset(_DatasetBase):
             else self._select_pavement_type(rng)
         )
 
+        # 1.5 粗糙度等级抽取：roughness_mix 开启时逐场景按权重抽样一次
+        # （开启态唯一新增的 rng 抽取），实际等级写入场景字段并在谱合成
+        # 中生效；关闭路径直接回退配置的单一等级，零新增 rng 消耗，既有
+        # 随机流逐位不变。
+        if self.config.road.roughness_mix is not None:
+            mix = self.config.road.roughness_mix
+            classes, weights = zip(*sorted(mix.items()), strict=False)
+            p = np.asarray(weights, dtype=np.float64)
+            p = p / p.sum()
+            roughness_actual = str(rng.choice(list(classes), p=p))
+        else:
+            roughness_actual = self.config.road.roughness_class
+
         # 2. 路面宏观轮廓 + 纹理谱段 + 设计几何（单次谱合成，法向从
         # 最终高度场统一重算——纹理不再作为独立的逐点位移步骤）。
         points, normals = generate_road_surface(
@@ -281,24 +301,61 @@ class SyntheticRoadDataset(_DatasetBase):
             length=length,
             grid_res=grid_res,
             pavement_type=pavement_type,
-            roughness_class=self.config.road.roughness_class,
+            roughness_class=roughness_actual,
             seed=int(rng.integers(0, 2 ** 31)),
             texture_rms=self.config.micro_texture.amplitude,
             texture_hurst=self.config.micro_texture.hurst,
             crossfall=self.config.road.crossfall,
             crossfall_shape=self.config.road.crossfall_shape,
             longitudinal_grade=self.config.road.longitudinal_grade,
+            texture_het_sigma_ln=self.config.micro_texture.het_sigma_ln,
+            texture_het_corr_len_m=self.config.micro_texture.het_corr_len_m,
         )
-        if len(points) != surface_estimate.point_count:
+        # 2.4 缘石条带（可选）：行车道横向外侧的抬高顶面条带，几何确定性、
+        # 零 rng 消耗。此处只**生成**、暂不并入——第 3 步病害与第 5 步松散
+        # 必须在纯路面足迹上进行：否则 add_depression 的影响半径、
+        # add_corrugation/add_concrete_damage 的整云 bbox 推导几何、泛油掩码
+        # 与 raveling 区域都会越过路缘，把病害标签与 z 调制写到抬高的缘石
+        # 结构上（违背设计保证：缘石点恒为背景标签 0，且污染 13/14、17/18
+        # 等类的 prevalence 分子）。缘石点在第 3 步之后并入，此后作为普通
+        # 非路面点参与曲率/强度/遮挡/噪声/密度统计，并因点数增加稀释自然
+        # prevalence 分母——该选项的预期效应。
+        curb_points: np.ndarray | None = None
+        curb_normals: np.ndarray | None = None
+        if self.config.curb.width_m > 0:
+            curb_points, curb_normals = generate_curb_strip(
+                road_width=width,
+                length=length,
+                grid_res=grid_res,
+                curb_width_m=self.config.curb.width_m,
+                curb_height_m=self.config.curb.height_m,
+                crossfall=self.config.road.crossfall,
+                crossfall_shape=self.config.road.crossfall_shape,
+                longitudinal_grade=self.config.road.longitudinal_grade,
+            )
+        # 路面合成网格点数（不含缘石）；curb 关闭时等于 surface_estimate.point_count。
+        road_point_count = surface_estimate.point_count - self.config.curb_grid_point_count
+        if len(points) != road_point_count:
             raise RuntimeError(
                 "Surface preflight mismatch: estimated "
-                f"{surface_estimate.point_count:,} points but generated {len(points):,}."
+                f"{road_point_count:,} points but generated {len(points):,}."
             )
 
-        # 2.5 P1-1: LiDAR 扫描线密度重采样（可选）——与噪声/强度共用位姿
+        # 2.5 P1-1: LiDAR 扫描线密度重采样（可选）——与噪声/强度共用位姿。
+        # 缘石已生成但未并入时，扫描在"路面+缘石"的临时合并云上做单次
+        # 通过、再按索引区间拆回：缘石点由此流经与路面完全相同的扫描线/
+        # 距离/入射角密度模型（同一次 rng 抽取、同一个 r_max 归一），而
+        # 第 3 步病害仍在纯路面足迹上执行。curb 关闭时 scan_input 就是
+        # points 本身、road_sel 恒等于 scan_idx，与历史路径逐位一致。
         if self.config.lidar_scan.enable:
+            n_road_pre_scan = points.shape[0]
+            scan_input = (
+                points
+                if curb_points is None
+                else np.vstack([points, curb_points])
+            )
             scan_idx = resample_to_lidar_pattern(
-                points,
+                scan_input,
                 scan_lines=self.config.lidar_scan.scan_lines,
                 vertical_fov_deg=self.config.lidar_scan.vertical_fov_deg,
                 scan_pattern=self.config.lidar_scan.scan_pattern,
@@ -309,9 +366,19 @@ class SyntheticRoadDataset(_DatasetBase):
                 line_sigma_m=self.config.lidar_scan.line_sigma_m,
             )
             if len(scan_idx) > 10:
-                points = points[scan_idx]
-                normals = normals[scan_idx]
-        scan_pattern_points = int(len(points))
+                # scan_idx 来自 np.where，严格升序，可按单一阈值拆分。
+                road_sel = scan_idx[scan_idx < n_road_pre_scan]
+                points = points[road_sel]
+                normals = normals[road_sel]
+                if curb_points is not None:
+                    curb_sel = (
+                        scan_idx[scan_idx >= n_road_pre_scan] - n_road_pre_scan
+                    )
+                    curb_points = curb_points[curb_sel]
+                    curb_normals = curb_normals[curb_sel]
+        scan_pattern_points = int(
+            len(points) + (0 if curb_points is None else curb_points.shape[0])
+        )
         # 3. 标签初始化 + 病害选择 & 应用
         labels = np.zeros(points.shape[0], dtype=np.int64)
 
@@ -517,6 +584,37 @@ class SyntheticRoadDataset(_DatasetBase):
                 changed_indices = np.where(changed_mask)[0]
                 labels[changed_indices[restore]] = old_labels[changed_indices[restore]]
 
+        # 3.5 缘石并入：在病害之后、曲率之前。缘石点自带背景标签 0，不占用
+        # 任何病害标签。road_mask 标记路面足迹（curb 关闭时全 True），供第 5
+        # 步松散区域与第 6 步标签膨胀排除非路面点——这两条路径在 curb 关闭时
+        # 与历史逐位一致（掩码全 True 不改变任何取值）。
+        if curb_points is not None:
+            n_curb = curb_points.shape[0]
+            # 以并入前的实际路面点数划线，而不是静态网格预算：第 2.5 步
+            # 扫描重采样会随机抽稀路面点，静态值既会让守卫必然失配，又会
+            # 把（索引超出实际路面点数的）缘石点误标为路面足迹。
+            n_road_current = points.shape[0]
+            points = np.vstack([points, curb_points])
+            normals = np.vstack([normals, curb_normals])
+            labels = np.concatenate([labels, np.zeros(n_curb, dtype=labels.dtype)])
+            road_mask = np.arange(points.shape[0]) < n_road_current
+            # 自洽守卫：扫描关闭时病害步骤不增减点数（第 4 步曲率快速路径
+            # 历来依赖同一等式），并入前必须仍等于路面网格预算；扫描开启
+            # 时该点数是随机的，无静态期望——网格健全性已由第 2.4 步
+            # preflight 守卫覆盖。
+            if (
+                not self.config.lidar_scan.enable
+                and n_road_current != road_point_count
+            ):
+                raise RuntimeError(
+                    "Curb merge mismatch: road cloud holds "
+                    f"{n_road_current:,} points before merge, expected the "
+                    f"road grid's {road_point_count:,} (scan resampling "
+                    "disabled)."
+                )
+        else:
+            road_mask = np.ones(points.shape[0], dtype=bool)
+
         # 4. Curvature for sensor edge mixing.  The full-resolution surface is
         # still a regular grid unless scan-line resampling was enabled.  A
         # finite-difference fast path avoids millions of individual KDTree
@@ -525,6 +623,7 @@ class SyntheticRoadDataset(_DatasetBase):
         if (
             not self.config.lidar_scan.enable
             and len(points) == surface_estimate.point_count
+            and self.config.curb_grid_point_count == 0
         ):
             curvature = _compute_grid_curvature(
                 points[:, 2].reshape(surface_estimate.grid_shape),
@@ -543,10 +642,14 @@ class SyntheticRoadDataset(_DatasetBase):
             x_frac_max = x_frac_min + float(rng.uniform(0.2, 0.5))
             y_frac_min = float(rng.uniform(0.05, 0.35))
             y_frac_max = y_frac_min + float(rng.uniform(0.2, 0.5))
-            x_min_r = np.min(points[:, 0]) + x_frac_min * (np.max(points[:, 0]) - np.min(points[:, 0]))
-            x_max_r = np.min(points[:, 0]) + x_frac_max * (np.max(points[:, 0]) - np.min(points[:, 0]))
-            y_min_r = np.min(points[:, 1]) + y_frac_min * (np.max(points[:, 1]) - np.min(points[:, 1]))
-            y_max_r = np.min(points[:, 1]) + y_frac_max * (np.max(points[:, 1]) - np.min(points[:, 1]))
+            # 区域从**路面足迹**推导（curb 关闭时 road_mask 全 True，与历史
+            # 逐位一致）：否则缘石会加宽 bbox，使既有病害几何随 curb 开关漂移，
+            # 并可能把松散区域推到缘石上。
+            road_pts = points[road_mask]
+            x_min_r = np.min(road_pts[:, 0]) + x_frac_min * (np.max(road_pts[:, 0]) - np.min(road_pts[:, 0]))
+            x_max_r = np.min(road_pts[:, 0]) + x_frac_max * (np.max(road_pts[:, 0]) - np.min(road_pts[:, 0]))
+            y_min_r = np.min(road_pts[:, 1]) + y_frac_min * (np.max(road_pts[:, 1]) - np.min(road_pts[:, 1]))
+            y_max_r = np.min(road_pts[:, 1]) + y_frac_max * (np.max(road_pts[:, 1]) - np.min(road_pts[:, 1]))
             region_mask = (
                 (points[:, 0] >= x_min_r) & (points[:, 0] <= x_max_r)
                 & (points[:, 1] >= y_min_r) & (points[:, 1] <= y_max_r)
@@ -569,7 +672,9 @@ class SyntheticRoadDataset(_DatasetBase):
         if np.any(raveling_valid_mask):
             raveling_xy = points[raveling_valid_mask][:, :2]
             raveling_severity = labels[raveling_valid_mask]
-            background_valid_mask = valid_mask & ~raveling_labels_mask
+            # 膨胀目标限定在路面足迹内：缘石点不得获得松散标签（设计保证
+            # 缘石恒为背景标签 0）。curb 关闭时 road_mask 全 True，无影响。
+            background_valid_mask = valid_mask & ~raveling_labels_mask & road_mask
             if np.any(background_valid_mask) and raveling_xy.shape[0] > 0:
                 from scipy.spatial import KDTree as _KDTree
                 bg_xy = points[background_valid_mask][:, :2]
@@ -785,8 +890,11 @@ class SyntheticRoadDataset(_DatasetBase):
         ]
         resolution_metadata["sensor_output"]["intensity_model"] = (
             "radiometric.v2: rho(x,y)*shading*cos(theta)/R^2, "
-            "lognormal albedo field (corr 0.3 m, sigma_ln 0.25), "
-            "Gamma speckle M=12, 8-bit quantization; sigma_r and dropout "
+            "lognormal albedo field (corr "
+            f"{self.config.radiometric.albedo_corr_len_m:g} m, sigma_ln "
+            f"{self.config.radiometric.albedo_sigma_ln:g}), "
+            f"Gamma speckle M={self.config.radiometric.speckle_m:g}, "
+            "8-bit quantization; sigma_r and dropout "
             "share the same received-power proxy"
         )
         # Audit trail for controlled scenes: record how many target-label
@@ -813,6 +921,10 @@ class SyntheticRoadDataset(_DatasetBase):
             "feats": feats,
             "normals": normals_final.astype(np.float32),
             "pavement_type": pavement_type,
+            # 该场景实际生效的 ISO 8608 等级，无论混合开关总是写入（与
+            # pavement_type 同型的 0 维 unicode 标量落盘）：混合开启时为
+            # 逐场景抽取结果，关闭时为配置的单一回退等级。
+            "roughness_class": roughness_actual,
             "target_label": -1 if target_label is None else int(target_label),
             "feature_schema": OBSERVABLE_FEATURE_SCHEMA,
             "feature_names": np.asarray(OBSERVABLE_FEATURE_NAMES),
@@ -991,11 +1103,18 @@ class SyntheticRoadDataset(_DatasetBase):
           外露）×1.15-1.2。裂缝/坑槽类不做材料偏移——凹陷内的变暗
           由几何遮蔽因子产生。
         - 空间相关反照率场：对数正态乘性场（FFT 低通，相关长度
-          ~0.3 m，σ_ln≈0.25），保证类内方差大、类间分布重叠。
+          ``radiometric.albedo_corr_len_m``，σ_ln ``radiometric.albedo_sigma_ln``），
+          保证类内方差大、类间分布重叠。
         - 几何遮蔽：低于局部参考面的点按 exp(-depth/12 mm) 变暗
           （深槽回波弱），参考面取 0.08 m 粗网格中位数。
         - cosθ/R² 几何项、AGC 归一（99 分位）、乘性 Gamma 斑点
-          （M=12）、uint8 量化。
+          （M=``radiometric.speckle_m``）、uint8 量化。
+
+        分布参数取自 ``config.radiometric``，默认值逐字等于历史硬编码
+        （0.25 / 0.3 / 12.0），因此默认构造时输出逐点一致。注意
+        ``received_power`` 同时供 σ_r 异方差与辐射耦合丢点使用，改动
+        这些参数会经丢点间接改变输出点数——这是预期的物理耦合，不是
+        点数缺陷。
 
         Returns:
             intensity: 归一化强度 (N,) float32 ∈ [0, 1]，256 级。
@@ -1025,7 +1144,7 @@ class SyntheticRoadDataset(_DatasetBase):
         fx = np.fft.fftfreq(gx, d=ext_x / gx)
         fy = np.fft.fftfreq(gy, d=ext_y / gy)
         f_r = np.sqrt(fx[:, None] ** 2 + fy[None, :] ** 2)
-        corr_len = 0.3  # m
+        corr_len = self.config.radiometric.albedo_corr_len_m  # m
         lowpass = np.exp(-((f_r * corr_len) ** 2))
         field = np.real(np.fft.ifft2(lowpass * np.fft.fft2(rng.normal(size=(gx, gy)))))
         fstd = field.std()
@@ -1036,7 +1155,7 @@ class SyntheticRoadDataset(_DatasetBase):
             (np.linspace(x_min, x_max, gx), np.linspace(y_min, y_max, gy)),
             field, bounds_error=False, fill_value=0.0,
         )
-        rho_field = np.exp(0.25 * interp(points[:, :2]))
+        rho_field = np.exp(self.config.radiometric.albedo_sigma_ln * interp(points[:, :2]))
         rho = np.clip(base * mult * rho_field, 0.02, 0.95)
 
         # --- 几何遮蔽：相对局部参考面的凹陷深度（与遮挡模型共用） ---
@@ -1054,7 +1173,7 @@ class SyntheticRoadDataset(_DatasetBase):
         # --- AGC 归一 + 斑点噪声 + 量化 ---
         scale = float(np.percentile(received_power, 99.0))
         intensity = received_power / max(scale, 1e-12)
-        speckle_m = 12.0
+        speckle_m = self.config.radiometric.speckle_m
         intensity = intensity * rng.gamma(shape=speckle_m, scale=1.0 / speckle_m, size=N)
         intensity = np.clip(intensity, 0.0, 1.0)
         intensity = np.round(intensity * 255.0) / 255.0
