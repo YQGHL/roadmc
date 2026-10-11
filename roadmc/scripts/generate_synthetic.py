@@ -82,6 +82,10 @@ def _save_one_scene(dataset, split_dir: Path, scene_id: int) -> dict:
             surface_grid_shape=scene["surface_grid_shape"],
             surface_grid_point_count=scene["surface_grid_point_count"],
             sensor_output_point_count=scene["sensor_output_point_count"],
+            observation_model=scene["observation_model"],
+            segment_count=scene["segment_count"],
+            segment_length_m=scene["segment_length_m"],
+            segment_overlap_m=scene["segment_overlap_m"],
             model_target_points=scene["model_target_points"],
         )
         result["ok"] = True
@@ -267,6 +271,27 @@ def _build_parser() -> argparse.ArgumentParser:
         default=8192.0,
         help="所有生成 worker 的表面合成估算内存总上限 (MiB)",
     )
+    parser.add_argument(
+        "--width",
+        type=float,
+        default=7.0,
+        help="路面宽度 (米)，默认 7.0（双车道口径）；硬下限 1.0 m",
+    )
+    parser.add_argument(
+        "--length",
+        type=float,
+        default=5.0,
+        help="路面长度（里程向）(米)，默认 5.0",
+    )
+    parser.add_argument(
+        "--observation-model",
+        choices=["on", "off"],
+        default="off",
+        help=(
+            "观测模型体制：off（默认）直接输出全部表面点，跳过扫描抽稀与"
+            "噪声丢点；on 复现完整传感器观测管线（与历史版本逐位一致）"
+        ),
+    )
     parser.add_argument("--pavement", type=str, default="mixed", choices=["asphalt", "concrete", "mixed"], help="路面类型")
     parser.add_argument("--roughness", type=str, default="B", choices=["A", "B", "C", "D", "E"], help="ISO 8608 粗糙度等级")
     parser.add_argument("--max-diseases", type=int, default=3, help="每场景最多病害数")
@@ -280,6 +305,8 @@ def _config_from_args(args: argparse.Namespace) -> GeneratorConfig:
 
     return GeneratorConfig(
         road=RoadSurfaceConfig(
+            width=args.width,
+            length=args.length,
             grid_res=args.surface_grid_spacing,
             roughness_class=args.roughness,
             pavement_type=args.pavement,
@@ -294,6 +321,8 @@ def _config_from_args(args: argparse.Namespace) -> GeneratorConfig:
         model_target_points=args.model_target_points,
         max_surface_points=args.max_surface_points,
         max_surface_memory_mib=args.max_surface_memory_mib,
+        # CLI 默认 off（冻结决策）；GeneratorConfig 的库内默认仍是 "on"。
+        observation_model=args.observation_model,
     )
 
 
@@ -309,6 +338,50 @@ def _validate_request(
         raise ValueError("--max-diseases must be >= 1")
     if args.workers < 0:
         raise ValueError("--workers must be >= 0; zero retains legacy single-worker behavior")
+
+    # 毫米域校验：宽度硬下限 1.0 m——add_depression/add_pothole 在
+    # [0.5, width-0.5] 上抽中心（generator.py），width < 1 时该区间
+    # 为空（lo >= hi），numpy 会直接抛错；在请求入口给出可读报错。
+    if args.width < 1.0:
+        raise ValueError(
+            f"--width must be >= 1.0 m, got {args.width}: disease centers are "
+            "sampled in [0.5, width - 0.5] (add_depression / add_pothole), which "
+            "is empty below 1.0 m"
+        )
+    # crowned 路拱是 7 m 双车道口径（±30 mm 中央落差）：3 m 窄路中央
+    # 路拱语义上是双车道剖面，建议 plane。不强制——crowned 几何本身合法。
+    if config.road.crossfall_shape == "crowned" and args.width <= 3.5:
+        warnings.warn(
+            f"--width {args.width:g} m <= 3.5 m with crossfall_shape='crowned': "
+            "the crowned profile is calibrated for the 7 m two-lane "
+            "cross-section; 'plane' is usually the right semantics on narrow "
+            "roads. Kept as configured (warning only).",
+            stacklevel=2,
+        )
+    # 轮迹带横向占位 = wheel_separation + rut_width（默认 2.4 m）：更窄的
+    # 路面会让车辙沟槽溢出路缘（add_rutting 的 x_L/x_R 落到路外）。
+    rutting_span = config.rutting.wheel_separation + config.rutting.rut_width
+    if args.width < rutting_span:
+        warnings.warn(
+            f"--width {args.width:g} m is narrower than the rutting wheel-track "
+            f"span ({rutting_span:g} m = wheel_separation + rut_width): rut "
+            "grooves would extend beyond the carriageway edge.",
+            stacklevel=2,
+        )
+
+    # 分段条带计划在 on 体制下不可执行（观测管线未分段）：前置硬报错，
+    # 而不是让批量跑逐场景 warn 失败、退出码 0、产出空数据集。
+    estimate = config.estimate_surface_generation()
+    if estimate.segmented and config.observation_model == "on":
+        raise ValueError(
+            f"Strip of {estimate.point_count:,} points requires the segmented "
+            f"regime ({estimate.segment_count} segments × "
+            f"{estimate.segment_length_m:.3f} m), which currently supports "
+            "observation_model='off' only (the sensor pipeline is not "
+            "segmented in this build). Re-run with --observation-model off "
+            "(the default), or raise --max-surface-points / "
+            "--max-surface-memory-mib to hold the whole strip in one block."
+        )
 
     effective_workers = max(1, args.workers)
     largest_split = max(args.train_count, args.val_count)
@@ -333,13 +406,32 @@ def _print_resolution_summary(
         if config.model_target_points is None
         else str(config.model_target_points)
     )
+    sensor_desc = (
+        "全表面直出 (点数/密度请求被忽略)"
+        if config.observation_model == "off"
+        else f"{config.sensor_output_mode}/约 {config.sensor_output_target_points:,} 点"
+    )
     print(
         "分辨率契约: "
         f"表面={config.road.surface_grid_spacing_m * 1000.0:.2f} mm "
-        f"({estimate.point_count:,} 点), "
-        f"传感器输出={config.sensor_output_mode}/约 "
-        f"{config.sensor_output_target_points:,} 点, "
+        f"({config.road.width:g}m×{config.road.length:g}m, "
+        f"{estimate.point_count:,} 点), "
+        f"观测模型={config.observation_model}, "
+        f"传感器输出={sensor_desc}, "
         f"模型目标={model_points}"
+    )
+    if estimate.segmented:
+        print(
+            f"分段条带: {estimate.segment_count} 段 × {estimate.segment_length_m:.3f} m "
+            f"(重叠 {estimate.overlap_m:.3f} m, 单段扩展点数 "
+            f"{estimate.segment_point_count_ext:,}, worker 峰值 "
+            f"{estimate.worker_peak_mib:.0f} MiB)"
+        )
+    per_scene_gib = estimate.point_count * 48 / 1024 ** 3
+    print(
+        f"体量估算: 每场景落盘数组约 {per_scene_gib:.2f} GiB"
+        "（f32 坐标/法向/特征 + i32 标签，压缩后更小）；"
+        "大规模生成前请确认磁盘预算"
     )
     if estimated_parallel_mib:
         print(
@@ -386,6 +478,9 @@ def main() -> None:
             "max_surface_points": args.max_surface_points,
             "max_surface_memory_mib": args.max_surface_memory_mib,
             "max_parallel_memory_mib": args.max_parallel_memory_mib,
+            "width_m": args.width,
+            "length_m": args.length,
+            "observation_model": args.observation_model,
         },
         "resolution_contract": config.resolution_metadata(),
         "parallel_surface_estimated_peak_memory_mib": estimated_parallel_mib,
