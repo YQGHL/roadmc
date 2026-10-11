@@ -59,7 +59,7 @@ road morphology + damage deformation + LiDAR observation
 | Architecture comparison | ✅ Five mainstream point-cloud segmentation networks run to 30 epochs under the identical protocol (see below) |
 | Channel-mixing ablation | ✅ Four variants × three seeds complete; between-variant differences are smaller than within-variant spread, **no mechanistic claim** |
 | Generator realism options | ✅ Roughness mixture, along-track texture heterogeneity, curb strip, radiometric calibration — all implemented, all off by default, v2 behaviour unchanged |
-| Domain-gap diagnostics | ✅ v2 joint MMD `0.136` (41 frames), replicated at `0.1368` on a 441-frame subset; `0.0398` for the dataset rebuilt with the realism options on under the same rule |
+| Domain-gap diagnostics | v2 joint MMD `0.136` (41 frames), replicated at `0.1368` on a 441-frame subset; the realism-config comparison is **pending re-validation** (the implementation was lost and re-written to spec in 2026-10; numbers to be backfilled) |
 | Real-domain performance | No real semantic mIoU. The available M2S-RoAD samples are unlabelled and used only for domain-gap diagnostics |
 
 ## Results
@@ -125,11 +125,11 @@ Real data: unlabelled PCD frames from M2S-RoAD (OS1-128). The gap is measured wi
 | v2 synthetic vs real (before fixes) | 855 × 41 | 0.458 |
 | v2 synthetic vs real (after fixes) | 855 × 41 | **0.136** |
 | v2 synthetic vs real (extended replication) | 855 × 441 | 0.1368 |
-| Realism-config dataset vs real | 858 × 440 | **0.0398** |
+| Realism-config dataset vs real | — | **pending re-validation** |
 
-All four rows use a `0.15 m` dominant-plane threshold. Tightening both sides to `0.02 m`, so the statistics cover points closer to the pavement layer, gives v2 `0.1410` and the realism-config dataset `0.0337` — the same direction and a similar relative reduction.
+All rows use a `0.15 m` dominant-plane threshold; at a tightened `0.02 m` threshold the v2 reading is `0.1410`.
 
-The first three rows differ only because of three defects in the diagnostic itself (inconsistent normal source, wrong intensity range used for normalization, mismatched sampling windows). Once corrected, the residual gap sits in point density, intensity distribution and normal tilt — all sensor-observation-layer quantities. The last row re-measures a dataset rebuilt with the generator's realism options switched on, using the same descriptors and the same code path.
+The first three rows differ only because of three defects in the diagnostic itself (inconsistent normal source, wrong intensity range used for normalization, mismatched sampling windows). Once corrected, the residual gap sits in point density, intensity distribution and normal tilt — all sensor-observation-layer quantities. The realism-config row is pending re-validation: that implementation was lost, re-written to the spec below in 2026-10, and passed functional acceptance (default-off output is bit-identical to v2); the comparison against real data will be backfilled after re-measurement.
 
 A data-level finding that affects anyone using M2S-RoAD: some sessions encode no-return samples as `range == 0`, and in most frames those points do **not** sit at the origin, so the usual "drop returns near the origin" filter does not remove them. They corrupt both the RANSAC dominant plane and the k-NN density estimate. The readings above drop those samples by their `range` field before any descriptor is computed; a loader-side filter is deliberately not merged yet, because it would move every existing 41-frame reading.
 
@@ -236,7 +236,7 @@ The four option groups below narrow the observation-level gap between synthetic 
 | Curb strip | `--curb-width 0.30 --curb-height 0.13` | Adds a raised strip beside the driving lane so that non-pavement points enter the density and normal statistics |
 | Radiometric calibration | `--albedo-sigma-ln 0.9 --speckle-m 6.0` | Computes intensity as `albedo field × incidence × 1/R²` with lognormal and Gamma calibration; the distribution is no longer uniformly too bright |
 
-The full rebuild command used for the last row of the domain-gap table:
+The full rebuild command with all four realism option groups enabled:
 
 ```powershell
 python roadmc/scripts/generate_class_budget.py `
@@ -253,7 +253,7 @@ python roadmc/scripts/generate_class_budget.py `
   --workers 16 --seed 42
 ```
 
-This configuration moves joint MMD from the 0.136 range down to 0.034. The cost is that curvature and height residual become larger than the real side under the matched ROI: real surfaces show "more long-wave undulation, less short-wave bending", and a single spectral shape cannot hit both sampling windows at once. The remaining visible gap is point density (about 115 points/m² synthetic vs about 156 points/m² real).
+How this configuration moves the joint MMD is **pending re-validation**: it will be re-measured against real data under the same rule as the table above and backfilled.
 
 ## Model Training
 
@@ -476,7 +476,7 @@ readmeimage/
 - Implemented n-stream residual mixing as an ablation arm (`--mixing {none,dscm,hc2,hc4}`) and completed four variants × three seeds, which downgraded the mixing gain to not significant.
 - Completed the 30-epoch comparison against five mainstream architectures, and documented where the two checkpoint selection rules disagree on weak models.
 - Corrected three defects that made domain-gap readings non-comparable (normal source, intensity range, sampling window), reducing joint MMD from 0.458 to 0.136, and replicated the result on a 441-frame subset.
-- Added four realism option groups to the generator (roughness mixture, along-track texture heterogeneity, curb strip, radiometric calibration), all off by default; a dataset rebuilt with them reaches joint MMD 0.0337.
+- Restored four realism option groups on the generator (roughness mixture, along-track texture heterogeneity, curb strip, radiometric calibration), all off by default with bit-identical default output; the real-domain comparison is pending re-validation.
 - Located and worked around the M2S-RoAD `range == 0` no-return encoding issue.
 
 ### Roadmap
