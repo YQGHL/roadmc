@@ -37,6 +37,41 @@ except ImportError:
 # JTG 5210-2018 线状裂缝轻/重判据：缝宽 3 mm 分界。
 JTG_CRACK_WIDTH_THRESHOLD_M: float = 0.003
 
+
+def _coord_hash01(x: np.ndarray, y: np.ndarray, salt: int) -> np.ndarray:
+    """Deterministic per-point uniform in [0, 1) keyed on the coordinates.
+
+    分段体制的**云无关**随机决策：同一物理点无论落在哪个段的扩展云里，
+    其 (x, y) 浮点位型相同 ⇒ 哈希值相同 ⇒ 摘除/侵蚀/剥落决策逐位一致。
+    用于 raveling 的点摘除与坑槽边缘剥落——这两个基元原本用
+    ``rng.choice(cloud_indices)``，其消耗随传入云的点集变化，跨段会在缝
+    两侧给出不同的孔洞/剥蚀模式（见设计稿云无关规则）。哈希只依赖坐标
+    与盐值，不消耗任何 ``Generator`` 状态。
+
+    Args:
+        x, y: 点坐标 (N,)，float64。
+        salt: 32/64 位整数盐值（按位与 2⁶⁴-1 截断）。
+
+    Returns:
+        (N,) float64，均匀分布于 [0, 1)（splitmix64 尾混）。
+    """
+
+    xb = np.ascontiguousarray(np.asarray(x, dtype=np.float64)).view(np.int64)
+    yb = np.ascontiguousarray(np.asarray(y, dtype=np.float64)).view(np.int64)
+    with np.errstate(over="ignore"):
+        h = (
+            xb.astype(np.uint64) * np.uint64(0x9E3779B97F4A7C15)
+            + yb.astype(np.uint64) * np.uint64(0xC2B2AE3D27D4EB4F)
+            + np.uint64(int(salt) & 0xFFFFFFFFFFFFFFFF)
+        )
+        h ^= h >> np.uint64(30)
+        h *= np.uint64(0xBF58476D1CE4E5B9)
+        h ^= h >> np.uint64(27)
+        h *= np.uint64(0x94D049BB133111EB)
+        h ^= h >> np.uint64(31)
+    return (h >> np.uint64(11)).astype(np.float64) * (1.0 / 9007199254740992.0)
+
+
 def _compute_normals(
     Z: np.ndarray, dx: float, dy: float
 ) -> np.ndarray:
@@ -441,6 +476,309 @@ def generate_road_surface(
     return points, normals
 
 
+# 1.1.2 — 分段条带合成（strip segmentation runtime）
+
+
+def _iso_band_variance_fine(
+    width: float, length: float, grid_res: float, Gd0: float
+) -> float:
+    """ISO 8608 带（Ω ≤ f_iso_max）在**细网格（单块路径）**离散频率集上的
+    精确 Parseval 方差，供分段宏观场定标使用。
+
+    单块 :func:`generate_road_surface` 的 ``var_iso`` 为
+    ``Σ Φ·dfx·dfy``，其中 ``fx = fftfreq(nx, grid_res) = k/width``（
+    ``nx = ceil(width/grid_res)``）、``fy = l/length``。这里用同一组
+    频率（``k/width``、``l/length``）在带内求和：因 Φ 带外为 0，只需
+    ``|k| ≤ f_iso_max·width``、``|l| ≤ f_iso_max·length`` 的项，网格规模
+    仅 ~O((f·W)·(f·L))（3 m/50 m@2 mm 为 9×142），代价可忽略。粗网格
+    ``dfx = 1/(nx_c·h_macro) ≠ 1/width``，直接用粗网格和定标会引入
+    ~1.3% 的宏观 RMS 偏差（见 :func:`synthesize_strip_macro_band`）。
+
+    Args:
+        width, length: 条带几何 (m)。
+        grid_res: 细网格分辨率 (m)，用于 f_iso_max。
+        Gd0: ISO 8608 功率谱密度常数 (m³/cycle)，= 等级×1e-6。
+
+    Returns:
+        细网格 ISO 带方差 (m²)。
+    """
+
+    n0 = 0.1
+    f_iso_max = min(ISO8608_BAND_MAX_CYCLES_PER_M, 0.5 / grid_res)
+    dfx = 1.0 / width
+    dfy = 1.0 / length
+    kx = np.arange(
+        -int(np.ceil(f_iso_max * width)), int(np.ceil(f_iso_max * width)) + 1
+    )
+    ky = np.arange(
+        -int(np.ceil(f_iso_max * length)), int(np.ceil(f_iso_max * length)) + 1
+    )
+    FX = (kx * dfx)[:, None]
+    FY = (ky * dfy)[None, :]
+    omega = np.sqrt(FX**2 + FY**2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        psd = np.where(
+            (omega > 0.0) & (omega <= f_iso_max),
+            0.25 * Gd0 * n0**2 * np.where(omega > 0.0, omega, 1.0) ** (-3.0),
+            0.0,
+        )
+    return float(np.sum(psd) * dfx * dfy)
+
+
+def synthesize_strip_macro_band(
+    width: float,
+    length: float,
+    grid_res: float,
+    roughness_class: str,
+    rng_surface: np.random.Generator,
+    *,
+    macro_grid_factor: float = 4.0,
+) -> dict:
+    """Synthesize the ISO 8608 macro band once for the whole strip on a
+    coarse grid.
+
+    分段体制的宏观长波段**整条带全局一次**合成：粗网格间距
+    ``h_macro = 1 / (macro_grid_factor * f_iso_max)``（对 ISO 带上限取
+    ``macro_grid_factor`` 倍过采样），PSD 与 :func:`generate_road_surface`
+    的 ISO 段逐字相同（Φ = Gd0·n0²/4·Ω⁻³，Ω ≤ f_iso_max）。**Parseval
+    定标取细网格（单块路径）的 ISO 带离散和**——粗网格的
+    ``dfx = 1/(nx_c·h_macro)`` 与细网格的 ``dfx = 1/width`` 不同（nx_c·h
+    ≈ width + h_macro），直接用粗网格和定标会偏 -2.58%（2 mm/3×50 m）或
+    +2.36%（5 mm/7×5 m），即宏观 RMS 偏差 ~1.3%；改用细网格频率集上的
+    小规模精确求和（ka·dfx、kb·dfy，仅 |k| ≤ f_iso_max·W/L 项，成本可
+    忽略）后与单块宏观方差一致。宏观场全局单块 ⇒ 接缝处精确连续，与
+    粗糙度等级无关。
+
+    Args:
+        width: 条带横向宽度 (m)。
+        length: 条带里程向长度 (m)。
+        grid_res: 细网格分辨率 (m)，仅用于 f_iso_max。
+        roughness_class: ISO 8608 等级。
+        rng_surface: 表面随机流（与单块路径同源：由 surface seed 派生），
+            宏观白噪声从此抽取。
+        macro_grid_factor: 粗网格过采样倍数。
+
+    Returns:
+        dict(x=..., y=..., field=(nx_c, ny_c) float64, spacing_m=h_macro)
+    """
+
+    n0 = 0.1
+    Gd0 = ISO_ROUGHNESS[roughness_class] * 1e-6
+    f_iso_max = min(ISO8608_BAND_MAX_CYCLES_PER_M, 0.5 / grid_res)
+    h_macro = 1.0 / (macro_grid_factor * f_iso_max)
+
+    x_c = np.arange(0.0, width + h_macro, h_macro)
+    y_c = np.arange(0.0, length + h_macro, h_macro)
+    nx_c, ny_c = len(x_c), len(y_c)
+
+    fx = np.fft.fftfreq(nx_c, d=h_macro)
+    fy = np.fft.fftfreq(ny_c, d=h_macro)
+    FX, FY = np.meshgrid(fx, fy, indexing="ij")
+    omega = np.sqrt(FX**2 + FY**2)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        psd_iso = np.where(
+            (omega > 0.0) & (omega <= f_iso_max),
+            0.25 * Gd0 * n0**2 * np.where(omega > 0.0, omega, 1.0) ** (-3.0),
+            0.0,
+        )
+
+    # 细网格（单块口径）ISO 带方差：细网格 fx = k/(nx·grid_res) = k/width，
+    # fy = l/length。仅需 |k| ≤ f_iso_max·width、|l| ≤ f_iso_max·length 的
+    # 频率（带外 PSD 为 0），网格极小（3m/50m@2mm → 9×142）。
+    var_iso = _iso_band_variance_fine(width, length, grid_res, Gd0)
+
+    white = rng_surface.normal(0.0, 1.0, (nx_c, ny_c))
+    macro = np.real(np.fft.ifft2(np.sqrt(psd_iso) * np.fft.fft2(white)))
+    macro = macro - np.mean(macro)
+    rms_current = float(np.std(macro))
+    rms_target = math.sqrt(max(var_iso, 0.0))
+    if rms_current > 1e-15 and rms_target > 0.0:
+        macro = macro * (rms_target / rms_current)
+
+    return {"x": x_c, "y": y_c, "field": macro, "spacing_m": h_macro}
+
+
+def generate_strip_surface(
+    width: float,
+    length: float,
+    grid_res: float,
+    roughness_class: str,
+    seed: int | None,
+    *,
+    segment_bounds: list[tuple[int, int, int, int]],
+    blend_band_rows: int,
+    texture_rms: float = 0.0,
+    texture_hurst: float = 0.7,
+    crossfall: float = 0.0,
+    crossfall_shape: str = "crowned",
+    longitudinal_grade: float = 0.0,
+    texture_het_sigma_ln: float = 0.0,
+    texture_het_corr_len_m: float = 2.0,
+    macro_grid_factor: float = 4.0,
+    macro_band: dict | None = None,
+):
+    """Segmented strip surface synthesis (yields one extended segment at a
+    time to keep the working set bounded).
+
+    谱分解（与 :func:`generate_road_surface` 单块路径的谱定义一致）：
+
+    1. **宏观长波**（ISO 8608 段）：整条带全局一次合成于粗网格（见
+       :func:`synthesize_strip_macro_band`），粗→细用
+       ``RegularGridInterpolator(method="cubic")`` 逐段采样。接缝处
+       精确连续。
+    2. **短波纹理**（(f_iso_max, Nyquist]）：每段在扩展域（拥有行 +
+       两侧 halo 行）上独立 FFT，Φ ∝ Ω^{-(2H+2)}，Parseval 定标到
+       ``texture_rms``；段种子从专用子 rng 按段序抽取，与分段数确定
+       对应。
+    3. **跨段混合**：缝两侧各 2·blend_band_rows 行的重叠带上按
+       root-raised-cosine 混合（cos²+sin²=1，独立等方差高斯场混合后
+       方差保持）。同一混合带只计算一次，两个段看到**同一份**混合值
+       ⇒ 逐位一致。
+    4. **texture-het 调制**：M(y) 全局 1-D（白噪声 → gaussian_filter1d
+       → 标准化 → exp(σ·z) → mean(M²)=1），混合后统一乘 M 的全局切片
+       （单一施加位点）；het 关闭时零新增随机流。
+    5. **设计几何**（crossfall/crowned 折角与纵坡）不进粗网格——折角
+       不是带限信号——在混合后的细网格上解析叠加（与单块路径同次序），
+       法向从最终高度场统一重算。
+
+    每个输出行的最终值只由恰好一个段的"拥有趟"产生；halo 行只喂邻域
+    算子，绝不作为拥有值写出（由调用方按拥有行切片落盘）。
+
+    Args:
+        segment_bounds: 每段 ``(y0_owned, y1_owned, y0_ext, y1_ext)`` 行
+            区间（行 index，y = row * grid_res；ext 区间已按条带边界裁剪）。
+        blend_band_rows: 缝两侧混合带半宽（行数，= halo 行数 m_rows）。
+        macro_band: 预先合成好的宏观粗网格（:func:`synthesize_strip_macro_band`
+            的返回值）；None 时内部按相同流程合成（独立调用/测试用）。
+
+    Yields:
+        ``(seg_index, y0_ext, y1_ext, y0_owned, y1_owned, x_grid,
+        y_ext_values, z_ext (nx, ext_rows), normals_ext (nx, ext_rows, 3))``
+    """
+
+    rng_surface = np.random.default_rng(seed)
+    rng_tex = np.random.default_rng(int(rng_surface.integers(0, 2**31)))
+
+    x = np.arange(0.0, width, grid_res)
+    y = np.arange(0.0, length, grid_res)
+    nx, ny_total = len(x), len(y)
+    nyquist = 0.5 / grid_res
+    f_iso_max = min(ISO8608_BAND_MAX_CYCLES_PER_M, nyquist)
+
+    if macro_band is None:
+        macro_band = synthesize_strip_macro_band(
+            width, length, grid_res, roughness_class, rng_surface,
+            macro_grid_factor=macro_grid_factor,
+        )
+    macro_interp = interpolate.RegularGridInterpolator(
+        (macro_band["x"], macro_band["y"]),
+        macro_band["field"],
+        method="cubic",
+        bounds_error=False,
+        fill_value=0.0,
+    )
+
+    # texture-het 全局 1-D 调制场（整条 y 轴，天然跨段连续）。
+    if texture_het_sigma_ln > 0.0:
+        e = rng_tex.normal(0.0, 1.0, ny_total)
+        g = ndimage.gaussian_filter1d(
+            e, sigma=texture_het_corr_len_m / grid_res, mode="reflect"
+        )
+        zmod = (g - g.mean()) / max(float(g.std()), 1e-15)
+        het_m = np.exp(texture_het_sigma_ln * zmod)
+        het_m = het_m / np.sqrt(np.mean(het_m**2))
+    else:
+        het_m = None
+
+    beta = 2.0 * texture_hurst + 2.0
+
+    def _synth_texture(y0e: int, y1e: int) -> np.ndarray:
+        ext_rows = y1e - y0e
+        seed_k = int(rng_tex.integers(0, 2**31))
+        rng_k = np.random.default_rng(seed_k)
+        fx = np.fft.fftfreq(nx, d=grid_res)
+        fy = np.fft.fftfreq(ext_rows, d=grid_res)
+        FX, FY = np.meshgrid(fx, fy, indexing="ij")
+        omega = np.sqrt(FX**2 + FY**2)
+        dfx = 1.0 / (nx * grid_res)
+        dfy = 1.0 / (ext_rows * grid_res)
+        if texture_rms > 0.0 and nyquist > f_iso_max:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                raw = np.where(
+                    omega > f_iso_max,
+                    np.where(omega > 0.0, omega, 1.0) ** (-beta),
+                    0.0,
+                )
+            raw_var = float(np.sum(raw) * dfx * dfy)
+            if raw_var <= 0.0:
+                h = np.zeros((nx, ext_rows))
+            else:
+                h = np.real(np.fft.ifft2(
+                    np.sqrt(raw * (texture_rms**2 / raw_var))
+                    * np.fft.fft2(rng_k.normal(0.0, 1.0, (nx, ext_rows)))
+                ))
+                std = float(np.std(h))
+                if std > 1e-15:
+                    h = h * (texture_rms / std)
+        else:
+            h = np.zeros((nx, ext_rows))
+        return h
+
+    prev_field: np.ndarray | None = None
+    prev_bounds: tuple[int, int, int, int] | None = None
+
+    def _finalize(seg_k: int, bounds: tuple[int, int, int, int], tex: np.ndarray):
+        y0o, y1o, y0e, y1e = bounds
+        h = tex
+        if het_m is not None:
+            h = h * het_m[y0e:y1e][None, :]
+        Y_e = y[y0e:y1e]
+        macro_part = macro_interp(
+            np.stack(np.meshgrid(x, Y_e, indexing="ij"), axis=-1).reshape(-1, 2)
+        ).reshape(nx, y1e - y0e)
+        h_field = macro_part + h
+        if crossfall != 0.0:
+            X_e = np.meshgrid(x, Y_e, indexing="ij")[0]
+            if crossfall_shape == "crowned":
+                h_field = h_field - crossfall * np.abs(X_e - width / 2.0)
+            else:
+                h_field = h_field - crossfall * X_e
+        if longitudinal_grade != 0.0:
+            h_field = h_field + longitudinal_grade * Y_e[None, :]
+        normals_grid = _compute_normals(h_field, grid_res, grid_res)
+        return (seg_k, y0e, y1e, y0o, y1o, x, Y_e, h_field, normals_grid)
+
+    for k, bounds in enumerate(segment_bounds):
+        cur = _synth_texture(bounds[2], bounds[3])
+        if prev_field is not None:
+            # 缝在段界 s = prev.y1_owned = cur.y0_owned；混合带
+            # [s − m, s + m)（裁剪到条带内）。两段扩展域都覆盖该带
+            # （influence/halo 设计保证），同一带只计算一次并写回两个
+            # 域 ⇒ 跨段逐位一致。
+            s = segment_bounds[k][0]
+            m = blend_band_rows
+            lo = max(0, s - m)
+            hi = min(ny_total, s + m)
+            p0o, p1o, p0e, p1e = prev_bounds
+            theta = (
+                (y[lo:hi] - y[max(0, s - m)])
+                / (2.0 * m * grid_res)
+                * (np.pi / 2.0)
+            )
+            cos_t = np.cos(theta)[None, :]
+            sin_t = np.sin(theta)[None, :]
+            prev_slice = prev_field[:, lo - p0e : hi - p0e]
+            cur_slice = cur[:, lo - bounds[2] : hi - bounds[2]]
+            blended = cos_t * prev_slice + sin_t * cur_slice
+            prev_field[:, lo - p0e : hi - p0e] = blended
+            cur[:, lo - bounds[2] : hi - bounds[2]] = blended
+            yield _finalize(k - 1, prev_bounds, prev_field)
+        prev_field = cur
+        prev_bounds = bounds
+    yield _finalize(len(segment_bounds) - 1, prev_bounds, prev_field)
+
+
 # 1.1.3 — 缘石条带 (非路面点)
 
 
@@ -454,6 +792,7 @@ def generate_curb_strip(
     crossfall: float = 0.0,
     crossfall_shape: str = "crowned",
     longitudinal_grade: float = 0.0,
+    y_values: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """生成行车道横向外侧的两条缘石顶面条带（几何确定性，零 rng）。
 
@@ -497,7 +836,11 @@ def generate_curb_strip(
         normals: (N_c, 3)，顶面法向恒为 (0, 0, 1)。
     """
 
-    y = np.arange(0.0, length, grid_res)
+    y = (
+        np.asarray(y_values, dtype=np.float64)
+        if y_values is not None
+        else np.arange(0.0, length, grid_res)
+    )
     nx_c = max(1, int(math.ceil(curb_width_m / grid_res)))
 
     # x<0 侧取 [-w, 0)（含 -w，不含 0）；x>road_width 侧取 (W, W+w]（含 W+w，不含 W）。
@@ -868,8 +1211,13 @@ def add_crack(
 
         # 段数由曲线几何决定并设上限——旧的 N//100 使段数随点云规模
         # 线性增长（350k 点 → 3500 段 × 全点云距离 = 58 s/裂缝，5mm
-        # 网格下不可用），与几何保真无关。
-        num_curve_samples = int(np.clip(N // 100, 100, 400))
+        # 网格下不可用），与几何保真无关。分段体制经
+        # params["num_curve_samples"] 固定为 400（clip 的饱和值），
+        # 解耦段内点数 N。
+        if "num_curve_samples" in params:
+            num_curve_samples = int(params["num_curve_samples"])
+        else:
+            num_curve_samples = int(np.clip(N // 100, 100, 400))
         curve_pts = _cubic_bezier(control_pts, num_curve_samples)
 
         pert_seed = rng.integers(0, 2**31)
@@ -888,8 +1236,13 @@ def add_crack(
         r_cand = max(0.06, label_width_floor)
         point_tree = spatial.cKDTree(xy)
         cand_lists = point_tree.query_ball_point(curve_pts, r_cand)
-        cand_idx = np.unique(np.concatenate([np.asarray(c, dtype=np.int64)
-                                             for c in cand_lists if len(c)]))
+        # 分段体制：段扩展域可能完全不含曲线（曲线在别的段）——候选
+        # 列表为空时直接跳过（历史路径中曲线恒在云内，不会触发）。
+        if any(len(c) for c in cand_lists):
+            cand_idx = np.unique(np.concatenate([np.asarray(c, dtype=np.int64)
+                                                 for c in cand_lists if len(c)]))
+        else:
+            cand_idx = np.empty(0, dtype=np.int64)
         min_dist = np.full(N, np.inf)
         min_t = np.zeros(N)
         if len(cand_idx) > 0:
@@ -914,12 +1267,17 @@ def add_crack(
 
         # 裂缝宽度沿曲线变化 (对数正态采样)，基于空间位置插值。
         # 截断到 JTG 3 mm 判据的正确一侧：轻度 ≤ 3 mm，重度 > 3 mm。
-        lognorm_sample = rng.lognormal(mean=np.log(width_mean), sigma=width_std,
-                                       size=num_curve_samples)
-        if severity == "light":
-            lognorm_sample = np.minimum(lognorm_sample, JTG_CRACK_WIDTH_THRESHOLD_M - 1e-4)
+        # 分段体制：params["width_profile"] 由计划阶段预抽（含截断）
+        # 传入，替代内部抽取，保证跨段同一条裂缝宽度场逐位一致。
+        if "width_profile" in params:
+            lognorm_sample = np.asarray(params["width_profile"], dtype=np.float64)
         else:
-            lognorm_sample = np.maximum(lognorm_sample, JTG_CRACK_WIDTH_THRESHOLD_M + 2e-4)
+            lognorm_sample = rng.lognormal(mean=np.log(width_mean), sigma=width_std,
+                                           size=num_curve_samples)
+            if severity == "light":
+                lognorm_sample = np.minimum(lognorm_sample, JTG_CRACK_WIDTH_THRESHOLD_M - 1e-4)
+            else:
+                lognorm_sample = np.maximum(lognorm_sample, JTG_CRACK_WIDTH_THRESHOLD_M + 2e-4)
 
         # measure-then-label：标签严重度由实现几何的代表缝宽（中位数）
         # 对照 3 mm 阈值决定，而不是信任输入的 severity 字符串——
@@ -960,44 +1318,54 @@ def add_crack(
 
     # 龟裂 / 块状裂缝 (Voronoi 图)
     elif crack_type in ("alligator", "block"):
-        scene_x_min, scene_x_max = float(np.min(xy[:, 0])), float(np.max(xy[:, 0]))
-        scene_y_min, scene_y_max = float(np.min(xy[:, 1])), float(np.max(xy[:, 1]))
-
-        # 龟裂是**局部**疲劳损坏（轮迹带内数米的 patch），不是整条路
-        # 的裂缝网——旧实现把 Voronoi 种子撒满全场（7×5m 场景 136/140
-        # 个 0.5m 瓦片含龟裂标注）。patch 中心可由调用方传入（生成器
-        # 给轮迹带先验），尺寸：龟裂 ~1-4m × 0.6-1.2m，块裂更大。
         if crack_type == "alligator":
             block_size = 0.2 if severity == "severe" else 0.5
             width_crack = params.get(
                 "width_mean", 0.0015 if severity == "light" else 0.005
             )
-            region_w = float(params.get("region_width", rng.uniform(0.6, 1.2)))
-            region_l = float(params.get("region_length", rng.uniform(1.0, 4.0)))
         else:
             block_size = 1.0 if severity == "light" else 0.6
             width_crack = params.get(
                 "width_mean", 0.002 if severity == "light" else 0.005
             )
-            region_w = float(params.get("region_width", rng.uniform(1.5, 3.0)))
-            region_l = float(params.get("region_length", rng.uniform(2.0, 4.5)))
-
-        region_center = params.get("region_center")
-        if region_center is None:
-            region_center = (
-                rng.uniform(scene_x_min, scene_x_max),
-                rng.uniform(scene_y_min, scene_y_max),
+        # 分段体制：params["region_bounds"] 由计划阶段按全局条带 bbox
+        # 裁剪后传入（patch 最终边界），保证跨段 Voronoi 全链一致；
+        # 不传时回退为从传入云 bbox 推导（单块路径历史行为逐位不变）。
+        if "region_bounds" in params:
+            x_min, x_max, y_min, y_max = (
+                float(v) for v in params["region_bounds"]
             )
-        x_min = max(scene_x_min, float(region_center[0]) - region_w / 2.0)
-        x_max = min(scene_x_max, float(region_center[0]) + region_w / 2.0)
-        y_min = max(scene_y_min, float(region_center[1]) - region_l / 2.0)
-        y_max = min(scene_y_max, float(region_center[1]) + region_l / 2.0)
-        if x_max - x_min < block_size or y_max - y_min < block_size:
-            # patch 被场景边界裁剪得过小：扩到最小可用尺寸。
-            x_min = max(scene_x_min, x_max - max(region_w, 2 * block_size))
-            x_max = min(scene_x_max, x_min + max(region_w, 2 * block_size))
-            y_min = max(scene_y_min, y_max - max(region_l, 2 * block_size))
-            y_max = min(scene_y_max, y_min + max(region_l, 2 * block_size))
+        else:
+            scene_x_min, scene_x_max = float(np.min(xy[:, 0])), float(np.max(xy[:, 0]))
+            scene_y_min, scene_y_max = float(np.min(xy[:, 1])), float(np.max(xy[:, 1]))
+
+            # 龟裂是**局部**疲劳损坏（轮迹带内数米的 patch），不是整条路
+            # 的裂缝网——旧实现把 Voronoi 种子撒满全场（7×5m 场景 136/140
+            # 个 0.5m 瓦片含龟裂标注）。patch 中心可由调用方传入（生成器
+            # 给轮迹带先验），尺寸：龟裂 ~1-4m × 0.6-1.2m，块裂更大。
+            if crack_type == "alligator":
+                region_w = float(params.get("region_width", rng.uniform(0.6, 1.2)))
+                region_l = float(params.get("region_length", rng.uniform(1.0, 4.0)))
+            else:
+                region_w = float(params.get("region_width", rng.uniform(1.5, 3.0)))
+                region_l = float(params.get("region_length", rng.uniform(2.0, 4.5)))
+
+            region_center = params.get("region_center")
+            if region_center is None:
+                region_center = (
+                    rng.uniform(scene_x_min, scene_x_max),
+                    rng.uniform(scene_y_min, scene_y_max),
+                )
+            x_min = max(scene_x_min, float(region_center[0]) - region_w / 2.0)
+            x_max = min(scene_x_max, float(region_center[0]) + region_w / 2.0)
+            y_min = max(scene_y_min, float(region_center[1]) - region_l / 2.0)
+            y_max = min(scene_y_max, float(region_center[1]) + region_l / 2.0)
+            if x_max - x_min < block_size or y_max - y_min < block_size:
+                # patch 被场景边界裁剪得过小：扩到最小可用尺寸。
+                x_min = max(scene_x_min, x_max - max(region_w, 2 * block_size))
+                x_max = min(scene_x_max, x_min + max(region_w, 2 * block_size))
+                y_min = max(scene_y_min, y_max - max(region_l, 2 * block_size))
+                y_max = min(scene_y_max, y_min + max(region_l, 2 * block_size))
         area = max((x_max - x_min) * (y_max - y_min), block_size ** 2)
 
         num_seeds = max(int(area / (block_size ** 2)), 4)
@@ -1080,6 +1448,7 @@ def add_pothole(
     severity: str,
     seed: int | None = None,
     beta_range: tuple[float, float] | None = None,
+    params: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Add a pothole (坑槽) via superellipsoid depression.
 
@@ -1099,6 +1468,14 @@ def add_pothole(
 
     标签：轻=9 (d_max ≤ 25mm), 重=10 (d_max > 25mm)
 
+    分段体制（``params["deterministic_seed"]`` + ``params["pit_seed"]``）：
+    边缘剥落改为坐标哈希的逐点确定性决策，微坑参数改由专用 ``pit_seed``
+    随机流抽定——历史路径里 ``rng.choice(edge_idx)`` 的消耗随传入云的点集
+    变化，会污染其后所有抽取（含 Poisson 微坑），使坑缘剥落/微坑在缝两侧
+    不一致（半径大、锚点近缝时扩展域截断剥落环）。坐标哈希 + 专用微坑流
+    使任一物理点在任何段里得到相同结果，无需归属段规则（归属段反而会把
+    跨缝坑槽在邻段拥有行上截断）。不传 params 时走历史路径，逐位不变。
+
     Args:
         points:  点云 (N, 3)。
         labels:  标签 (N,)。
@@ -1107,9 +1484,11 @@ def add_pothole(
         depth:   最大深度 d_max (m)。
         edge_quality: 边缘质量因子 [0,1]，1 为完整，0 为严重剥落。
         severity: 严重程度 'light' | 'severe'。
-        seed: 随机种子。
+        seed: 随机种子（历史路径）。
         beta_range: 重度坑槽的 β 采样区间 (lo, hi)；轻度恒为 2（椭球）。
             None 时重度取 [3, 5]（默认口径，与 PotholeConfig.beta_range 一致）。
+        params: 可选覆盖：``'deterministic_seed'``（剥落坐标哈希盐）、
+            ``'pit_seed'``（微坑专用随机流种子）。
 
     Returns:
         points_modified:  修改后点云 (N, 3)。
@@ -1145,28 +1524,47 @@ def add_pothole(
         pts[in_pothole, 2] += z_depression
         lbl[in_pothole] = label_val
 
+    det_seed = None if params is None else params.get("deterministic_seed")
+    pit_seed = None if params is None else params.get("pit_seed")
+    pit_rng = rng if pit_seed is None else np.random.default_rng(int(pit_seed))
+
     # 边缘剥落 (edge spalling)
     if edge_quality < 1.0:
         edge_mask = (r >= 0.8 * radius) & (r <= 1.2 * radius)
         if np.any(edge_mask):
             edge_idx = np.where(edge_mask)[0]
-            num_spall = int(edge_quality * len(edge_idx))
-            if num_spall < len(edge_idx):
-                spall_idx = rng.choice(edge_idx, size=len(edge_idx) - num_spall,
-                                       replace=False)
-                spall_depth = rng.uniform(0.0, depth * 0.3, size=len(spall_idx))
-                pts[spall_idx, 2] -= spall_depth
-                lbl[spall_idx] = label_val
+            if det_seed is not None:
+                # 云无关：每个边缘点按坐标哈希以 edge_quality 概率保留。
+                u_keep = _coord_hash01(
+                    pts[edge_idx, 0], pts[edge_idx, 1], int(det_seed)
+                )
+                spall_idx = edge_idx[u_keep >= edge_quality]
+                if len(spall_idx) > 0:
+                    u_depth = _coord_hash01(
+                        pts[spall_idx, 0], pts[spall_idx, 1],
+                        int(det_seed) ^ 0x27D4EB2F165667C5,
+                    )
+                    spall_depth = u_depth * (depth * 0.3)
+                    pts[spall_idx, 2] -= spall_depth
+                    lbl[spall_idx] = label_val
+            else:
+                num_spall = int(edge_quality * len(edge_idx))
+                if num_spall < len(edge_idx):
+                    spall_idx = rng.choice(edge_idx, size=len(edge_idx) - num_spall,
+                                           replace=False)
+                    spall_depth = rng.uniform(0.0, depth * 0.3, size=len(spall_idx))
+                    pts[spall_idx, 2] -= spall_depth
+                    lbl[spall_idx] = label_val
 
         # Poisson 微坑 (小尺度次生坑)
-        num_pits = rng.poisson(max(1, int(radius * 5)))
+        num_pits = pit_rng.poisson(max(1, int(radius * 5)))
         for _ in range(num_pits):
-            pit_angle = rng.uniform(0, 2 * np.pi)
-            pit_radius = radius * rng.uniform(0.8, 1.3)
+            pit_angle = pit_rng.uniform(0, 2 * np.pi)
+            pit_radius = radius * pit_rng.uniform(0.8, 1.3)
             pit_cx = cx + pit_radius * np.cos(pit_angle)
             pit_cy = cy + pit_radius * np.sin(pit_angle)
-            pit_r = 0.02 + rng.random() * 0.04  # 微坑半径 2-6cm
-            pit_d = rng.uniform(0.001, 0.005)  # 深度 1-5mm
+            pit_r = 0.02 + pit_rng.random() * 0.04  # 微坑半径 2-6cm
+            pit_d = pit_rng.uniform(0.001, 0.005)  # 深度 1-5mm
 
             r_pit = np.sqrt((xy[:, 0] - pit_cx) ** 2 + (xy[:, 1] - pit_cy) ** 2)
             in_pit = r_pit <= pit_r
@@ -1259,6 +1657,7 @@ def add_raveling(
     severity: str,
     seed: int | None = None,
     remove_nan: bool = False,
+    params: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Add raveling (松散) — simulate fine aggregate loss.
 
@@ -1272,13 +1671,21 @@ def add_raveling(
     可改进点#1: 增加 ``remove_nan`` 参数，为 True 时在返回前自动过滤 NaN
     点并同步裁剪标签数组，减少调用方负担。
 
+    分段体制（``params["deterministic_seed"]``）：摘除与侵蚀改为**坐标
+    哈希**的逐点确定性决策，不再用 ``rng.choice(region_idx)``——后者消耗
+    随传入云的点集变化，缝两侧取自不同窗口时孔洞/侵蚀模式不一致（松散框
+    可占 0.2-0.5·L，必然跨段，且无哪个段的扩展域能完整包含它，故归属段
+    规则不适用）。坐标哈希保证同一物理点在任何段的扩展云里决策相同。
+    不传 params 时走历史 rng 路径，逐位不变。
+
     Args:
         points:  点云 (N, 3)。
         labels:  标签 (N,)。
         region_mask: 布尔掩码 (N,)，指示松散发生的区域。
         severity: 严重程度 'light' | 'severe'。
-        seed: 随机种子。
+        seed: 随机种子（历史路径；deterministic 模式下不使用）。
         remove_nan: 是否在返回前自动过滤 NaN 点 (可改进点#1)。
+        params: 可选覆盖：``'deterministic_seed'``（int）→ 坐标哈希决策。
 
     Returns:
         points_modified:  修改后点云 (N, 3) 或 (N', 3) (若 remove_nan=True)。
@@ -1304,21 +1711,51 @@ def add_raveling(
         removal_ratio = 0.20
         pitting_depth = 0.005  # 5mm
 
-    # 1. 随机移除点 (设为 NaN)
-    num_remove = int(removal_ratio * len(region_idx))
-    remove_idx = rng.choice(region_idx, size=num_remove, replace=False)
-    pts[remove_idx] = np.nan
-    lbl[remove_idx] = label_val  # 即使移除也标注标签
+    det_seed = None if params is None else params.get("deterministic_seed")
 
-    # 2. 剩余区域点的表面侵蚀
-    remaining_idx = np.setdiff1d(region_idx, remove_idx)
-    if len(remaining_idx) > 0:
-        # 高斯噪声随机深度
-        erosion = rng.normal(loc=pitting_depth * 0.5, scale=pitting_depth * 0.3,
-                             size=len(remaining_idx))
-        erosion = np.clip(erosion, 0.0, pitting_depth * 1.5)
-        pts[remaining_idx, 2] -= erosion
-        lbl[remaining_idx] = label_val
+    if det_seed is not None:
+        # 云无关路径：逐点坐标哈希决定摘除/保留与侵蚀深度。
+        salt = int(det_seed)
+        u_remove = _coord_hash01(
+            pts[region_idx, 0], pts[region_idx, 1], salt
+        )
+        remove_mask = u_remove < removal_ratio
+        remove_idx = region_idx[remove_mask]
+        pts[remove_idx] = np.nan
+        lbl[remove_idx] = label_val  # 即使移除也标注标签
+        remaining_idx = region_idx[~remove_mask]
+        if len(remaining_idx) > 0:
+            u_erosion = _coord_hash01(
+                pts[remaining_idx, 0], pts[remaining_idx, 1],
+                salt ^ 0x2545F4914F6CDD1D,
+            )
+            # 逆变换采样复现历史 N(0.5, 0.3)·depth 的侵蚀分布。
+            z_erosion = stats.norm.ppf(
+                np.clip(u_erosion, 1e-12, 1.0 - 1e-12)
+            )
+            erosion = np.clip(
+                pitting_depth * 0.5 + pitting_depth * 0.3 * z_erosion,
+                0.0,
+                pitting_depth * 1.5,
+            )
+            pts[remaining_idx, 2] -= erosion
+            lbl[remaining_idx] = label_val
+    else:
+        # 1. 随机移除点 (设为 NaN)
+        num_remove = int(removal_ratio * len(region_idx))
+        remove_idx = rng.choice(region_idx, size=num_remove, replace=False)
+        pts[remove_idx] = np.nan
+        lbl[remove_idx] = label_val  # 即使移除也标注标签
+
+        # 2. 剩余区域点的表面侵蚀
+        remaining_idx = np.setdiff1d(region_idx, remove_idx)
+        if len(remaining_idx) > 0:
+            # 高斯噪声随机深度
+            erosion = rng.normal(loc=pitting_depth * 0.5, scale=pitting_depth * 0.3,
+                                 size=len(remaining_idx))
+            erosion = np.clip(erosion, 0.0, pitting_depth * 1.5)
+            pts[remaining_idx, 2] -= erosion
+            lbl[remaining_idx] = label_val
 
     if remove_nan:
         valid = ~np.any(np.isnan(pts), axis=1)
@@ -1399,6 +1836,7 @@ def add_rutting(
     width: float,
     severity: str,
     seed: int | None = None,
+    params: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Add rutting (车辙) — dual wheel-track depressions.
 
@@ -1417,6 +1855,10 @@ def add_rutting(
     轻 (标签 15)：深度 10-15mm
     重 (标签 16)：深度 > 15mm
 
+    分段体制：``params["modulation_wavelength"]`` 由计划阶段按**全局**
+    条带长度固定（Λ = 全局 y 幅 × 0.5）传入；不传时回退为从传入云的
+    y 范围推导（单块路径历史行为逐位不变）。
+
     Args:
         points:  点云 (N, 3)。
         labels:  标签 (N,)。
@@ -1424,8 +1866,9 @@ def add_rutting(
         wheel_separation: 左右轮迹间距 (m)。
         depth:  最大深度 (m)。
         width: 单条轮迹宽度 (m)。
-        severity: 'light' | 'severe'。
-        seed: 随机种子。
+        severity: 严重程度 'light' | 'severe'。
+        seed: 随机种子（当前实现为确定性计算，保留接口）。
+        params: 可选覆盖：'modulation_wavelength' 纵向调制波长 (m)。
 
     Returns:
         points_modified:  修改后点云 (N, 3)。
@@ -1445,8 +1888,11 @@ def add_rutting(
 
     sigma = width / 3.0
 
-    y_range = np.max(y) - np.min(y)
-    modulation_wavelength = y_range * 0.5
+    if params is not None and "modulation_wavelength" in params:
+        modulation_wavelength = float(params["modulation_wavelength"])
+    else:
+        y_range = np.max(y) - np.min(y)
+        modulation_wavelength = y_range * 0.5
     epsilon = 0.2
     modulation = 1.0 + epsilon * np.sin(2.0 * np.pi * y / modulation_wavelength)
 
@@ -1477,6 +1923,7 @@ def add_corrugation(
     amplitude: float,
     severity: str,
     seed: int | None = None,
+    params: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Add corrugation (波浪拥包) — sinusoidal height modulation.
 
@@ -1499,14 +1946,19 @@ def add_corrugation(
     类先验被极端扭曲。注意 amplitude 指单侧波高；若 JTG 分级量按
     峰谷差解读则为 2A，正式实验前需对照标准原文口径（文档声明）。
 
+    分段体制：``params["envelope_center"]``/``params["envelope_sigma"]``
+    由计划阶段按**全局**条带 bbox 抽定后传入（不传时回退为从传入云
+    的 bbox 抽取——单块路径历史行为逐位不变）。
+
     Args:
         points:  点云 (N, 3)。
         labels:  标签 (N,)。
         direction: 波纹方向 'longitudinal' | 'transverse'。
         wavelength: 波长 (m)。
         amplitude:  振幅 (m)。
-        severity: 'light' | 'severe'。
+        severity: 严重程度 'light' | 'severe'。
         seed: 随机种子（包络中心与尺寸）。
+        params: 可选覆盖：'envelope_center' (cx, cy)、'envelope_sigma' σ_e。
 
     Returns:
         points_modified:  修改后点云 (N, 3)。
@@ -1526,11 +1978,15 @@ def add_corrugation(
         raise ValueError(f"Unknown direction: {direction}")
 
     # 高斯空间包络：局部搓板区（中心随机、σ_e ∈ [0.7, 1.3] m）。
-    x_min, x_max = float(np.min(pts[:, 0])), float(np.max(pts[:, 0]))
-    y_min, y_max = float(np.min(pts[:, 1])), float(np.max(pts[:, 1]))
-    cx = float(rng.uniform(x_min, x_max))
-    cy = float(rng.uniform(y_min, y_max))
-    sigma_e = float(rng.uniform(0.7, 1.3))
+    if params is not None and "envelope_center" in params:
+        cx, cy = (float(v) for v in params["envelope_center"])
+        sigma_e = float(params["envelope_sigma"])
+    else:
+        x_min, x_max = float(np.min(pts[:, 0])), float(np.max(pts[:, 0]))
+        y_min, y_max = float(np.min(pts[:, 1])), float(np.max(pts[:, 1]))
+        cx = float(rng.uniform(x_min, x_max))
+        cy = float(rng.uniform(y_min, y_max))
+        sigma_e = float(rng.uniform(0.7, 1.3))
     envelope = np.exp(
         -((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2) / (2.0 * sigma_e ** 2)
     )
@@ -1593,6 +2049,7 @@ def add_patching(
     angle_rad: float = 0.0,
     elevation: float = 0.0,
     edge_width: float = 0.08,
+    params: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Insert a finite-width repair patch with a smooth geometric transition.
 
@@ -1601,6 +2058,10 @@ def add_patching(
     over ``edge_width``. This gives a continuous height field instead of a
     label-only rectangle, while preserving nearby road roughness outside the
     repair boundary.
+
+    分段体制：``params["reference_plane"] = (a, b, c)`` 由计划阶段在
+    全局宏观 + 设计几何场上拟合后传入（纹理零均值，lstsq 天然平均掉），
+    替代对传入云的 lstsq——单块路径不传 params 时行为逐位不变。
     """
     if width <= 0.0 or length <= 0.0:
         raise ValueError("patch width and length must be positive")
@@ -1632,7 +2093,10 @@ def add_patching(
         return pts, lbl
 
     design = np.column_stack((x, y, np.ones_like(x)))
-    plane, *_ = np.linalg.lstsq(design, pts[:, 2], rcond=None)
+    if params is not None and "reference_plane" in params:
+        plane = np.asarray(params["reference_plane"], dtype=np.float64)
+    else:
+        plane, *_ = np.linalg.lstsq(design, pts[:, 2], rcond=None)
     target_height = design @ plane + elevation
 
     t = np.clip(1.0 - np.maximum(signed_distance, 0.0) / edge_width, 0.0, 1.0)
@@ -1682,6 +2146,18 @@ def add_concrete_damage(
             - 'slab_width': 板块宽度 (m)，默认 4.0
             - 'joint_width': 接缝宽度 (m)，默认 0.008
             - 'd_max': 最大深度/位移 (m)
+            - 'domain_bounds': (x_min, x_max, y_min, y_max) 全局条带 bbox
+              （分段体制；替代从传入云推导的 bbox，使接缝线/线中心等
+              bbox 派生量跨段一致）
+            - 'target_slab': (ix, iy) 计划固定的目标板块（slab_shatter /
+              corner_break / blowup）
+            - 'slab_bounds': (x0, x1, y0, y1) 计划固定的板块盒（同上三型，
+              使碎片种子/拱起中心跨段一致）
+            - 'corner_signs': (sx, sy) 计划固定的板角选向（corner_break）
+            - 'corner_reach': 计划预计算的角点距离（corner_break，跨缝
+              板块的倾斜场跨段一致）
+            - 'joint_y': 计划固定的错台接缝 y 坐标（faulting）
+            - 'pit_center': (cx, cy) 计划固定的坑洞中心（pitting）
         seed: 随机种子。
 
     Returns:
@@ -1724,9 +2200,15 @@ def add_concrete_damage(
         label_val = label_map.get(damage_type, 24)
 
     # 辅助：计算点到 slab 接缝的距离
-    # 接缝位置
-    x_min, x_max = float(np.min(x)), float(np.max(x))
-    y_min, y_max = float(np.min(y)), float(np.max(y))
+    # 接缝位置。分段体制：params["domain_bounds"]（全局条带 bbox）由
+    # 计划阶段传入，替代从传入云推导的 bbox——保证跨段的接缝线列表、
+    # faulting 的 joint_y、slab_crack 的线中心、pitting 的中心等
+    # bbox 派生量逐段一致（单块路径不传时行为逐位不变）。
+    if "domain_bounds" in params:
+        x_min, x_max, y_min, y_max = (float(v) for v in params["domain_bounds"])
+    else:
+        x_min, x_max = float(np.min(x)), float(np.max(x))
+        y_min, y_max = float(np.min(y)), float(np.max(y))
 
     # 横向接缝 (沿 y 方向，在偏移 + 整数倍 slab_len 处)
     trans_joints = np.arange(y_offset, y_max + slab_len, slab_len)
@@ -1751,10 +2233,15 @@ def add_concrete_damage(
     if damage_type == "slab_shatter":
         # 选择一块或多块板，将板内点分割成 Voronoi 碎片
         # 每个碎片随机垂直错台
-
+        # 分段体制：params["target_slab"]/["slab_bounds"] 由计划阶段按
+        # 全局板块列表固定后传入（跨段一致）；不传时回退为从传入云的
+        # 板块集合抽取（单块路径历史行为逐位不变）。下同。
         ix, iy = slab_indices(x, y)
-        unique_slabs = np.unique(np.stack([ix, iy], axis=1), axis=0)
-        target_slab = unique_slabs[rng.integers(len(unique_slabs))]
+        if "target_slab" in params:
+            target_slab = np.asarray(params["target_slab"], dtype=int)
+        else:
+            unique_slabs = np.unique(np.stack([ix, iy], axis=1), axis=0)
+            target_slab = unique_slabs[rng.integers(len(unique_slabs))]
 
         slab_mask = (ix == target_slab[0]) & (iy == target_slab[1])
         slab_idx = np.where(slab_mask)[0]
@@ -1762,8 +2249,13 @@ def add_concrete_damage(
         if len(slab_idx) > 3:
             slab_x = x[slab_idx]
             slab_y = y[slab_idx]
-            x_s_min, x_s_max = np.min(slab_x), np.max(slab_x)
-            y_s_min, y_s_max = np.min(slab_y), np.max(slab_y)
+            if "slab_bounds" in params:
+                x_s_min, x_s_max, y_s_min, y_s_max = (
+                    float(v) for v in params["slab_bounds"]
+                )
+            else:
+                x_s_min, x_s_max = np.min(slab_x), np.max(slab_x)
+                y_s_min, y_s_max = np.min(slab_y), np.max(slab_y)
 
             n_fragments = rng.integers(3, 8)
             seeds = np.column_stack([
@@ -1825,8 +2317,11 @@ def add_concrete_damage(
     elif damage_type == "corner_break":
         # 选择一个板块的一个角
         ix, iy = slab_indices(x, y)
-        unique_slabs = np.unique(np.stack([ix, iy], axis=1), axis=0)
-        target_slab = unique_slabs[rng.integers(len(unique_slabs))]
+        if "target_slab" in params:
+            target_slab = np.asarray(params["target_slab"], dtype=int)
+        else:
+            unique_slabs = np.unique(np.stack([ix, iy], axis=1), axis=0)
+            target_slab = unique_slabs[rng.integers(len(unique_slabs))]
 
         slab_mask = (ix == target_slab[0]) & (iy == target_slab[1])
         slab_idx = np.where(slab_mask)[0]
@@ -1838,16 +2333,29 @@ def add_concrete_damage(
             # "过角点的射线带 + 圆形沉降盘"，形态与真实病害不同。
             slab_x = x[slab_idx]
             slab_y = y[slab_idx]
-            x_s_min, x_s_max = np.min(slab_x), np.max(slab_x)
-            y_s_min, y_s_max = np.min(slab_y), np.max(slab_y)
+            if "slab_bounds" in params:
+                x_s_min, x_s_max, y_s_min, y_s_max = (
+                    float(v) for v in params["slab_bounds"]
+                )
+            else:
+                x_s_min, x_s_max = np.min(slab_x), np.max(slab_x)
+                y_s_min, y_s_max = np.min(slab_y), np.max(slab_y)
             slab_w_local = max(x_s_max - x_s_min, 1e-6)
             slab_l_local = max(y_s_max - y_s_min, 1e-6)
 
-            # 选一个角及指向板内的方向
-            corner_x = x_s_min if rng.random() < 0.5 else x_s_max
-            corner_y = y_s_min if rng.random() < 0.5 else y_s_max
-            sx = 1.0 if corner_x == x_s_min else -1.0
-            sy = 1.0 if corner_y == y_s_min else -1.0
+            # 选一个角及指向板内的方向（分段体制可经 params["corner_signs"]
+            # 固定，保证跨段选角一致）
+            if "corner_signs" in params:
+                sign_x, sign_y = (float(v) for v in params["corner_signs"])
+                corner_x = x_s_min if sign_x > 0 else x_s_max
+                corner_y = y_s_min if sign_y > 0 else y_s_max
+                sx = 1.0 if corner_x == x_s_min else -1.0
+                sy = 1.0 if corner_y == y_s_min else -1.0
+            else:
+                corner_x = x_s_min if rng.random() < 0.5 else x_s_max
+                corner_y = y_s_min if rng.random() < 0.5 else y_s_max
+                sx = 1.0 if corner_x == x_s_min else -1.0
+                sy = 1.0 if corner_y == y_s_min else -1.0
 
             # 弦线端点：沿两条相邻接缝各取一个交点（0.2-0.5 倍边长，
             # 测试可通过 params 固定）。
@@ -1872,7 +2380,13 @@ def add_concrete_damage(
                 dist_to_corner = np.sqrt(
                     (slab_x - corner_x) ** 2 + (slab_y - corner_y) ** 2
                 )
-                reach = float(dist_to_corner[triangle].max()) or 1.0
+                # 分段体制：params["corner_reach"] 由计划阶段在全局网格
+                # 窗口上预计算（板块跨缝时各段只看到部分三角），保证倾斜
+                # 场跨段一致。
+                if "corner_reach" in params:
+                    reach = float(params["corner_reach"])
+                else:
+                    reach = float(dist_to_corner[triangle].max()) or 1.0
                 tilt = 0.5 + 0.5 * (1.0 - dist_to_corner[triangle] / reach)
                 pts[slab_idx[triangle], 2] -= d_max_corner * tilt
                 lbl[slab_idx[triangle]] = label_val
@@ -1887,12 +2401,16 @@ def add_concrete_damage(
 
     # 4) 错台 (Faulting)
     elif damage_type == "faulting":
-        # 接缝两侧高度差
-        interior_trans = trans_joints[(trans_joints > y_min) & (trans_joints < y_max)]
-        if len(interior_trans):
-            joint_y = float(rng.choice(interior_trans))
+        # 接缝两侧高度差（分段体制：params["joint_y"] 由计划阶段在全局
+        # 接缝列表上抽定传入；domain_bounds 为全局时回退路径也逐段一致）
+        if "joint_y" in params:
+            joint_y = float(params["joint_y"])
         else:
-            joint_y = (y_min + y_max) * 0.5
+            interior_trans = trans_joints[(trans_joints > y_min) & (trans_joints < y_max)]
+            if len(interior_trans):
+                joint_y = float(rng.choice(interior_trans))
+            else:
+                joint_y = (y_min + y_max) * 0.5
 
         fault_offset = params.get("d_max", 0.005 if severity == "light" else 0.015)
 
@@ -1963,10 +2481,14 @@ def add_concrete_damage(
 
     # 8) 坑洞 (Pitting) — 类似坑槽但更深
     elif damage_type == "pitting":
-        center_x = rng.uniform(x_min + 0.05 * (x_max - x_min),
-                               x_max - 0.05 * (x_max - x_min))
-        center_y = rng.uniform(y_min + 0.05 * (y_max - y_min),
-                               y_max - 0.05 * (y_max - y_min))
+        # 分段体制：params["pit_center"] 由计划阶段按全局 bbox 抽定传入
+        if "pit_center" in params:
+            center_x, center_y = (float(v) for v in params["pit_center"])
+        else:
+            center_x = rng.uniform(x_min + 0.05 * (x_max - x_min),
+                                   x_max - 0.05 * (x_max - x_min))
+            center_y = rng.uniform(y_min + 0.05 * (y_max - y_min),
+                                   y_max - 0.05 * (y_max - y_min))
         pit_radius = rng.uniform(0.05, 0.15)
         pit_depth = params.get("d_max", rng.uniform(0.03, 0.08))
 
@@ -1983,8 +2505,11 @@ def add_concrete_damage(
     elif damage_type == "blowup":
         # 板体向上拱起 (余弦拱形)
         ix, iy = slab_indices(x, y)
-        unique_slabs = np.unique(np.stack([ix, iy], axis=1), axis=0)
-        target_slab = unique_slabs[rng.integers(len(unique_slabs))]
+        if "target_slab" in params:
+            target_slab = np.asarray(params["target_slab"], dtype=int)
+        else:
+            unique_slabs = np.unique(np.stack([ix, iy], axis=1), axis=0)
+            target_slab = unique_slabs[rng.integers(len(unique_slabs))]
 
         slab_mask = (ix == target_slab[0]) & (iy == target_slab[1])
         slab_idx = np.where(slab_mask)[0]
@@ -1992,8 +2517,15 @@ def add_concrete_damage(
         if len(slab_idx) > 0:
             slab_x = x[slab_idx]
             slab_y = y[slab_idx]
-            x_s_center = (np.min(slab_x) + np.max(slab_x)) / 2.0
-            y_s_center = (np.min(slab_y) + np.max(slab_y)) / 2.0
+            if "slab_bounds" in params:
+                x_s_min, x_s_max, y_s_min, y_s_max = (
+                    float(v) for v in params["slab_bounds"]
+                )
+            else:
+                x_s_min, x_s_max = np.min(slab_x), np.max(slab_x)
+                y_s_min, y_s_max = np.min(slab_y), np.max(slab_y)
+            x_s_center = (x_s_min + x_s_max) / 2.0
+            y_s_center = (y_s_min + y_s_max) / 2.0
 
             blowup_height = params.get("d_max", rng.uniform(0.02, 0.06))
 

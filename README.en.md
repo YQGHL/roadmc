@@ -203,6 +203,25 @@ python roadmc/scripts/generate_synthetic.py `
 
 At the default surface grid each worker peaks at several hundred MiB; the script prints the resolution summary and the aggregate parallel-memory estimate before starting, and refuses to run past the `--max-parallel-memory-mib` budget.
 
+### Observation-model regime and strip geometry
+
+`generate_synthetic.py` exposes three options that control the generation regime:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--width` | `7.0` | Road width in metres. Hard lower bound `1.0 m`: disease centers are sampled in `[0.5, width-0.5]`, so narrower requests fail at the entry check. A warning is emitted when `width ≤ 3.5` with the default `crowned` crown shape (the center crown is calibrated for the 7 m two-lane cross-section; narrow roads usually want a plane crossfall), and when `width < 2.4` (the wheel-track span `wheel_separation + rut_width`), where rut grooves would overflow the carriageway edge |
+| `--length` | `5.0` | Road length along the mileage axis, in metres |
+| `--observation-model` | `off` | Observation-model regime switch, `on` / `off` |
+
+Semantics of the observation-model regime:
+
+- `off` (CLI default): **all surface points are written out directly**. Scan-line resampling, curvature, geometric occlusion, LiDAR noise, nearest-neighbour label transfer, and output sampling are skipped; the road spectral synthesis, all diseases, the raveling and NaN filtering (a surface-geometry property, not an observation effect), intensity, normalization, and features are all kept. `--num-points` / `--target-density` are ignored, but the requested values are recorded in the scene's `resolution_metadata_json` together with the `ignored_under_observation_off` flag, the skipped-step list (`pipeline_steps_skipped`), the occlusion policy, and the regime itself; the scene `.npz` additionally gains the four top-level scalars `observation_model`, `segment_count`, `segment_length_m`, and `segment_overlap_m`. If the LiDAR scan switch is also enabled, the script warns and skips the scan (recorded as an override in the metadata) instead of hard-failing.
+- `on`: the full sensor observation pipeline, with geometry/label/feature output bitwise identical to before this option existed; only the metadata changes, gaining the v2 resolution-contract records (`roadmc-resolution-v2`) while every v1 field is preserved. Note that `GeneratorConfig.observation_model` defaults to `"on"` in the library — only the CLI defaults to `"off"` — because the training-side smoke configuration and the generator self-check depend on the library default.
+
+Strip geometry enters the per-scene point estimate as `(W × L)`: the CLI prints the resolution contract as `surface={spacing}mm ({W}m×{L}m, {N} points)` with the observation mode appended, plus a per-scene on-disk size estimate (confirm the disk budget before large `--train-count` runs).
+
+**Strip segmentation**: when the whole strip exceeds the per-worker budget (`--max-surface-points` or the point count implied by `--max-surface-memory-mib`), the pre-flight budget check switches to a segmented plan — segment length, blend overlap, and segment count are derived deterministically (all recorded in the `surface_grid.segmentation` metadata, overridable via the explicit `GeneratorConfig.strip` fields), and infeasible plans whose blend-band overhead would dominate (e.g. 1 mm spacing under the default budget) fail at the entry check with guidance to raise the budget. Large strips previously rejected outright by `max_surface_points` are now generated in segments automatically. The segmented runtime (observation_model='off') is wired in: the ISO macro band is synthesized once for the whole strip (seams exactly continuous), short-wave texture is synthesized per segment with root-raised-cosine blending, diseases go through the plan/apply cloud-independence machinery (bit-identical across seams), intensity uses a whole-strip p99 AGC two-pass sweep, features are recomputed chunk-wise over segment+halo KD-trees, and the coordinate contract (normalization, invertible transform, metric bounds) matches the single-block path. The seam acceptance criterion: seam-zone adjacent-bin profile steps never exceed the natural far-from-seam fluctuation, and the texture-band step stays under the 0.5 mm design tolerance; disease application is bit-identical across seams. The sensor pipeline (scan resampling, occlusion, noise, NN transfer, output sampling) is not segmented yet, so `--observation-model on` combined with a segmented plan hard-fails at the entry check (the library constructor refuses as well) — the main regime of the segmented mode is the default `off`. Comparison numbers between datasets from the new regime and the existing ones: to be filled in.
+
 ### Controlled class budgets
 
 Formal experiments should control both forced scenes and effective target-point counts per class, rather than only the total number of files:
@@ -224,6 +243,8 @@ The budget generator is resumable and reports completion only after scene quotas
 - Controlled scenes do not pin the target-class point ratio; the per-scene survival floor is derived as `ceil(min-points / target-scenes)`, can be overridden with `--target-label-min-output-points`, and every protection intervention is written to the scene audit record.
 - The script refuses to resume into directories containing scenes with no resolution record (old-quota era), so two sampling regimes cannot mix inside one dataset; `--ignore-legacy-scenes` excludes them explicitly. **Note that resumption checks quotas but not the generation configuration**: if a directory already holds scenes from a different configuration, the quotas are considered satisfied. When rebuilding under a new configuration, use a fresh output directory or rename the old one first.
 - Multi-worker runs validate the aggregate memory budget before generation starts.
+
+The script also accepts `--width` / `--length` / `--observation-model` (defaults 7.0 / 5.0 / `off`), with the same regime semantics as `generate_synthetic.py`: with `off` it writes all surface points directly (`--num-points` is ignored and recorded in metadata), and strips beyond the per-worker budget are generated under a segmented plan; `on` restores the full observation pipeline and hard-fails at the entry check when combined with a segmented plan. The top-level `.npz` scalar keys stay in sync with `generate_synthetic.py`.
 
 ### Settings that move the synthesis closer to real pavements
 
@@ -412,7 +433,8 @@ Each scene is stored as a compressed `.npz` file:
 | `target_label` | scalar | Class forced into a controlled scene, `-1` otherwise |
 | `feature_schema` | scalar | Must be `roadmc.observable_features.v1` |
 | `coordinate_center` / `coordinate_scale` | `(3,)` / scalar | Invertible coordinate normalization |
-| `resolution_metadata_json` | scalar | JSON with the three resolutions, the protection-sampling audit, and the intensity model string (`sensor_output.intensity_model`) |
+| `resolution_metadata_json` | scalar | JSON with the three resolutions, the protection-sampling audit, and the intensity model string (`sensor_output.intensity_model`); v2 additionally records the observation-model regime (`sensor_output.observation_model`, skipped steps, occlusion policy) and the strip-segmentation plan (`surface_grid.segmentation`) |
+| `observation_model` / `segment_count` / `segment_length_m` / `segment_overlap_m` | scalar | Observation-model regime and strip-segmentation plan (single-block path: 1 segment, full length, zero overlap) |
 | `surface_grid_spacing_m` etc. | scalar | Surface grid spacing/shape/count, sensor output count, model target points |
 
 ## 38-Class Label Space

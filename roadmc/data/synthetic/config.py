@@ -18,11 +18,31 @@ from typing import Any, Literal
 NUM_CLASSES: int = 38
 """JTG 5210-2018 病害分类总数（含背景标签 0）。"""
 
-RESOLUTION_CONTRACT_VERSION: str = "roadmc-resolution-v1"
-"""Version of the surface -> sensor -> model resolution metadata contract."""
+RESOLUTION_CONTRACT_VERSION: str = "roadmc-resolution-v2"
+"""Version of the surface -> sensor -> model resolution metadata contract.
+
+v2 preserves every v1 field and adds the observation-model regime records
+(``sensor_output.observation_model`` plus the skipped-step / occlusion-policy
+audit when the sensor pipeline is off) and the strip-segmentation plan
+(``surface_grid.segmentation`` with per-worker memory estimates).
+"""
 
 SURFACE_PEAK_BYTES_PER_POINT: int = 320
 """Conservative peak-RAM estimate for the current float64 synthesis pipeline."""
+
+ASSEMBLY_BYTES_PER_POINT: int = 48
+"""Preallocated float32 output assembly: points12 + normals12 + feats12 +
+labels4 + power4 + intensity4 bytes per point (segmented strips write per
+segment slices into this buffer; float64 vstack is forbidden)."""
+
+FEATURE_SWEEP_BYTES_PER_POINT: int = 64
+"""Per-segment (owned rows + halo) cKDTree and blockwise-query temporary
+budget for the chunked final-feature recomputation."""
+
+POTHOLE_INFLUENCE_RADIUS_M: float = 0.45
+"""Cross-segment attribution bound: a pothole's full influence (severe
+radius 0.30 m × 1.3 spall reach + 0.06 m micro-pit radius) stays inside this
+envelope, which the default blend overlap (0.7067 m) must always cover."""
 
 DEFAULT_MAX_SURFACE_POINTS: int = 10_000_000
 DEFAULT_MAX_SURFACE_MEMORY_MIB: float = 4096.0
@@ -564,14 +584,100 @@ class DiseaseConfig:
                 raise ValueError(f"disease_probs['{k}'] = {v} not in [0,1]")
 
 
+@dataclass
+class StripSegmentationConfig:
+    """分段条带（strip segmentation）参数。
+
+    当 :meth:`GeneratorConfig.estimate_surface_generation` 判定整条带
+    超出 per-worker 预算（``max_surface_points`` 或
+    ``max_surface_memory_mib`` 换算的点数）时进入分段体制：宏观长波
+    场整条带全局一次合成于粗网格、短波纹理逐段 FFT、段间
+    root-raised-cosine 混合、het 调制场全局 1-D 共享。``None`` 字段
+    使用确定性自动推导，推导结果（段数 / 段长 / 重叠）全部写入场景
+    元数据 ``surface_grid.segmentation``。
+
+    Attributes:
+        segment_length_m: 单段拥有行长度 (米)。None = 自动推导（默认），
+            自动值 = ``(rows_cap - 2 * m_rows) * grid_res``。仅在分段被
+            触发（条带超 per-worker 预算）时生效；条带在预算内时保持
+            单块路径。
+        overlap_m: 段间重叠宽度 (米)。None = 自动推导
+            ``max(2 / ISO8608_BAND_MAX_CYCLES_PER_M, 16 * grid_res, 0.2)``
+            （默认 ≥ 2 倍纹理带最长波长 0.354 m，并覆盖坑槽 0.45 m 的
+            影响半径归属规则）；显式值不得低于 0.45 m。
+        macro_grid_factor: 宏观粗网格相对 ISO 带上限频率的过采样倍数
+            （粗网格间距 = 1 / (macro_grid_factor * f_iso_max)）。
+        feature_halo_m: 最终特征分块重算的邻域 halo 宽度 (米)。
+            None = 自动 ``max(0.05, 16 * grid_res)``。
+    """
+
+    segment_length_m: float | None = None
+    overlap_m: float | None = None
+    macro_grid_factor: float = 4.0
+    feature_halo_m: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("segment_length_m", "overlap_m", "feature_halo_m"):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(value) or value <= 0.0):
+                raise ValueError(
+                    f"{name} must be finite and > 0 when provided, got {value}"
+                )
+        if (
+            not math.isfinite(self.macro_grid_factor)
+            or self.macro_grid_factor < 1.0
+        ):
+            raise ValueError(
+                "macro_grid_factor must be finite and >= 1, "
+                f"got {self.macro_grid_factor}"
+            )
+
+
 @dataclass(frozen=True)
 class SurfaceGenerationEstimate:
-    """Preflight estimate for the full-resolution synthesis surface."""
+    """Preflight estimate for the full-resolution synthesis surface.
+
+    v2 additions model the segmented-strip regime.  When ``segmented`` is
+    False the new fields degrade to whole-strip semantics (a single segment
+    spanning the full length with zero overlap), so every consumer can read
+    them unconditionally.
+    """
 
     grid_shape: tuple[int, int]
     point_count: int
     estimated_peak_memory_mib: float
+    """Per-worker peak-RAM estimate: whole-strip synthesis peak on the
+    single-block path, ``worker_peak_mib`` on segmented plans (the naive
+    whole-strip figure is no longer any worker's true peak there)."""
     bytes_per_point_assumption: int = SURFACE_PEAK_BYTES_PER_POINT
+    # ---- v2: 分段体制估算字段（单块时退化为整条带语义） ----
+    segmented: bool = False
+    """Whether the strip exceeded the per-worker budget and is planned as
+    multiple blended segments."""
+    segment_count: int = 1
+    """Number of owned segments (1 for the single-block path)."""
+    segment_length_m: float = 0.0
+    """Owned length of one segment in metres (full strip length when not
+    segmented)."""
+    overlap_m: float = 0.0
+    """Segment blend overlap width in metres (0 for the single-block path)."""
+    segment_point_count_ext: int = 0
+    """Allocated points of one extended segment: owned rows + both overlap
+    halos (plus in-segment curb columns), i.e. the per-segment allocation the
+    budget must cover."""
+    segment_peak_mib: float = 0.0
+    """Synthesis peak estimate for one extended segment at
+    ``SURFACE_PEAK_BYTES_PER_POINT``."""
+    assembly_mib: float = 0.0
+    """Preallocated float32 output assembly for the whole strip at
+    ``ASSEMBLY_BYTES_PER_POINT`` (written per-segment, never vstacked)."""
+    feature_sweep_mib: float = 0.0
+    """Chunked final-feature recomputation budget for one extended segment at
+    ``FEATURE_SWEEP_BYTES_PER_POINT``."""
+    worker_peak_mib: float = 0.0
+    """Per-worker peak = max(segment_peak_mib, assembly_mib +
+    feature_sweep_mib); equals ``estimated_peak_memory_mib`` on the
+    single-block path."""
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -617,6 +723,9 @@ class GeneratorConfig:
         max_surface_points: 传感器采样前允许分配的最大表面网格点数。
         max_surface_memory_mib: 单个生成 worker 的估算峰值内存上限。
         normalize: 是否坐标归一化到单位球，默认 True。
+        observation_model: 观测模型体制开关（见字段文档串；配置默认
+            "on"，CLI generate_synthetic.py 默认 "off"）。
+        strip: 分段条带合成参数（超 per-worker 预算时触发，默认自动）。
     """
 
     road: RoadSurfaceConfig = field(default_factory=RoadSurfaceConfig)
@@ -650,7 +759,35 @@ class GeneratorConfig:
     contains ~1.4M points at 5 mm grid spacing — useful for density-upper-bound
     references in ablation studies.  ``num_points`` is ignored when this is set."""
 
+    observation_model: Literal["on", "off"] = "on"
+    """观测模型体制开关（交互规则见下）。
+
+    - ``"on"``（**配置默认**）：完整传感器观测管线（扫描重采样 → 曲率 →
+      遮挡 → 噪声 → 最近邻传递 → 输出采样），行为与历史版本逐位一致。
+    - ``"off"``：观测体制关闭——直接输出全部表面点（retain-all 语义，
+      ``noisy_points := points``），跳过扫描线重采样、曲率、几何遮挡、
+      LiDAR 噪声、最近邻标签传递与输出采样；``num_points`` /
+      ``target_density`` 被忽略但仍以 ``ignored_under_observation_off``
+      记录在元数据；路面谱合成、全部病害、松散及 NaN 过滤（表面几何
+      属性，非观测效应）、强度计算、归一化、特征全部保留。off 且
+      ``lidar_scan.enable=True`` 时发 ``warnings.warn`` 并跳过扫描
+      （元数据记录 override），不报硬错。
+
+    **配置默认值取 "on"，CLI（generate_synthetic.py）默认才是 "off"**：
+    ``GeneratorConfig()`` 的库内默认行为被 dataloader 冒烟配置与生成器
+    自检（``points.shape[0] == num_points`` 断言）依赖，配置默认翻成
+    off 会让这两条路径无声改变。"""
+
+    strip: StripSegmentationConfig = field(default_factory=StripSegmentationConfig)
+    """分段条带合成参数：条带总点数超过 per-worker 预算时按此配置分段，
+    字段为 None 时使用确定性自动推导（推导结果写入场景元数据）。"""
+
     def __post_init__(self) -> None:
+        if self.observation_model not in ("on", "off"):
+            raise ValueError(
+                "observation_model must be 'on' or 'off', "
+                f"got {self.observation_model!r}"
+            )
         if not self.retain_all_surface_points and self.num_points < 1:
             raise ValueError(f"num_points must be >= 1, got {self.num_points}")
         if self.target_density is not None and self.target_density < 0:
@@ -750,20 +887,220 @@ class GeneratorConfig:
         strips (0 points when disabled), so per-worker and parallel memory
         budgets keep covering the true peak once the curb points are merged
         into the surface cloud.
+
+        When the strip exceeds the per-worker budget (``max_surface_points``
+        or the row count implied by ``max_surface_memory_mib``), the estimate
+        switches to the segmented-strip plan: deterministic auto derivation
+        of overlap width, owned rows per segment and segment count, with the
+        per-worker peak taken as ``max(segment peak, assembly + feature
+        sweep)``.  Otherwise the single-block plan is returned unchanged and
+        the new fields degrade to whole-strip semantics.
         """
 
         point_count = self.road.surface_grid_point_count + self.curb_grid_point_count
         memory_mib = point_count * SURFACE_PEAK_BYTES_PER_POINT / (1024.0 ** 2)
+        grid_shape = self.road.surface_grid_shape
+        assembly_mib = point_count * ASSEMBLY_BYTES_PER_POINT / (1024.0 ** 2)
+        feature_sweep_mib = (
+            point_count * FEATURE_SWEEP_BYTES_PER_POINT / (1024.0 ** 2)
+        )
+
+        if not self._strip_needs_segmentation():
+            return SurfaceGenerationEstimate(
+                grid_shape=grid_shape,
+                point_count=point_count,
+                estimated_peak_memory_mib=memory_mib,
+                segmented=False,
+                segment_count=1,
+                segment_length_m=float(self.road.length),
+                overlap_m=0.0,
+                segment_point_count_ext=point_count,
+                segment_peak_mib=memory_mib,
+                assembly_mib=assembly_mib,
+                feature_sweep_mib=feature_sweep_mib,
+                worker_peak_mib=memory_mib,
+            )
+        return self._plan_strip_segmentation()
+
+    def _strip_rows_budget(self) -> int:
+        """Per-worker point budget expressed as a number of y-axis rows.
+
+        The budget (whichever of ``max_surface_points`` and the
+        ``max_surface_memory_mib`` row budget is tighter) is divided by the
+        per-row point footprint: road columns ``nx`` plus, when the curb
+        strips are enabled, both curb column groups.  The design formula
+        divides by ``nx`` only; with curb enabled that combination can never
+        satisfy the design's own ``segment_point_count_ext <=
+        max_surface_points`` check (ext grows by the curb column fraction
+        while the budget does not), so the division uses the full per-row
+        footprint — conservative and feasible for every configuration.
+        """
+
+        nx = self.road.surface_grid_shape[0]
+        if self.curb.width_m > 0:
+            nx_c = max(1, int(math.ceil(self.curb.width_m / self.road.grid_res)))
+            nx += 2 * nx_c
+        budget_points = min(
+            self.max_surface_points,
+            math.floor(
+                self.max_surface_memory_mib * (1024.0 ** 2)
+                / SURFACE_PEAK_BYTES_PER_POINT
+            ),
+        )
+        return budget_points // nx
+
+    def _strip_needs_segmentation(self) -> bool:
+        """True when the strip exceeds the per-worker row budget.
+
+        The only trigger is the budget (per the design); an explicit
+        ``strip.segment_length_m`` selects the segment length once
+        segmentation is triggered and never forces segmentation by itself.
+        """
+
+        _, ny = self.road.surface_grid_shape
+        return ny > self._strip_rows_budget()
+
+    def strip_overlap_m(self) -> float:
+        """Blend overlap width: explicit override or the deterministic auto
+        value ``max(2 / ISO8608_BAND_MAX_CYCLES_PER_M, 16 * grid_res, 0.2)``.
+
+        The overlap must never fall below the 0.45 m pothole influence radius
+        (the design's cross-segment attribution rule); explicit overrides
+        below that bound are rejected.
+        """
+
+        if self.strip.overlap_m is not None:
+            overlap_m = float(self.strip.overlap_m)
+            if overlap_m < POTHOLE_INFLUENCE_RADIUS_M:
+                raise ValueError(
+                    f"strip.overlap_m must be >= {POTHOLE_INFLUENCE_RADIUS_M} m "
+                    f"(pothole influence radius), got {overlap_m}"
+                )
+            return overlap_m
+        return max(
+            2.0 / ISO8608_BAND_MAX_CYCLES_PER_M,
+            16.0 * self.road.grid_res,
+            0.2,
+        )
+
+    def strip_halo_rows(self) -> int:
+        """Overlap half-width in grid rows (m_rows = ceil(overlap/grid_res))."""
+
+        return max(1, int(math.ceil(self.strip_overlap_m() / self.road.grid_res)))
+
+    def strip_macro_grid_spacing_m(self) -> float:
+        """Coarse-grid spacing of the global macro (ISO 8608 band) field:
+        ``1 / (macro_grid_factor * f_iso_max)`` with
+        ``f_iso_max = min(2.83, Nyquist)``."""
+
+        f_iso_max = min(ISO8608_BAND_MAX_CYCLES_PER_M, 0.5 / self.road.grid_res)
+        return 1.0 / (self.strip.macro_grid_factor * f_iso_max)
+
+    def strip_owned_rows_per_segment(self) -> int:
+        """Owned grid rows of one segment (auto or explicit), validated for
+        feasibility.  The last segment of a strip may be shorter."""
+
+        grid_res = self.road.grid_res
+        m_rows = self.strip_halo_rows()
+        if self.strip.segment_length_m is not None:
+            rows_seg = int(math.ceil(self.strip.segment_length_m / grid_res))
+        else:
+            rows_seg = self._strip_rows_budget() - 2 * m_rows
+        feasibility_floor = max(4 * m_rows, 200)
+        if rows_seg < feasibility_floor:
+            raise ValueError(
+                f"Strip segmentation is infeasible: owned segment rows {rows_seg} "
+                f"< max(4 * overlap_rows={4 * m_rows}, 200)={feasibility_floor} at "
+                f"{grid_res * 1000.0:.3f} mm spacing with "
+                f"{self.strip_overlap_m():.3f} m overlap ({m_rows} halo rows per "
+                "side). Raise --max-surface-points / --max-surface-memory-mib, use "
+                "a coarser spacing, or shorten the strip; do not force tiny "
+                "blend-dominated segments."
+            )
+        return rows_seg
+
+    def _plan_strip_segmentation(self) -> SurfaceGenerationEstimate:
+        """Deterministic segmented-strip plan (all values recorded in scene
+        metadata).
+
+        Auto derivation: ``m_rows = ceil(overlap / grid_res)`` halo rows per
+        side; ``rows_seg = rows_budget - 2 * m_rows`` owned rows; feasibility
+        requires ``rows_seg >= max(4 * m_rows, 200)`` — otherwise the blend
+        band overhead would dominate the segment and the texture spectrum
+        would be blend-dominated, so this raises instead of silently cutting
+        sliver segments.
+        """
+
+        grid_res = self.road.grid_res
+        nx, ny = self.road.surface_grid_shape
+        point_count = self.road.surface_grid_point_count + self.curb_grid_point_count
+        overlap_m = self.strip_overlap_m()
+        rows_seg = self.strip_owned_rows_per_segment()
+        m_rows = self.strip_halo_rows()
+        segment_length_m = rows_seg * grid_res
+
+        segment_count = max(1, int(math.ceil(ny / rows_seg)))
+        ext_rows = rows_seg + 2 * m_rows
+        ext_cols = nx
+        if self.curb.width_m > 0:
+            nx_c = max(1, int(math.ceil(self.curb.width_m / grid_res)))
+            ext_cols += 2 * nx_c
+        segment_point_count_ext = ext_rows * ext_cols
+        segment_peak_mib = (
+            segment_point_count_ext * SURFACE_PEAK_BYTES_PER_POINT / (1024.0 ** 2)
+        )
+        assembly_mib = point_count * ASSEMBLY_BYTES_PER_POINT / (1024.0 ** 2)
+        feature_sweep_mib = (
+            segment_point_count_ext * FEATURE_SWEEP_BYTES_PER_POINT / (1024.0 ** 2)
+        )
+        worker_peak_mib = max(segment_peak_mib, assembly_mib + feature_sweep_mib)
+        # estimated_peak_memory_mib 承载 v1 的 per-worker 峰值语义：分段
+        # 计划下等于 worker_peak_mib（整条带 naive 值 point_count×320 已
+        # 不再是任何 worker 的真实峰值，报告它会让审计误判预算被突破）。
         return SurfaceGenerationEstimate(
-            grid_shape=self.road.surface_grid_shape,
+            grid_shape=(nx, ny),
             point_count=point_count,
-            estimated_peak_memory_mib=memory_mib,
+            estimated_peak_memory_mib=worker_peak_mib,
+            segmented=True,
+            segment_count=segment_count,
+            segment_length_m=segment_length_m,
+            overlap_m=overlap_m,
+            segment_point_count_ext=segment_point_count_ext,
+            segment_peak_mib=segment_peak_mib,
+            assembly_mib=assembly_mib,
+            feature_sweep_mib=feature_sweep_mib,
+            worker_peak_mib=worker_peak_mib,
         )
 
     def validate_surface_budget(self) -> SurfaceGenerationEstimate:
-        """Reject a surface that exceeds configured per-worker safety limits."""
+        """Reject a surface that exceeds configured per-worker safety limits.
+
+        Segmented plans are validated on the per-segment extended allocation
+        (``segment_point_count_ext``) and the per-worker peak
+        (``worker_peak_mib``); single-block plans keep the original
+        whole-strip checks verbatim.
+        """
 
         estimate = self.estimate_surface_generation()
+        if estimate.segmented:
+            if estimate.segment_point_count_ext > self.max_surface_points:
+                raise ValueError(
+                    "Segmented strip plan would allocate "
+                    f"{estimate.segment_point_count_ext:,} points per extended "
+                    f"segment at {self.road.surface_grid_spacing_m * 1000.0:.3f} mm, "
+                    f"exceeding max_surface_points={self.max_surface_points:,}. "
+                    "Increase the spacing, crop the road, or explicitly raise the "
+                    "limit after checking RAM."
+                )
+            if estimate.worker_peak_mib > self.max_surface_memory_mib:
+                raise ValueError(
+                    "Segmented strip synthesis is estimated to peak at "
+                    f"{estimate.worker_peak_mib:.1f} MiB per worker, exceeding "
+                    f"max_surface_memory_mib={self.max_surface_memory_mib:.1f}. "
+                    "Reduce the surface size/resolution or explicitly raise the "
+                    "memory budget."
+                )
+            return estimate
         if estimate.point_count > self.max_surface_points:
             raise ValueError(
                 "Surface grid would allocate "
@@ -787,7 +1124,12 @@ class GeneratorConfig:
         workers: int,
         max_parallel_memory_mib: float,
     ) -> float:
-        """Validate aggregate high-resolution memory for parallel generation."""
+        """Validate aggregate high-resolution memory for parallel generation.
+
+        The per-worker figure multiplied by ``workers`` is
+        ``worker_peak_mib`` (identical to the whole-strip estimate on the
+        single-block path, the segmented per-segment peak otherwise).
+        """
 
         if workers < 1:
             raise ValueError(f"workers must be >= 1, got {workers}")
@@ -796,7 +1138,7 @@ class GeneratorConfig:
                 "max_parallel_memory_mib must be finite and > 0, "
                 f"got {max_parallel_memory_mib}"
             )
-        total_mib = self.validate_surface_budget().estimated_peak_memory_mib * workers
+        total_mib = self.validate_surface_budget().worker_peak_mib * workers
         if total_mib > max_parallel_memory_mib:
             raise ValueError(
                 f"{workers} workers may require about {total_mib:.1f} MiB for surface "
@@ -828,7 +1170,7 @@ class GeneratorConfig:
             if output_points is None or output_points == 0
             else math.sqrt(self.road.surface_area_m2 / output_points)
         )
-        return {
+        metadata = {
             "contract_version": RESOLUTION_CONTRACT_VERSION,
             "surface_grid": {
                 "spacing_m": self.road.surface_grid_spacing_m,
@@ -878,8 +1220,29 @@ class GeneratorConfig:
                 "crossfall_shape": str(self.road.crossfall_shape),
                 "longitudinal_grade": float(self.road.longitudinal_grade),
             },
-            "sensor_output": {
-                "mode": self.sensor_output_mode,
+        }
+        # v2 条带分段计划与 per-worker 内存估算：统一在 config 层写入，
+        # 使数据集级 metadata.json 与逐场景 resolution_metadata_json 携带
+        # 结构一致（同键同值）的 surface_grid 载荷。
+        metadata["surface_grid"]["segmentation"] = {
+            "enabled": bool(estimate.segmented),
+            "segment_count": int(estimate.segment_count),
+            "segment_length_m": float(estimate.segment_length_m),
+            "overlap_m": float(estimate.overlap_m),
+            "macro_grid_spacing_m": float(self.strip_macro_grid_spacing_m()),
+            "macro_band_cycles_per_m": [
+                1.0 / float(max(self.road.length, 1e-9)),
+                min(ISO8608_BAND_MAX_CYCLES_PER_M, 0.5 / self.road.grid_res),
+            ],
+            "texture_blend": "root_raised_cosine",
+            "het_modulation": "global_1d_shared",
+            "design_geometry": "fine_grid_post_blend",
+        }
+        metadata["surface_grid"]["worker_peak_mib"] = float(estimate.worker_peak_mib)
+        metadata["surface_grid"]["assembly_mib"] = float(estimate.assembly_mib)
+        metadata["sensor_output"] = {
+            "observation_model": str(self.observation_model),
+            "mode": self.sensor_output_mode,
                 "requested_points": requested_points,
                 "requested_density_points_per_m2": self.sensor_output_density_points_per_m2,
                 "actual_points": output_points,
@@ -901,16 +1264,16 @@ class GeneratorConfig:
                         "fixed_fraction": None,
                     }
                 ),
-            },
-            "model_input": {
-                "target_points": (
-                    None
-                    if self.model_target_points is None
-                    else int(self.model_target_points)
-                ),
-                "sampling_applied_by_generator": False,
-            },
         }
+        metadata["model_input"] = {
+            "target_points": (
+                None
+                if self.model_target_points is None
+                else int(self.model_target_points)
+            ),
+            "sampling_applied_by_generator": False,
+        }
+        return metadata
 
 
 # 工具函数

@@ -203,6 +203,25 @@ python roadmc/scripts/generate_synthetic.py `
 
 默认表面网格下每 worker 峰值内存约数百 MiB；脚本启动前打印三层分辨率与并行内存估算，超出 `--max-parallel-memory-mib` 预算会在生成前报错。
 
+### 观测模型体制与条带几何
+
+`generate_synthetic.py` 提供三个控制生成体制的选项：
+
+| 选项 | 默认 | 作用 |
+| --- | --- | --- |
+| `--width` | `7.0` | 路面横向宽度（米）。硬下限 `1.0 m`：病害中心在 `[0.5, width-0.5]` 上抽样，更窄会在入口直接报错。`width ≤ 3.5` 且路拱形状为默认的 `crowned` 时给警告（中央路拱是 7 m 双车道口径，窄路通常应取单向坡）；`width < 2.4`（轮迹带横向占位 `wheel_separation + rut_width`）时警告车辙沟槽会溢出路缘 |
+| `--length` | `5.0` | 路面里程向长度（米） |
+| `--observation-model` | `off` | 观测模型体制开关，取值 `on` / `off` |
+
+观测模型体制的语义：
+
+- `off`（CLI 默认）：**直接输出全部表面点**。跳过扫描线重采样、曲率、几何遮挡、LiDAR 噪声、最近邻标签传递与输出采样；路面谱合成、全部病害、松散及 NaN 过滤（表面几何属性，不是观测效应）、强度、归一化、特征全部保留。`--num-points` / `--target-density` 被忽略，但请求值连同 `ignored_under_observation_off` 标记、跳过的步骤列表（`pipeline_steps_skipped`）、遮挡策略（`occlusion_policy`）与观测模式一起写入场景的 `resolution_metadata_json`；`.npz` 顶层同时新增 `observation_model`、`segment_count`、`segment_length_m`、`segment_overlap_m` 四个标量。若同时开启 LiDAR 扫描开关，脚本发警告并跳过扫描（元数据记录 override），不报硬错。
+- `on`：完整传感器观测管线，几何/标签/特征输出与本选项引入之前逐位一致；仅元数据按 v2 分辨率契约（`roadmc-resolution-v2`）新增记录字段，v1 字段全部保留。注意 `GeneratorConfig.observation_model` 的**库内默认是 `"on"`，只有 CLI 默认 `"off"`**——训练侧冒烟配置与生成器自检依赖库内默认行为，不得无声改变。
+
+条带几何以 `(W × L)` 计入每场景点数：CLI 启动时按 `表面={spacing}mm ({W}m×{L}m, {N} 点)` 打印分辨率契约并追加观测模式，同时给出每场景落盘数组体量估算（大规模 `--train-count` 前先确认磁盘预算）。
+
+**条带分段**：当整条带总点数超过 per-worker 预算（`--max-surface-points` 或 `--max-surface-memory-mib` 换算的点数）时，生成前的预算校验改按分段计划执行——自动推导段长、段间重叠与段数（确定性推导，全部写入 `surface_grid.segmentation` 元数据，可用 `GeneratorConfig.strip` 的显式字段覆盖），重叠带开销占比过高的不可行计划（如 1 mm 网格在默认预算下）会在入口报错并提示提高预算。行预算是把点预算按每行点占位整除：路缘石开启时按 `nx + 2·nx_curb`（而非设计稿仅 `nx`）整除——设计稿的 `nx` 公式在 curb 下会使 `segment_point_count_ext ≤ max_surface_points` 恒不可满足；该改动方向保守（更早分段、段更小）。此前会被 `max_surface_points` 直接拒绝的大条带现在自动分段生成。分段运行时（observation_model='off'）已接入：宏观长波整条带全局一次合成（接缝精确连续）、短波纹理逐段 FFT + 段间 root-raised-cosine 混合、病害计划/施加云无关化（缝两侧逐位一致）、强度整条带 p99 AGC 两遍扫、特征按段+halo 分块重算；坐标契约（归一化、可逆变换、米制边界）与单块路径同语义。上述接缝验收准则为：缝区相邻 bin 剖面阶跃不高于远离缝处的自然波动，且纹理带阶跃低于 0.5 mm 设计容差；跨段病害施加逐位一致。观测管线（扫描重采样、遮挡、噪声、最近邻传递、输出采样）尚未分段化，因此 `--observation-model on` 与分段计划组合会在入口硬报错（库内构造同样拒绝）——分段体制的主 regime 是默认的 `off`。新体制数据集与既有各版本数据集的对比数字：待补正。
+
 ### 受控类别预算
 
 正式实验应同时约束每类的强制场景数和有效病害点数，而不能只看场景总数：
@@ -224,6 +243,8 @@ python roadmc/scripts/generate_class_budget.py `
 - 受控场景不固定目标类别点数比例；每场景最低存活点数由 `ceil(min-points / target-scenes)` 推导，可用 `--target-label-min-output-points` 覆盖，每次保护干预写入场景审计字段。
 - 拒绝向缺少分辨率记录（旧配额时代）场景的目录续跑，防止两种采样体制混入同一数据集；`--ignore-legacy-scenes` 可显式排除旧场景。**注意续跑只核对配额、不核对生成配置**：同一目录下若已存在另一套配置产出的场景，配额会被判为满足。跨配置重建时应换输出目录，或先确认旧目录已改名。
 - 多 worker 生成前执行聚合内存预算校验。
+
+脚本同样接 `--width` / `--length` / `--observation-model`（默认 7.0 / 5.0 / `off`），体制语义与 `generate_synthetic.py` 完全一致：`off` 时直接输出全部表面点（`--num-points` 被忽略并记入元数据），条带超出 per-worker 预算时自动按分段计划生成；`on` 时恢复完整观测管线，与分段计划组合会在入口硬报错。`.npz` 顶层标量键与 `generate_synthetic.py` 保持一致。
 
 ### 贴近真实路面的配置项
 
@@ -412,8 +433,9 @@ python roadmc/scripts/diagnose_domain_gap.py `
 | `target_label` | scalar | 受控场景强制注入的类别，非受控为 `-1` |
 | `feature_schema` | scalar | 必须为 `roadmc.observable_features.v1` |
 | `coordinate_center` / `coordinate_scale` | `(3,)` / scalar | 可逆坐标归一化参数 |
-| `resolution_metadata_json` | scalar | JSON，含三层分辨率、保护采样审计和强度模型描述串（`sensor_output.intensity_model`） |
+| `resolution_metadata_json` | scalar | JSON，含三层分辨率、保护采样审计和强度模型描述串（`sensor_output.intensity_model`）；v2 另含观测模型体制（`sensor_output.observation_model`、跳过步骤、遮挡策略）与条带分段计划（`surface_grid.segmentation`） |
 | `surface_grid_spacing_m` 等 | scalar | 表面网格间距/形状/点数、传感器输出点数、模型目标点数 |
+| `observation_model` / `segment_count` / `segment_length_m` / `segment_overlap_m` | scalar | 观测模型体制与条带分段计划（单块路径为 1 段全长、零重叠） |
 
 ## 38 类标签
 

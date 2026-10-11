@@ -285,6 +285,10 @@ def _save_forced_scene(task: tuple[int, int]) -> dict[str, int | bool | str]:
             surface_grid_shape=scene["surface_grid_shape"],
             surface_grid_point_count=scene["surface_grid_point_count"],
             sensor_output_point_count=scene["sensor_output_point_count"],
+            observation_model=scene["observation_model"],
+            segment_count=scene["segment_count"],
+            segment_length_m=scene["segment_length_m"],
+            segment_overlap_m=scene["segment_overlap_m"],
             model_target_points=scene["model_target_points"],
         )
         return {
@@ -448,6 +452,20 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=0, help="0 chooses min(8, cpu_count - 2); use 16 explicitly when appropriate")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--grid-res", type=float, default=0.005)
+    parser.add_argument("--width", type=float, default=7.0, help="路面宽度 (米)，默认 7.0（双车道口径）")
+    parser.add_argument("--length", type=float, default=5.0, help="路面长度（里程向）(米)，默认 5.0")
+    parser.add_argument(
+        "--observation-model",
+        choices=["on", "off"],
+        default="off",
+        help=(
+            "观测模型体制：off（默认，新体制）直出全部表面点并跳过扫描/噪声/"
+            "丢点/输出采样（num_points 被忽略并记录在元数据 "
+            "ignored_under_observation_off，类预算按全表面点计量）；on 保留"
+            "完整传感器管线与 num_points 固定采样，与历史版本逐位一致"
+            "（legacy 回归口径）。与 generate_synthetic.py 默认一致。"
+        ),
+    )
     parser.add_argument("--num-points", type=int, default=8192)
     parser.add_argument("--pavement", choices=("asphalt", "concrete", "mixed"), default="mixed")
     parser.add_argument("--roughness", choices=("A", "B", "C", "D", "E"), default="B")
@@ -554,6 +572,8 @@ def main() -> None:
 
     config = GeneratorConfig(
         road=RoadSurfaceConfig(
+            width=args.width,
+            length=args.length,
             grid_res=args.grid_res,
             pavement_type=args.pavement,
             roughness_class=args.roughness,
@@ -572,8 +592,38 @@ def main() -> None:
         disease=DiseaseConfig(max_diseases_per_scene=args.max_diseases),
         seed=args.seed,
         num_points=args.num_points,
+        # 与 generate_synthetic.py 同一冻结体制：CLI 默认 off（直出全表面），
+        # on 为 legacy 回归口径（显式传值时与历史版本逐位一致）。
+        observation_model=args.observation_model,
     )
+    estimate = config.estimate_surface_generation()
+    if args.workers <= 0:
+        # 自动 worker 数必须尊重并行内存预算：毫米条带单 worker 峰值
+        # （分段合成）可达数 GiB，min(8, cpu-2) 的核心数口径会直接把
+        # 8 个 worker 压爆 max_parallel_memory_mib。按估算峰值收拢。
+        peak = max(estimate.worker_peak_mib, 1.0)
+        budget_cap = max(1, int(args.max_parallel_memory_mib // peak))
+        workers = min(_auto_workers(), budget_cap)
+        if workers < _auto_workers():
+            print(
+                f"[note] auto workers capped to {workers} by parallel memory "
+                f"budget ({args.max_parallel_memory_mib:.0f} MiB / "
+                f"~{peak:.0f} MiB per worker)"
+            )
     config.validate_parallel_budget(workers, args.max_parallel_memory_mib)
+    # 分段条带计划在 on 体制下不可执行（观测管线未分段），必须前置硬
+    # 报错而不是逐场景静默失败；off 体制支持分段，放行。条件与
+    # generate_synthetic.py 的 _validate_request 保持一致。
+    if estimate.segmented and config.observation_model == "on":
+        raise SystemExit(
+            f"Strip of {estimate.point_count:,} points requires the segmented "
+            f"regime ({estimate.segment_count} segments × "
+            f"{estimate.segment_length_m:.3f} m), which does not support the "
+            "observation pipeline (observation_model='on') in this build. "
+            "Re-run with --observation-model off, or raise the surface budget "
+            "(GeneratorConfig.max_surface_points / max_surface_memory_mib) to "
+            "hold the whole strip in one block, or use a coarser --grid-res."
+        )
     if not 0.0 < args.test_ratio < 1.0:
         raise ValueError("--test-ratio must be in (0, 1)")
     output_dir = Path(args.output_dir)
