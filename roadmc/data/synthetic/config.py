@@ -141,6 +141,17 @@ class RoadSurfaceConfig:
             'legacy' —— 恢复历史点采样权重 Φ = Gd0·n0²/4·Ω⁻³、实现
             级 std 重定标与带边硬切换（宏观 σ 约为 ISO 边际口径的
             2 倍，保留仅供回归对照，见 CLI --macro-spectrum）。
+            'two-segment'（**库内与 CLI 新默认**）——ISO 段构造与
+            'iso-marginal' 逐字不变；纹理段按 VT 2015 两区间幂律拆为
+            宏观纹理段 (f_tex_lo, f_b] 与微观纹理段 (f_b, f_nyq]，谱
+            指数分别取 H_macro=0.34 / H_micro=0.75，在断裂波长 f_b 处
+            解析连续（两尺度律 PSD 式 3-55/3-56，vtthesis2015.txt:
+            3230-3261；H 具体数值导入而非自校准，需人工核对 VT 原页）。
+            primitives 侧两段谱已随本批合入（generate_road_surface /
+            generate_strip_surface / _synth_texture），材质 MPD 幅值
+            分档同步生效（micro_texture.mpd_target_m）。
+            回退 = --macro-spectrum iso-marginal（库内构造
+            RoadSurfaceConfig(macro_spectrum_mode='iso-marginal')）。
     """
 
     width: float = 7.0
@@ -152,13 +163,17 @@ class RoadSurfaceConfig:
     crossfall_shape: Literal["crowned", "plane"] = "crowned"
     longitudinal_grade: float = 0.0
     roughness_mix: dict[str, float] | None = None
-    macro_spectrum_mode: Literal["iso-marginal", "legacy"] = "iso-marginal"
+    macro_spectrum_mode: Literal["iso-marginal", "legacy", "two-segment"] = (
+        "two-segment"
+    )
 
     def __post_init__(self) -> None:
-        if self.macro_spectrum_mode not in ("iso-marginal", "legacy"):
+        if self.macro_spectrum_mode not in (
+            "iso-marginal", "legacy", "two-segment",
+        ):
             raise ValueError(
-                "macro_spectrum_mode must be 'iso-marginal' or 'legacy', "
-                f"got {self.macro_spectrum_mode!r}"
+                "macro_spectrum_mode must be 'iso-marginal', 'legacy' or "
+                f"'two-segment', got {self.macro_spectrum_mode!r}"
             )
         if not math.isfinite(self.width) or self.width <= 0:
             raise ValueError(f"width must be > 0, got {self.width}")
@@ -266,14 +281,52 @@ class MicroTextureConfig:
             相关长度可异，默认同 het_corr_len_m）；'1d' —— 历史
             沿里程 y 一维、横跨整幅路宽同缩放的调制场（CLI
             --het-field-1d）。
+        h_macro / h_micro: two-segment 谱形的宏观/微观纹理 Hurst
+            指数（谱斜率 -(2H+2)）。默认 0.34 / 0.75 为 VT 2015
+            两区间幂律口径的导入值（两尺度律 PSD 式 3-55/3-56，
+            vtthesis2015.txt:3230-3261），H 数值区间本次未在本地
+            OCR 文本定位原页——**导入而非自校准，需人工核对**。
+            仅 macro_spectrum_mode='two-segment' 时生效；
+            iso-marginal/legacy 下纹理仍用标量 hurst。
+        break_wavelength_m: two-segment 谱形的断裂波长 λ_b (米)，
+            f_b = 1/λ_b 为宏观/微观纹理段分界。默认 0.010 m；VT
+            2015 Table 4-2 实测 roll-off 波长高速公路 0.50–2.30 cm
+            （vtthesis2015.txt:3568-3577，导入而非自校准）。
+            f_b ≥ 网格 Nyquist 时微观段能量为 0（元数据记
+            micro_band_empty=true）。
+        mpd_target_m: two-segment 下按 pavement_type 抽样的 MPD
+            目标区间 (lo, hi) 米（每场景 MPD~U(lo,hi)，纹理幅值
+            texture_rms_eff = MPD/mpd_rms_ratio）。None 用内置
+            {"asphalt": (0.0008, 0.0013), "concrete": (0.0002,
+            0.0008)}——沥青 MPD 0.8–1.3mm、水泥 0.2–0.8mm，
+            **导入而非自校准**。iso-marginal/legacy 下忽略，
+            纹理幅值仍取 amplitude 标量。
+        mpd_rms_ratio: MPD/纹理带 RMS 比值估计器标定。**默认 0.81**
+            为 two-segment 谱形（H_macro=0.34，5mm 默认网格、微观段
+            为空）下的工程标定值：7×5m 补丁 4 个种子实测 MPD/RMS =
+            0.812–0.814（估计器口径同 tests/test_texture_metrics.py，
+            带通 (2.83, Nyquist] c/m）；历史单段 H=0.7 谱形下的 0.52
+            见 amplitude docstring。该比值随谱形与网格漂移（微观段
+            实体化的 ≤2mm 网格下需另行标定）——grid_res<5mm 且依赖
+            MPD 目标带时请显式覆盖本字段。
+        het_corr_len_m: 调制场的高斯低通相关长度 (米)，仅在
+            het_sigma_ln > 0 时生效。**默认 0.01**（1cm 相关长度；
+            历史值 2.0 由 CLI --het-corr-len-m 2.0 恢复）。1cm 在
+            5mm 网格仅 2 格，het 开启时建议 grid_res ≤ 2mm 并已
+            写入 resolution_contract。
     """
 
     amplitude: float = 0.0008
     hurst: float = 0.7
     grid_convention: Literal["consistent", "legacy"] = "consistent"
     het_sigma_ln: float = 0.0
-    het_corr_len_m: float = 2.0
+    het_corr_len_m: float = 0.01
     het_field: Literal["2d", "1d"] = "2d"
+    h_macro: float = 0.34
+    h_micro: float = 0.75
+    break_wavelength_m: float = 0.010
+    mpd_target_m: dict[str, tuple[float, float]] | None = None
+    mpd_rms_ratio: float = 0.81
 
     def __post_init__(self) -> None:
         if self.grid_convention not in ("consistent", "legacy"):
@@ -297,6 +350,28 @@ class MicroTextureConfig:
                 "het_corr_len_m must be finite and > 0 when het_sigma_ln > 0, "
                 f"got {self.het_corr_len_m}"
             )
+        for name in ("h_macro", "h_micro", "mpd_rms_ratio"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0, got {value}")
+        if not math.isfinite(self.break_wavelength_m) or self.break_wavelength_m <= 0.0:
+            raise ValueError(
+                f"break_wavelength_m must be finite and > 0, "
+                f"got {self.break_wavelength_m}"
+            )
+        if self.mpd_target_m is not None:
+            for key, pair in self.mpd_target_m.items():
+                lo, hi = pair
+                if key not in ("asphalt", "concrete"):
+                    raise ValueError(
+                        f"mpd_target_m keys must be 'asphalt'/'concrete', "
+                        f"got {key!r}"
+                    )
+                if not (0.0 < lo <= hi):
+                    raise ValueError(
+                        f"mpd_target_m[{key!r}] must satisfy 0 < lo <= hi, "
+                        f"got {pair}"
+                    )
 
 
 @dataclass
@@ -330,6 +405,21 @@ class CrackConfig:
             （measure-then-label，与线状裂缝同型；阈值需人工核对
             JTG 5210-2018 原文）；'legacy' —— 直接采信 severity
             字符串（CLI --areacrack-label-legacy）。
+        profile_exponent: 缝深剖面指数 p：d(r) = d_max·exp(-(r/λ)^p)。
+            默认 2.0（高斯槽，现行行为）；p→1 为近线性 V 形侧壁。
+            3D 激光剖面实测裂缝呈深 V 形、缝深 1–5 mm（DOI
+            10.1109/ACCESS.2019.2956758），文献未给出 p 数值——
+            **导入依据、p 值导入而非自校准**。CLI
+            --crack-profile-exponent。
+        edge_band_width_m: 缝缘崩碎/松散过渡带宽度 (米)。0（默认）
+            = 关闭（现行行为）；> 0 时沿缝缘生成线性衰减的崩碎带，
+            **标签掩码同步外扩同宽度**（标签边界=几何边界由构造
+            保证）。文献仅对缝缘破损做定性分级（DOI
+            10.3390/coatings15070836），无宽度实测——**工程假设/
+            导入而非自校准，宽度需自行量测**。CLI
+            --crack-edge-band-width。
+        edge_band_depth_ratio: 缝缘过渡带深度比例（相对该处缝深），
+            仅 edge_band_width_m > 0 时生效；工程假设，无文献值。
     """
 
     crack_types: list[str] = field(
@@ -342,8 +432,28 @@ class CrackConfig:
     width_truncation: Literal["resample", "clip"] = "resample"
     area_lambda_mode: Literal["quarter", "half"] = "quarter"
     area_label_mode: Literal["measure", "legacy"] = "measure"
+    profile_exponent: float = 2.0
+    edge_band_width_m: float = 0.0
+    edge_band_depth_ratio: float = 0.15
 
     def __post_init__(self) -> None:
+        if not math.isfinite(self.profile_exponent) or self.profile_exponent <= 0.0:
+            raise ValueError(
+                f"profile_exponent must be finite and > 0, "
+                f"got {self.profile_exponent}"
+            )
+        if not math.isfinite(self.edge_band_width_m) or self.edge_band_width_m < 0.0:
+            raise ValueError(
+                f"edge_band_width_m must be finite and >= 0, "
+                f"got {self.edge_band_width_m}"
+            )
+        if not math.isfinite(self.edge_band_depth_ratio) or not (
+            0.0 < self.edge_band_depth_ratio <= 1.0
+        ):
+            raise ValueError(
+                f"edge_band_depth_ratio must be in (0, 1], "
+                f"got {self.edge_band_depth_ratio}"
+            )
         if self.severity_ratio is not None and not (
             math.isfinite(self.severity_ratio) and 0.0 <= self.severity_ratio <= 1.0
         ):
@@ -403,6 +513,10 @@ class PotholeConfig:
         micropit_mode: 微坑口径。'area'（默认，λ 随面积增长、始终
             生成）；'legacy' —— 恢复钳制到 1 的历史计数且仅在
             edge_quality < 1.0 时生成（CLI --pothole-micropits-legacy）。
+        spall_profile: 坑缘剥落深度剖面口径。'uniform'（默认，现行
+            行为——(0.8, 1.0)·R 均匀带）；'linear-decay' —— 剥落
+            深度从剥落带内缘到外缘线性衰减。坑缘崩碎梯度无可及
+            文献实测，两档均标**工程假设**。
     """
 
     max_radius_severe: float = 0.30
@@ -414,8 +528,14 @@ class PotholeConfig:
     spall_band: tuple[float, float] = (0.8, 1.0)
     micropit_rate: float = 4.0
     micropit_mode: Literal["area", "legacy"] = "area"
+    spall_profile: Literal["uniform", "linear-decay"] = "uniform"
 
     def __post_init__(self) -> None:
+        if self.spall_profile not in ("uniform", "linear-decay"):
+            raise ValueError(
+                f"spall_profile must be 'uniform' or 'linear-decay', "
+                f"got {self.spall_profile!r}"
+            )
         lo, hi = self.beta_range
         if not 0.0 < lo <= hi:
             raise ValueError(f"beta_range must satisfy 0 < lo <= hi, got {self.beta_range}")
@@ -655,6 +775,14 @@ class PatchingConfig:
             『±15mm』）。负侧 0.4 系数为压实沉降先验（工程假设，无
             标准依据；北京 DB11 接茬 +0~+5mm、深圳 ≤3mm 为检索摘要，
             需人工核对，未据此改值）。
+        edge_profile: 修补边缘过渡剖面。'smoothstep'（默认，现行
+            行为——三次 smoothstep 混合）；'step-fillet' —— 尖锐
+            阶跃 + 小圆角，贴近实测接缝错台口径（1–5.1mm 局部阶
+            跃、1mm 分辨率按 AASHTO R36-04 量测，DOI
+            10.3390/s18010044 与 DOI 10.1061/9780784413586.048——
+            导入而非自校准）。
+        edge_fillet_m: 'step-fillet' 剖面的圆角宽度 (米)，仅
+            edge_profile='step-fillet' 时生效；工程假设。
     """
 
     min_width: float = 0.60
@@ -664,8 +792,19 @@ class PatchingConfig:
     edge_width: float = 0.08
     max_elevation: float = 0.015
     elevation_range: tuple[float, float] = (-0.006, 0.015)
+    edge_profile: Literal["smoothstep", "step-fillet"] = "smoothstep"
+    edge_fillet_m: float = 0.01
 
     def __post_init__(self) -> None:
+        if self.edge_profile not in ("smoothstep", "step-fillet"):
+            raise ValueError(
+                f"edge_profile must be 'smoothstep' or 'step-fillet', "
+                f"got {self.edge_profile!r}"
+            )
+        if not math.isfinite(self.edge_fillet_m) or self.edge_fillet_m < 0.0:
+            raise ValueError(
+                f"edge_fillet_m must be finite and >= 0, got {self.edge_fillet_m}"
+            )
         if not 0.0 < self.min_width <= self.max_width:
             raise ValueError("patch width limits must satisfy 0 < min_width <= max_width")
         if not 0.0 < self.min_length <= self.max_length:
@@ -709,6 +848,10 @@ class ConcreteDamageConfig:
             —— 历史仅有限脊线、逐条累加（三线交汇可达 3×d_max）。
         以上四项的聚合回退为 CLI --concrete-legacy（一次性恢复四项
         旧行为，供回归门使用）。
+        fault_fillet_m: 错台（faulting）接缝阶跃的平滑过渡宽度 (米)。
+            0（默认）= 现行纯阶跃（primitives faulting 分支）；> 0
+            时在该宽度内做平滑过渡。实测口径为局部阶跃（DOI
+            10.3390/s18010044），默认保持纯阶跃。
     """
 
     slab_length: float = 5.0
@@ -720,8 +863,13 @@ class ConcreteDamageConfig:
     fault_scope: Literal["adjacent-slabs", "legacy-strip"] = "adjacent-slabs"
     edge_spall_mode: Literal["patch-truncated", "legacy"] = "patch-truncated"
     shatter_mode: Literal["clipped-max", "legacy"] = "clipped-max"
+    fault_fillet_m: float = 0.0
 
     def __post_init__(self) -> None:
+        if not math.isfinite(self.fault_fillet_m) or self.fault_fillet_m < 0.0:
+            raise ValueError(
+                f"fault_fillet_m must be finite and >= 0, got {self.fault_fillet_m}"
+            )
         if self.fault_scope not in ("adjacent-slabs", "legacy-strip"):
             raise ValueError(
                 f"fault_scope must be 'adjacent-slabs' or 'legacy-strip', got "
@@ -736,6 +884,164 @@ class ConcreteDamageConfig:
             raise ValueError(
                 f"shatter_mode must be 'clipped-max' or 'legacy', got "
                 f"{self.shatter_mode!r}"
+            )
+
+
+@dataclass
+class AmEnvelopeConfig:
+    """振幅调制（AM）慢变包络参数（默认关闭）。
+
+    改进 Gamma 慢变包络 ×载波：对基底高度场按 Wcut 分带，慢变
+    Gamma 包络 M 调制短波（纹理）分量，再经保秩 CDF 变换钉住目标
+    边际矩（skew/kurt）。默认关闭 → 默认输出逐位不变。
+
+    Attributes:
+        enable: 是否启用 AM 包络。False（默认）= 关闭。
+        wcut_cycles_per_m: 快/慢波分界频率 (cycle/m)。默认 2.83 =
+            ISO 带边界（包络波长 > 0.35 m）。
+        gamma_shape: Gamma 包络形状参数 k（scale=1/k 使 E[M]=1）。
+        target_skew: CDF 变换的目标偏度。默认 0.0（道路表面高度
+            边际近零偏——**导入而非自校准**）。
+        target_kurt: CDF 变换的目标峰度。默认 4.5（正超额峰度量
+            级——**导入而非自校准**；目标区间 skew∈[-0.35,0.35]、
+            kurt∈[3.2,6.0] 按任务给定文献量级设定，本地未检到原文
+            实测 skew/kurt，需人工核对）。
+    """
+
+    enable: bool = False
+    wcut_cycles_per_m: float = 2.83
+    gamma_shape: float = 4.0
+    target_skew: float = 0.0
+    target_kurt: float = 4.5
+
+    def __post_init__(self) -> None:
+        for name in ("wcut_cycles_per_m", "gamma_shape"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0, got {value}")
+        for name in ("target_skew", "target_kurt"):
+            if not math.isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite, got {getattr(self, name)}")
+        if self.target_kurt < 3.0:
+            raise ValueError(
+                f"target_kurt must be >= 3.0 (Gaussian reference), "
+                f"got {self.target_kurt}"
+            )
+
+
+@dataclass
+class BaseConditionConfig:
+    """基层条件与病害因果链参数（默认关闭，旧行为逐位不变）。
+
+    开启后每场景抽取 (SNP, 龄期, YE4) 并由 HDM-4 路线推导结构性
+    裂缝起始年 ICA；age_years < ICA 时结构性裂缝出现概率强制为 0。
+    系数为 **导入系数、非自校准**（HDM-4 Volume Five Table B3-4，
+    经 Malaysian J. Civil Eng. 27(1):121-143, 2015 转引，
+    utm.txt:677-684 核实）。
+
+    Attributes:
+        enable: 是否启用因果链。False（默认）= 关闭。
+        snp_range: 平均结构数 SNP 抽样区间。
+        age_years_range: 场景龄期 (年) 抽样区间。
+        ye4_msa_range: 年均当量轴次 YE4 (MSA/车道) 抽样区间。
+        cds: 施工缺陷指标 CDS（沥青面层）。
+        crt_years: 养护裂缝延迟时间 CRT (年)。
+        hdm4_a0 / hdm4_a1 / hdm4_a2: HDM-4 ICA 公式系数
+            （ICA = K_cia·{CDS^a0·exp(a1·SNP + a2·YE4/SNP²) + CRT}）。
+        tpm_path: Markov 状态转移概率矩阵 JSON 路径。None = 不加载
+            （disease_probs 不被 π 占用分布调制）。JSON 需含
+            states/matrix/provenance/source 四键，加载时校验行和
+            =1±1e-6、对角占优、sound 行上三角（病害不可逆）。
+        pothole_cooccur_base: 坑槽-龟裂共现概率基准（工程假设）。
+            enable 时共现概率 = base·clip(age/ICA−1, 0, 1)
+            + 0.5·base（函数形式为工程假设，显著标注）；disable 时
+            保持历史 0.5 字面量。
+    """
+
+    enable: bool = False
+    snp_range: tuple[float, float] = (3.0, 5.5)
+    age_years_range: tuple[float, float] = (0.0, 15.0)
+    ye4_msa_range: tuple[float, float] = (0.05, 2.0)
+    cds: float = 1.0
+    crt_years: float = 0.0
+    hdm4_a0: float = 4.21
+    hdm4_a1: float = 0.14
+    hdm4_a2: float = -17.1
+    tpm_path: str | None = None
+    pothole_cooccur_base: float = 0.5
+
+    def __post_init__(self) -> None:
+        for name in ("snp_range", "age_years_range", "ye4_msa_range"):
+            lo, hi = getattr(self, name)
+            if not (math.isfinite(lo) and math.isfinite(hi) and 0.0 <= lo < hi):
+                raise ValueError(
+                    f"{name} must satisfy 0 <= lo < hi, got {getattr(self, name)}"
+                )
+        for name in ("cds", "crt_years", "hdm4_a0", "hdm4_a1",
+                     "hdm4_a2", "pothole_cooccur_base"):
+            if not math.isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
+        if not 0.0 <= self.pothole_cooccur_base <= 1.0:
+            raise ValueError(
+                f"pothole_cooccur_base must be in [0, 1], "
+                f"got {self.pothole_cooccur_base}"
+            )
+
+
+@dataclass
+class LineProfilerConfig:
+    """线激光剖面仪（line profiler）传感器配置。
+
+    传感器几何与噪声参数为 LSP 实测规格的导入值（DOI
+    10.1109/ACCESS.2019.2956758：1mm 横向分辨率、0.25mm 高程精度——
+    **导入而非自校准**）；散斑参数化出自 Csencsics 2022（DOI
+    10.1109/I2MTC48687.2022.9806610，已核）；传感器高度/入射角为
+    工程设定。仅在 ``observation_model='line-profiler'`` 时消费；
+    仿真本体 ``roadmc.data.synthetic.line_profiler`` 由传感组按固定
+    签名提供，已随 2026-10 修复批交付；若某构建缺失该模块，该档位
+    报"未安装"类清晰错误（on/off 档位不受影响）。
+
+    Attributes:
+        lateral_res_m: 横向重采样分辨率 (米)，默认 0.001。
+        step_m: 纵向剖面步距 (米)，默认 0.005。
+        sensor_height_m: 传感器高度 (米)，默认 0.35（工程设定）。
+        laser_incidence_deg: 光平面入射角 (度，自竖直)，默认 30.0
+            （工程设定）。
+        sigma_z0_m: 垂直入射基准高程噪声标准差 (米)，默认 0.00025。
+        speckle_shape: 散斑亮度 Gamma 形状参数，默认 3.0。
+        flyer_prob: 逐点飞点概率，默认 1e-3。
+        flyer_sigma_mult: 飞点离群倍数（×σ_z），默认 8.0。
+        brightness_dropout_ref: 低亮度丢点归一参考亮度，默认 0.05。
+    """
+
+    lateral_res_m: float = 0.001
+    step_m: float = 0.005
+    sensor_height_m: float = 0.35
+    laser_incidence_deg: float = 30.0
+    sigma_z0_m: float = 0.00025
+    speckle_shape: float = 3.0
+    flyer_prob: float = 1e-3
+    flyer_sigma_mult: float = 8.0
+    brightness_dropout_ref: float = 0.05
+
+    def __post_init__(self) -> None:
+        for name in (
+            "lateral_res_m", "step_m", "sensor_height_m", "sigma_z0_m",
+            "speckle_shape", "flyer_sigma_mult", "brightness_dropout_ref",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0, got {value}")
+        if not math.isfinite(self.laser_incidence_deg) or not (
+            0.0 < self.laser_incidence_deg < 90.0
+        ):
+            raise ValueError(
+                f"laser_incidence_deg must be in (0, 90), "
+                f"got {self.laser_incidence_deg}"
+            )
+        if not math.isfinite(self.flyer_prob) or not 0.0 <= self.flyer_prob <= 1.0:
+            raise ValueError(
+                f"flyer_prob must be in [0, 1], got {self.flyer_prob}"
             )
 
 
@@ -1101,8 +1407,15 @@ class GeneratorConfig:
         max_surface_memory_mib: 单个生成 worker 的估算峰值内存上限。
         normalize: 是否坐标归一化到单位球，默认 True。
         observation_model: 观测模型体制开关（见字段文档串；配置默认
-            "on"，CLI generate_synthetic.py 默认 "off"）。
+            "on"，CLI generate_synthetic.py 默认 "off"）。第三档
+            "line-profiler" 为线激光剖面仪观测模型（传感器模块
+            roadmc/data/synthetic/line_profiler.py（已交付），
+            模块未就绪时报"未安装"类清晰错误，不影响 on/off）。
         strip: 分段条带合成参数（超 per-worker 预算时触发，默认自动）。
+        am_envelope: AM 慢变包络配置（默认关闭）。
+        base_condition: 基层条件与病害因果链配置（默认关闭）。
+        line_profiler: 线激光剖面仪传感器配置（仅在 observation_model
+            ="line-profiler" 时使用；传感器模块未就绪前不装配）。
     """
 
     road: RoadSurfaceConfig = field(default_factory=RoadSurfaceConfig)
@@ -1136,7 +1449,7 @@ class GeneratorConfig:
     contains ~1.4M points at 5 mm grid spacing — useful for density-upper-bound
     references in ablation studies.  ``num_points`` is ignored when this is set."""
 
-    observation_model: Literal["on", "off"] = "on"
+    observation_model: Literal["on", "off", "line-profiler"] = "on"
     """观测模型体制开关（交互规则见下）。
 
     - ``"on"``（**配置默认**）：完整传感器观测管线（扫描重采样 → 曲率 →
@@ -1149,6 +1462,13 @@ class GeneratorConfig:
       属性，非观测效应）、强度计算、归一化、特征全部保留。off 且
       ``lidar_scan.enable=True`` 时发 ``warnings.warn`` 并跳过扫描
       （元数据记录 override），不报硬错。
+    - ``"line-profiler"``：线激光剖面仪观测模型——跳过旋转 LiDAR
+      扫描重采样（步骤 2.5）与 ``simulate_lidar_noise`` 球坐标噪声
+      （步骤 8，扫描式 LiDAR 模型），在步骤 2.5 位置运行
+      ``simulate_line_profiler``（模块
+      ``roadmc.data.synthetic.line_profiler``，固定签名
+      提供；模块未就绪时报"未安装"类清晰错误）。暂仅支持单块路径，
+      与分段体制组合显式 raise NotImplementedError。
 
     **配置默认值取 "on"，CLI（generate_synthetic.py）默认才是 "off"**：
     ``GeneratorConfig()`` 的库内默认行为被 dataloader 冒烟配置与生成器
@@ -1159,10 +1479,20 @@ class GeneratorConfig:
     """分段条带合成参数：条带总点数超过 per-worker 预算时按此配置分段，
     字段为 None 时使用确定性自动推导（推导结果写入场景元数据）。"""
 
+    am_envelope: AmEnvelopeConfig = field(default_factory=AmEnvelopeConfig)
+    """AM 慢变包络配置：默认关闭，默认输出逐位不变。"""
+
+    base_condition: BaseConditionConfig = field(default_factory=BaseConditionConfig)
+    """基层条件与病害因果链配置：默认关闭（旧行为逐位不变）。"""
+
+    line_profiler: LineProfilerConfig = field(default_factory=LineProfilerConfig)
+    """线激光剖面仪传感器配置（仅在 observation_model='line-profiler'
+    时消费；传感器模块未就绪前保持占位）。"""
+
     def __post_init__(self) -> None:
-        if self.observation_model not in ("on", "off"):
+        if self.observation_model not in ("on", "off", "line-profiler"):
             raise ValueError(
-                "observation_model must be 'on' or 'off', "
+                "observation_model must be 'on', 'off' or 'line-profiler', "
                 f"got {self.observation_model!r}"
             )
         if not self.retain_all_surface_points and self.num_points < 1:
@@ -1549,6 +1879,28 @@ class GeneratorConfig:
         )
         metadata = {
             "contract_version": RESOLUTION_CONTRACT_VERSION,
+            # 分辨率契约的显式布尔记录（设计稿 sensor_contract /
+            # spectrum_design 要求落 resolution_contract 的量）。键名
+            # 取 resolution_contract_booleans 而非 resolution_contract：
+            # 场景 npz 已有同名标量键 resolution_contract（取
+            # contract_version 字符串，历史口径），同名会在下游造成
+            # 一名两义（前一轮复核实测）。语义同设计稿：
+            # crack_resolvable —— 表面网格能否分辨轻裂（中位缝宽
+            # 1.8mm 需要点间距 ≪ 缝宽；grid_res>2mm 不可分辨，警告
+            # 依据 DOI 10.3390/s26082338；line-profiler 档位相关）；
+            # het_grid_adequate —— het 调制相关长度在当前网格上的
+            # 采样充分性（corr_len/grid_res ≥ 5 视为充分；1cm 相关
+            # 长度在 5mm 网格仅 2 格 → False）。均为配置层判定，
+            # 生成器不回填。
+            "resolution_contract_booleans": {
+                "crack_resolvable": bool(self.road.grid_res <= 0.002),
+                "het_grid_adequate": bool(
+                    self.micro_texture.het_sigma_ln <= 0.0
+                    or self.micro_texture.het_corr_len_m
+                    / self.road.grid_res
+                    >= 5.0
+                ),
+            },
             "surface_grid": {
                 "spacing_m": self.road.surface_grid_spacing_m,
                 "width_m": float(self.road.width),
@@ -1596,7 +1948,91 @@ class GeneratorConfig:
                 "crossfall": float(self.road.crossfall),
                 "crossfall_shape": str(self.road.crossfall_shape),
                 "longitudinal_grade": float(self.road.longitudinal_grade),
+                "het_modulation_grid_advisory": (
+                    "het_sigma_ln > 0 with corr length "
+                    f"{self.micro_texture.het_corr_len_m:g} m spans only "
+                    f"{max(1, int(round(self.micro_texture.het_corr_len_m / self.road.grid_res)))} "
+                    "grid cells; grid_res <= 0.002 m recommended when the het "
+                    "modulation is enabled"
+                    if self.micro_texture.het_sigma_ln > 0.0
+                    else None
+                ),
+                # two-segment 谱形审计（配置层规格；逐场景实际抽取的
+                # mpd_drawn_m / texture_rms_effective_m 由生成器写入）。
+                "texture_spectrum": {
+                    "mode": str(self.road.macro_spectrum_mode),
+                    "h_macro": float(self.micro_texture.h_macro),
+                    "h_micro": float(self.micro_texture.h_micro),
+                    "break_wavelength_m": float(self.micro_texture.break_wavelength_m),
+                    "break_cycles_per_m": float(
+                        1.0 / self.micro_texture.break_wavelength_m
+                    ),
+                    "nyquist_cycles_per_m": float(0.5 / self.road.grid_res),
+                    "micro_band_empty": bool(
+                        1.0 / self.micro_texture.break_wavelength_m
+                        >= 0.5 / self.road.grid_res
+                    ),
+                    # 设计稿点名的键：mpd_target_m 报**有效**目标区间
+                    # （用户覆盖或内置默认）。override 状态经
+                    # mpd_target_m_overridden 布尔披露——两键合读可
+                    # 区分覆盖与默认（前一轮曾用 mpd_target_m_effective
+                    # 命名，按复核意见恢复设计稿键名）。
+                    "mpd_target_m": (
+                        {
+                            k: [float(v[0]), float(v[1])]
+                            for k, v in (
+                                self.micro_texture.mpd_target_m
+                                if self.micro_texture.mpd_target_m is not None
+                                else {
+                                    "asphalt": (0.0008, 0.0013),
+                                    "concrete": (0.0002, 0.0008),
+                                }
+                            ).items()
+                        }
+                    ),
+                    "mpd_target_m_overridden": (
+                        self.micro_texture.mpd_target_m is not None
+                    ),
+                    "mpd_rms_ratio": float(self.micro_texture.mpd_rms_ratio),
+                    "mpd_drawn_m": None,
+                    "texture_rms_effective_m": None,
+                    "provenance": (
+                        "two-scale power law (VT 2015 Eqs. 3-55/3-56, "
+                        "vtthesis2015.txt:3230-3261); roll-off wavelength "
+                        "Table 4-2 (vtthesis2015.txt:3568-3577); imported_"
+                        "not_self_calibrated; H ranges 0.31-0.37 / 0.68-0.82 "
+                        "need manual verification against the VT original pages"
+                    ),
+                },
+                # AM 慢变包络审计（配置层规格；实测 skew/kurt 由生成器
+                # 在包络施加后回填）。
+                "am_envelope": {
+                    "enabled": bool(self.am_envelope.enable),
+                    "wcut_cycles_per_m": float(self.am_envelope.wcut_cycles_per_m),
+                    "gamma_shape": float(self.am_envelope.gamma_shape),
+                    "target_skew": float(self.am_envelope.target_skew),
+                    "target_kurt": float(self.am_envelope.target_kurt),
+                    "measured_skew": None,
+                    "measured_kurt": None,
+                    "coefficients_provenance": "imported_not_self_calibrated",
+                },
             },
+        }
+        # 基层条件 / 病害因果链审计（配置层规格；逐场景抽取值由生成器
+        # 写入顶层 base_condition 的扩展字段）。
+        metadata["base_condition"] = {
+            "enabled": bool(self.base_condition.enable),
+            "snp_range": [float(v) for v in self.base_condition.snp_range],
+            "age_years_range": [float(v) for v in self.base_condition.age_years_range],
+            "ye4_msa_range": [float(v) for v in self.base_condition.ye4_msa_range],
+            "tpm_path": self.base_condition.tpm_path,
+            "coefficients_provenance": "imported_not_self_calibrated",
+            "pothole_cooccur_model": (
+                "base*clip(age/ICA-1,0,1)+0.5*base (engineering assumption, "
+                "significantly annotated)"
+                if self.base_condition.enable
+                else "legacy literal 0.5"
+            ),
         }
         # v2 条带分段计划与 per-worker 内存估算：统一在 config 层写入，
         # 使数据集级 metadata.json 与逐场景 resolution_metadata_json 携带
@@ -1620,6 +2056,32 @@ class GeneratorConfig:
         metadata["sensor_output"] = {
             "observation_model": str(self.observation_model),
             "agc_mode": str(self.radiometric.agc_mode),
+            "line_profiler": {
+                "lateral_res_m": float(self.line_profiler.lateral_res_m),
+                "step_m": float(self.line_profiler.step_m),
+                "sensor_height_m": float(self.line_profiler.sensor_height_m),
+                "laser_incidence_deg": float(self.line_profiler.laser_incidence_deg),
+                "sigma_z0_m": float(self.line_profiler.sigma_z0_m),
+                "speckle_shape": float(self.line_profiler.speckle_shape),
+                "flyer_prob": float(self.line_profiler.flyer_prob),
+                "brightness_dropout_ref": float(
+                    self.line_profiler.brightness_dropout_ref
+                ),
+                "profile_count": None,
+                "points_total": None,
+                "points_per_profile_median": None,
+                "flyer_ratio": None,
+                "dropped_ratio": None,
+                "crack_resolvable": None,
+                "speckle_provenance": (
+                    "Csencsics 2022 (DOI 10.1109/I2MTC48687.2022.9806610) "
+                    "imported_not_self_calibrated; 2023 journal extension "
+                    "needs manual verification; LSP specs (DOI "
+                    "10.1109/ACCESS.2019.2956758) imported_not_self_calibrated"
+                ),
+            }
+            if self.observation_model == "line-profiler"
+            else None,
             "agc_reference_power": (
                 None
                 if self.radiometric.agc_mode == "scene-p99"

@@ -187,9 +187,9 @@ $$
 | 观测层 | 扫描线重采样、距离噪声、角度扰动、辐射强度、按自然 prevalence 的输出采样 | `roadmc/data/synthetic/generator.py` |
 | 标签层 | 逐点 JTG 风格标签，支持二分类和课程迁移 | `roadmc/data/synthetic/labels.py` |
 
-生成过程不是向规则网格添加随机噪声，而是先构造表面与病害，再模拟传感器采样。生成器显式区分三层分辨率：物理表面网格间距（`generate_synthetic.py` 用 `--surface-grid-spacing`，类别预算脚本用 `--grid-res`，v2 取 `0.02 m`）、传感器输出点数（`--num-points`）、下游模型输入点数。毫米级表面网格不会自动保留到最终点云，每场景的三层分辨率与保护采样记录都写入 `resolution_metadata_json`。
+生成过程不是向规则网格添加随机噪声，而是先构造表面与病害，再模拟传感器采样。生成器显式区分三层分辨率：物理表面网格间距（`generate_synthetic.py` 用 `--surface-grid-spacing`，类别预算脚本用 `--grid-res`，v2 取 `0.02 m`）、传感器输出点数（generate_synthetic.py 规范名 `--sensor-output-points`，`--num-points` 为兼容别名；`--sensor-output-density` 为点/㎡密度口径，类预算脚本用 `--num-points`）、下游模型输入点数（`--model-target-points`，仅记录契约不执行采样）。毫米级表面网格不会自动保留到最终点云，每场景的三层分辨率与保护采样记录都写入 `resolution_metadata_json`。
 
-边界声明：两类路面**共享同一几何宏观谱与纹理谱，不建模材料纹理分化**——`pavement_type` 只决定病害集合与强度材料先验（基线反照率），水泥拉毛/刻槽纹理、接缝周期谱分量等均为未实现的后续项；基层/路基/垫层相关机理（沉陷-软弱点耦合、反射裂缝、错台-唧泥成因链）同样不在建模范围内。
+边界声明：两类路面的**几何宏观谱形状仍然共享**（ISO 8608 段与谱指数不随路面类型变化），但 two-segment 谱形下纹理**幅值按 pavement_type 分档**——每场景 MPD~U(目标区间)（内置：沥青 0.8–1.3mm、水泥 0.2–0.8mm，导入而非自校准），有效纹理 RMS = MPD/mpd_rms_ratio 传入几何合成，材料纹理分化经幅值分档重新进入几何。这是对旧口径『两类路面共享同一纹理谱』的有意反转；iso-marginal/legacy 谱形下保持旧口径（pavement_type 只决定病害集合与强度材料先验）。水泥拉毛/刻槽纹理形状、接缝周期谱分量等仍为未实现的后续项；基层/路基/垫层相关机理（反射裂缝、错台-唧泥成因链）不在建模范围内——病害因果链（基层条件→裂缝起始年 ICA→坑槽/修补共现约束）已作为可选项入码（见"基层条件与病害因果链"），沉陷-软弱点耦合仍未建模。
 
 ### 生成数据集
 
@@ -214,7 +214,7 @@ python roadmc/scripts/generate_synthetic.py `
 | --- | --- | --- |
 | `--width` | `7.0` | 路面横向宽度（米）。硬下限 `1.0 m`：病害中心在 `[0.5, width-0.5]` 上抽样，更窄会在入口直接报错。`width ≤ 3.5` 且路拱形状为默认的 `crowned` 时给警告（中央路拱是 7 m 双车道口径，窄路通常应取单向坡）；`width < 2.4`（轮迹带横向占位 `wheel_separation + rut_width`）时警告车辙沟槽会溢出路缘 |
 | `--length` | `5.0` | 路面里程向长度（米） |
-| `--observation-model` | `off` | 观测模型体制开关，取值 `on` / `off` |
+| `--observation-model` | `off` | 观测模型体制开关，取值 `on` / `off` / `line-profiler`（line-profiler 为线激光剖面仪档，见下文专门小节） |
 
 观测模型体制的语义：
 
@@ -241,7 +241,7 @@ python roadmc/scripts/generate_class_budget.py `
   --roughness B
 ```
 
-类别预算脚本可断点续跑，只有在类别配额、点数配额和特征校验都满足后才报告完成。三个与统计效度相关的行为：
+类别预算脚本可断点续跑（`--max-attempts-per-class` 控制每类最大尝试数，默认按配额自动推导；`--dry-run` 只扫描现状不生成），只有在类别配额、点数配额和特征校验都满足后才报告完成。三个与统计效度相关的行为：
 
 - 受控场景不固定目标类别点数比例；每场景最低存活点数由 `ceil(min-points / target-scenes)` 推导，可用 `--target-label-min-output-points` 覆盖，每次保护干预写入场景审计字段。
 - 拒绝向缺少分辨率记录（旧配额时代）场景的目录续跑，防止两种采样体制混入同一数据集；`--ignore-legacy-scenes` 可显式排除旧场景。**注意续跑只核对配额、不核对生成配置**：同一目录下若已存在另一套配置产出的场景，配额会被判为满足。跨配置重建时应换输出目录，或先确认旧目录已改名。
@@ -251,12 +251,12 @@ python roadmc/scripts/generate_class_budget.py `
 
 ### 贴近真实路面的配置项
 
-下面四组选项用于缩小合成侧与真实侧的观测差距，全部默认关闭；关闭时几何与强度采样与 v2 相同（新增的 `roughness_class` 等记录字段除外，它总是写入）：
+下面四组选项用于缩小合成侧与真实侧的观测差距，全部默认关闭；关闭时几何与强度采样与 v2 相同（新增的 `roughness_class` 等记录字段除外，它总是写入）。**本节选项（`--roughness-mix`/`--texture-rms`/`--texture-het-sigma`/`--texture-het-corr`/`--curb-width`/`--curb-height`/`--albedo-sigma-ln`/`--speckle-m`）只在 generate_class_budget.py 中提供**；generate_synthetic.py 没有这些 flag，对其使用会报未知参数：
 
 | 选项 | CLI | 作用 |
 | --- | --- | --- |
 | 粗糙度混合 | `--roughness-mix "D:0.5,E:0.5"` | 每场景按权重抽样 ISO 8608 等级，并把实际等级写入场景字段 `roughness_class`，避免整批数据只用一个等级 |
-| 纹理沿程不均匀 | `--texture-het-sigma 0.6 --texture-het-corr 2.0` | 对已按 Parseval 定标的短波分量做对数正态幅值调制（先做高低通分解，不改变总方差），使纹理强弱沿里程起伏 |
+| 纹理沿程不均匀 | `--texture-het-sigma 0.6 --texture-het-corr 2.0`（仅 generate_class_budget.py；generate_synthetic.py 用 `--het-corr-len-m 2.0`）| 对已按 Parseval 定标的短波分量做对数正态幅值调制（先做高低通分解，不改变总方差），使纹理强弱沿里程起伏。`--texture-het-corr` 与 `--het-corr-len-m` 是同一字段（micro_texture.het_corr_len_m）的两个名字：两者都缺省时用库内默认 0.01，显式传任一者即覆盖，都传且值不同时报错（历史版本里类预算脚本的 `--texture-het-corr` 会被 `--het-corr-len-m` 的默认值无声覆盖，已修复） |
 | 缘石条带 | `--curb-width 0.30 --curb-height 0.13` | 在行车道外加一条抬高带，让非路面点进入密度与法向统计 |
 | 辐射标定 | `--albedo-sigma-ln 0.9 --speckle-m 6.0` | 强度改为 `反照率场 × 入射角 × 1/R²` 后做对数正态与 Gamma 标定，强度分布不再整体偏亮 |
 
@@ -294,12 +294,12 @@ python roadmc/scripts/generate_class_budget.py `
 - 泛油：从恒定 40% 面积、贯穿全路长的硬边界条带改为轮迹带上的随机斑块（面积占比 U(5%,25%)，logistic 平滑边界）；
 - 朗伯项：cosθ 不再取绝对值（背向面强度趋 0），反照率截断上限 0.95 → 0.98。
 
-每一项都保留显式回退通道（旧口径仅作回归对照保留，不是推荐配置）。两个生成脚本接受同一组 flag：
+每一项都保留显式回退通道（旧口径仅作回归对照保留，不是推荐配置）。两个生成脚本接受同一组回退 flag，仅两处例外：`--no-stratified`（已弃用的 `--disease-sampling bernoulli` 旧别名）只存在于 generate_synthetic.py；`--texture-het-corr`（`--het-corr-len-m` 的别名）只存在于 generate_class_budget.py——两 flag 写同一配置字段，显式传两者且值不同时报错：
 
 | 回退 flag | 恢复的旧行为 |
 | --- | --- |
 | `--macro-spectrum legacy` | 历史点采样谱权重 + std 重定标 |
-| `--disease-sampling legacy` | 概率归一化加权恒定计数（`--no-stratified` 保留为其 bernoulli 旧别名，已弃用） |
+| `--disease-sampling legacy` | 概率归一化加权恒定计数（`--no-stratified` 保留为其 bernoulli 旧别名，已弃用；仅 generate_synthetic.py） |
 | `--pothole-beta-legacy` / `--pothole-micropits-legacy` / `--pothole-aspect-legacy` | 坑槽 β 字面量分级 / 钳制微坑计数 / 取消纵横比先验 |
 | `--pothole-spall-band 0.8 1.2` | 坑缘剥落环外扩到 1.2R |
 | `--agc-mode scene-p99` | 逐场景 p99 AGC |
@@ -310,6 +310,24 @@ python roadmc/scripts/generate_class_budget.py `
 | `--bleeding-geometry-legacy` | 泛油恒定 40% 面积条带 |
 | `--lambert-abs-legacy` / `--albedo-clip-hi 0.95` | cosθ 取绝对值 / 反照率上限 0.95 |
 | `--micro-texture-grid-legacy` / `--het-field-1d` | 纹理谱频率网格历史口径 / het 一维调制场 |
+| `--macro-spectrum iso-marginal` | 单段纹理谱（H=0.7，ISO 边际重构）——two-segment 的回退档（two-segment 为库内与 CLI 新默认，primitives 侧两段谱已合入） |
+| `--het-corr-len-m 2.0` | het 调制场相关长度恢复 2.0 m（新默认 0.01 m；het 默认关闭时无输出差异） |
+| `--crack-profile-exponent 2.0` / `--crack-edge-band-width 0` | 缝深剖面高斯槽 / 关闭缝缘崩碎带 |
+| `--pothole-spall-profile uniform` / `--patch-edge-profile smoothstep` / `--fault-fillet-m 0` | 坑缘剥落均匀带 / 修补 smoothstep 边缘 / 错台纯阶跃 |
+| `--am-envelope off` / `--causality off` | AM 包络关闭 / 因果链关闭（二者默认即关闭） |
+| `--observation-model on` / `off` | 完整传感器管线 / 全表面直出（`line-profiler` 档为新增） |
+
+**五模块批（two-segment 默认翻转而设）的回退配方**：`--macro-spectrum
+iso-marginal --am-envelope off --crack-profile-exponent 2.0
+--crack-edge-band-width 0 --patch-edge-profile smoothstep --fault-fillet-m 0
+--het-corr-len-m 2.0 --causality off`。**注意配方不含
+`--observation-model`**：line-profiler 档位的新增没有改变任何默认
+（CLI 默认仍 off、库内默认仍 on），回退门的基线命令自带观测档位
+（如 `--observation-model on`），配方若再带观测档会覆盖基线体制、
+输出必然不逐字节一致（2026-10-12 回归门 wf4 事故：配方误带
+`--observation-model off` 导致 1024 点 on 基线对 87500 点 off 输出，
+四数组全 MISMATCH；去掉该 flag 后逐字节一致，实测见
+output/wf4_reg_fix vs output/wf4_baseline）。
 
 同一命令把全部口径恢复到 2026-10 之前（供回归门使用）：
 
@@ -323,7 +341,7 @@ python roadmc/scripts/generate_synthetic.py `
   --areacrack-lambda-legacy --areacrack-label-legacy --concrete-legacy `
   --depression-center-legacy --depression-label-legacy `
   --bleeding-geometry-legacy --lambert-abs-legacy --albedo-clip-hi 0.95 `
-  --micro-texture-grid-legacy
+  --micro-texture-grid-legacy --het-corr-len-m 2.0
 ```
 
 配置 schema 同步变更（构造时传旧关键字会报 `TypeError`）：`PotholeConfig` 删除 `max_radius_light` / `edge_spall_prob`；`DepressionConfig.max_radius` 改为 `radius_range=(0.5, 2.0)`；`RavelingConfig.pitting_depth` 改为 `erosion_depth=(0.002, 0.005)`；`BleedingConfig.intensity_boost`（实测对输出零影响的死参数）改为 `intensity_multiplier=0.55`；`MicroTextureConfig.octaves` 删除（谱合成路径早已不使用）；`CrackConfig.severity_ratio` 改为 `None`（= 使用 `disease.severity_ratio`）并接线为裂缝专属覆盖。这些字段此前从未被读取或从未被正确读取（名实不符），详见 config.py 内注释。
@@ -331,6 +349,26 @@ python roadmc/scripts/generate_synthetic.py `
 合入顺序说明：上述口径中的一部分由 `primitives.py` 侧消费（谱重构、坑槽/裂缝/水泥几何、沉陷标签半径、纹理网格口径、het 场维度）。生成器的装配层按两类通道下发：签名级新增 kwargs（如 `macro_spectrum_mode`）按基元当前签名转发或剔除；`params` 字典内的键始终随字典下发，但装配层会检查基元源码是否已读取该键。基元侧批次尚未合入时，"请求行为 ≠ 基元当前行为"的键每键发一次警告，并写入场景元数据 `pending_primitive_upgrades`（该元数据按场景准确记录，只含本场景实际遇到的键）；请求行为 = 基元当前行为（即全部回退 flag 的 legacy 等价值）的键静默——因此 full-legacy 回退运行的待合入集合为空，与新默认运行在回归门上可区分，不会无声地宣称已切换。基元侧合入后同一装配代码自动生效，待合入集合随之变空。
 
 新默认口径与旧口径数据集（含与真实侧）的对比数字：**待补正**。
+
+### two-segment 谱形、AM 包络、过渡带与因果链（2026-10 结构批）
+
+在 2026-10 行为修正批之上的第二批结构改动。除特别注明外，每项默认值都等于旧行为或带显式回退 flag。
+
+**纹理谱 two-segment（库内与 CLI 新默认）**：`RoadSurfaceConfig.macro_spectrum_mode` 第三档 `'two-segment'` 已随本批在 primitives 侧合入（`generate_road_surface` / `generate_strip_surface` 纹理段两段幂律，`synthesize_strip_macro_band` 的 ISO 段与 iso-marginal 逐字一致），库内默认与两个生成脚本的 `--macro-spectrum` 默认均已翻为 `'two-segment'`（装配层与脚本入口的预检保留为安全网：基元侧不支持该档时清晰报错并提示回退，而不是逐场景异常）。primitives 基元自身的签名默认仍为 `'iso-marginal'`，以保护直接调用方与既有固定种子测试。ISO 段构造与 `iso-marginal` 逐字不变；纹理段按 VT 2015 两区间幂律（两尺度律 PSD 式 3-55/3-56，vtthesis2015.txt:3230-3261）拆为宏观纹理段（H_macro=0.34）与微观纹理段（H_micro=0.75），在断裂波长 λ_b（默认 0.010 m；roll-off 波长高速公路实测 0.50–2.30 cm，vtthesis2015.txt:3568-3577，Table 4-2）处解析连续。诚实声明：**H=0.34/0.75 为导入而非自校准**——VT 2015 两尺度律框架已核实，但 H 具体数值区间本次未能在本地 OCR 文本定位原页，需人工核对。5mm 默认网格下 f_b=100 c/m 恰为 Nyquist，微观段恒为空（元数据 `surface_grid.texture_spectrum.micro_band_empty=true`），微观段仅在 grid_res<5mm 时实体化；谱形门（逐列 1D PSD 对数-对数拟合，3×3m@1mm、N≥4 种子取中位）区间：h_macro∈[0.24,0.46]、h_micro∈[0.58,0.92]、λ_b∈[0.006,0.020]m。回退：`--macro-spectrum iso-marginal`。`mpd_rms_ratio` 已按 two-segment 谱形重新标定：默认 0.81（7×5m@5mm 补丁 4 种子实测 MPD/RMS=0.812–0.814；单段 H=0.7 谱形下的历史值 0.52 见 `MicroTextureConfig.amplitude` docstring）。该比值随谱形与网格漂移，微观段实体化的 ≤2mm 网格下需另行标定并显式覆盖。
+
+**材质分档**（可被 `--texture-h-macro`/`--texture-h-micro`/`--texture-break-wavelength`/`--mpd-rms-ratio` 显式覆盖，默认 0.34/0.75/0.010/0.81）：two-segment 下每场景按 pavement_type 抽 MPD~U(目标区间)（内置 asphalt 0.8–1.3mm / concrete 0.2–0.8mm，**导入而非自校准**；`MicroTextureConfig.mpd_target_m` 可覆盖），纹理幅值 = MPD/mpd_rms_ratio；iso-marginal/legacy 下忽略，纹理幅值仍取 `amplitude` 标量。这使 pavement_type 重新进入几何（见"生成模型"边界声明），two-segment 逐场景多消耗 1 次 uniform 抽取；iso-marginal/legacy 路径零新增 rng 消耗，回退运行逐位复现旧输出。逐场景实际抽取值写入 `surface_grid.texture_spectrum.mpd_drawn_m / texture_rms_effective_m`。
+
+**AM 慢变包络（默认关闭）**：`--am-envelope on` 启用。AM 门（设计稿 am_gate）：实测偏度 ∈ [-0.35, 0.35]、实测峰度 ∈ [3.2, 6.0]——AM-off 基线实测 kurt≈2.6-3.0（ISO 低频主导，略低峰态），与门下限 3.2 干净分离，能检出『AM 静默未生效』；sinh-arcsinh 钉扎为迭代近似（在 AM-off 基线锚点场景 3×3m@2mm、class A、seed 11/22/33/44/7/99 实测：|Δkurt| ≤ 0.05、|Δskew| ≤ 0.001；目标 3.5/5.5 同样达标），实测值逐场景落元数据。对病害施加**之前**的基底高度场做改进 Gamma 慢变包络（分界频率 `--am-wcut` 默认 2.83 c/m = ISO 带边界；Gamma 形状 k=4.0，包络按 E[M²]=1 归一），再经保秩 sinh-arcsinh CDF 变换把高度边际钉到目标偏度/峰度（`--am-target-skew` 默认 0.0、`--am-target-kurt` 默认 4.5，**导入而非自校准**——本地可及的 ERA 2023（DOI 10.3934/era.2023119）只报 MTD 与分形维数、未报 skew/kurt，目标量级的原文需人工核对）。实现位于 `roadmc/data/synthetic/am_envelope.py`；管线位置是硬约束（必须在病害之前，否则全场 CDF 变换会改写坑槽深度/缝深，JTG 分级判据失真——生成器含顺序断言）。实测 skew/kurt 写入 `surface_grid.am_envelope.measured_skew/measured_kurt`。默认关闭 → 默认输出逐位不变。
+
+**病害过渡带剖面（默认值 = 旧行为）**：裂缝新增 `--crack-profile-exponent`（默认 2.0 = 现行高斯槽；p→1 为近线性 V 形侧壁——3D 激光剖面实测裂缝呈深 V 形、缝深 1–5mm，DOI 10.1109/ACCESS.2019.2956758，p 值**导入而非自校准**）与 `--crack-edge-band-width`（默认 0 = 关闭；>0 时沿缝缘生成线性衰减崩碎带、**标签掩码同步外扩同宽度**——文献仅对缝缘破损做定性分级（DOI 10.3390/coatings15070836）、无宽度实测，**工程假设/导入而非自校准，宽度需自行量测**）；坑槽新增 `--pothole-spall-profile`（uniform=现行 | linear-decay，**工程假设**——坑缘崩碎梯度无可及文献实测）；修补新增 `--patch-edge-profile`（smoothstep=现行 | step-fillet，接缝错台 1–5.1mm 局部阶跃实测口径，DOI 10.3390/s18010044 与 DOI 10.1061/9780784413586.048，**导入而非自校准**）；水泥错台新增 `--fault-fillet-m`（默认 0 = 现行纯阶跃；实测口径为阶跃，默认不变）。过渡带全开时的门：缝缘过渡带 1/e 半宽 ∈ [0.5,2]×ring_width_m（门配置 0.02m）、病害核心区外相邻网格点最大非预期竖向阶跃 ≤ 0.02m。松散维持点移除+高斯侵蚀（定性吻合集料损失体积口径，DOI 10.3390/su14127471 / DOI 10.3141/2457-01；无直接实测引用）。以上过渡带键已随本批在 primitives 侧合入（`add_crack` / `add_pothole` / `add_patching` / `add_concrete_damage` 均从 `params` 读取对应键），装配层的 `pending_primitive_upgrades` 不再披露这些键（请求值=默认值时本就静默）。
+
+**观测模型 line-profiler 档**：`--observation-model` 新增第三档 `line-profiler`（CLI 默认仍 off、库内默认仍 on，不改任何默认行为）。线激光剖面仪：纵向步进采样光平面与网格表面求交剖面（横向 1mm 重采样）、高程噪声按 Csencsics 2022 散斑参数化（DOI 10.1109/I2MTC48687.2022.9806610，已核；『Csencsics 2023』期刊扩展未检到，需人工核对）、σ_z0=0.25mm 与 1mm 横向分辨率为 LSP 实测规格（DOI 10.1109/ACCESS.2019.2956758，**导入而非自校准**）、飞点/低亮度丢点启发式。跳过旋转 LiDAR 扫描重采样与 `simulate_lidar_noise` 球坐标噪声（那是扫描式模型）；输出点云走同一 features.py 通道（特征只由最终点与强度计算，标签永不进特征）。`grid_res>0.002` 时警告并在 `resolution_metadata.resolution_contract_booleans` 记 `crack_resolvable=false`（轻裂中位缝宽 1.8mm 需要点间距≪缝宽；点间距-缝宽耦合偏差警告依据 DOI 10.3390/s26082338）。传感门（设计稿 sensor_gate）：门场景 2×2m@grid_res=0.001、step_m=0.0025、横向 1mm，名义 800 剖面×2000 点=1.6M 点，min_points=1280000（≥80% 存活下限）、max_flyer_ratio=0.005；实测 flyer_ratio/dropped_ratio/profile_count/points_per_profile_median 逐场景落 `sensor_output.line_profiler`。`crack_resolvable` 与 het 网格充分性（`het_grid_adequate`）记录在 `resolution_metadata.resolution_contract_booleans` 结构化块中（键名带 _booleans 后缀以与 npz 标量键 `resolution_contract`（版本字符串）消歧）。传感器模块 `roadmc/data/synthetic/line_profiler.py` 已交付（配置类 `LineProfilerConfig` 唯一真源在 config.py，模块经 `from .config import` 引用）；模块缺失的构建下该档位报'未安装'类清晰错误，不影响 on/off；暂仅单块路径，与分段体制组合显式拒绝。**设计方裁定（2026-10 修复批）**：本档位跳过几何遮挡步（遮挡模型用车载 2m 位姿，与线激光头 0.35m 几何不符）与步骤 10 输出采样——剖面点云即本档位的产出物，固定点数随机抽稀会打断横向剖面相邻性；`num_points`/`target_density` 被忽略并记 `sensor_output.ignored_under_line_profiler=true`（与 observation off 的忽略记录同型）。
+
+**基层条件与病害因果链（默认关闭）**：`--causality on` 启用。每场景抽 (SNP, 龄期, YE4)，由 HDM-4 路线推导结构性裂缝起始年 ICA = CDS^a0·exp(a1·SNP + a2·YE4/SNP²) + CRT（系数 a0=4.21/a1=0.14/a2=−17.1 为 HDM-4 Volume Five Table B3-4 数值，经 Malaysian J. Civil Eng. 27(1):121-143, 2015 转引核实，utm.txt:677-684——**导入系数、非自校准**）；硬规则：age_years<ICA 时结构性裂缝出现概率强制为 0（SNP/龄期区间可用 `--snp-range LO HI` 与 `--age-range LO HI` 覆盖，默认 3.0–5.5 与 0.0–15.0）；坑槽 ⇒（有裂缝 ∨ age≥ICA）、修补 ⇒ 场景病害史含裂缝标记（共现概率 = base·clip(age/ICA−1,0,1)+0.5·base，**函数形式为工程假设**）；`--tpm-path` 可导入 Markov 状态转移概率矩阵 JSON（行随机、对角占优、sound 行上三角——病害不可逆），π=π0·P^age 调制 disease_probs（缩放因子落元数据）。受控场景（generate_class_budget 的显式物理配方）绕过全部因果约束。逐场景抽取值写入顶层 `base_condition` 元数据。回退 = `--causality off`（即不传）。
+
+**het 调制场相关长度新默认 0.01 m**：`MicroTextureConfig.het_corr_len_m` 默认 2.0→0.01（1cm 相关长度）。het_sigma_ln 默认 0，默认场景零行为差；het 开启的旧复现实验需 `--het-corr-len-m 2.0` 回退。1cm 相关长度在 5mm 网格仅 2 格，het 开启时建议 grid_res≤2mm（元数据 `surface_grid.het_modulation_grid_advisory`）。
+
+本批全部新参数与旧口径数据集的对比数字、AM 开启后的域差距读数：**待补正**。
 
 ## 模型训练
 
@@ -489,7 +527,7 @@ python roadmc/scripts/diagnose_domain_gap.py `
 | `target_label` | scalar | 受控场景强制注入的类别，非受控为 `-1` |
 | `feature_schema` | scalar | 必须为 `roadmc.observable_features.v1` |
 | `coordinate_center` / `coordinate_scale` | `(3,)` / scalar | 可逆坐标归一化参数 |
-| `resolution_metadata_json` | scalar | JSON，含三层分辨率、保护采样审计和强度模型描述串（`sensor_output.intensity_model`）；v2 另含观测模型体制（`sensor_output.observation_model`、跳过步骤、遮挡策略）与条带分段计划（`surface_grid.segmentation`） |
+| `resolution_metadata_json` | scalar | JSON，含三层分辨率、保护采样审计和强度模型描述串（`sensor_output.intensity_model`）；v2 另含观测模型体制（`sensor_output.observation_model`、跳过步骤、遮挡策略）与条带分段计划（`surface_grid.segmentation`）；2026-10 结构批另含分辨率契约显式布尔（顶层 `resolution_contract_booleans`：`crack_resolvable`/`het_grid_adequate`）与 two-segment 谱形审计（`surface_grid.texture_spectrum`，含逐场景 `mpd_drawn_m`）、AM 包络审计（`surface_grid.am_envelope`，含实测 skew/kurt）、因果链维度（顶层 `base_condition`，含 SNP/龄期/ICA/TPM 出处）与 line-profiler 传感审计（`sensor_output.line_profiler`） |
 | `surface_grid_spacing_m` 等 | scalar | 表面网格间距/形状/点数、传感器输出点数、模型目标点数 |
 | `observation_model` / `segment_count` / `segment_length_m` / `segment_overlap_m` | scalar | 观测模型体制与条带分段计划（单块路径为 1 段全长、零重叠） |
 
@@ -558,7 +596,8 @@ readmeimage/
 - 修正域差距诊断中三类导致读数不可比的缺陷（法向来源、强度量程、采样窗口），联合 MMD 由 0.458 降到 0.136，并在 441 帧的扩展子集上复现。
 - 在生成器上恢复四项真实性配置（粗糙度混合、纹理沿程不均匀、缘石条带、辐射标定），默认关闭、关闭时输出与 v2 逐位一致；与真实侧的对比数字待补正。
 - 定位并规避 M2S-RoAD 的 `range == 0` 无效回波编码问题。
-- 落地 2026-10 生成器行为修正批（宏观谱 ISO 边际重构、病害伯努利采样、固定 AGC 标定、坑槽/车辙/沉陷/裂缝/水泥病害几何修正、死配置清理），全部旧口径保留为显式回退 flag；新旧行为的对比数字待补正。恢复纹理 MPD 物理回归测试（`tests/test_texture_metrics.py`，固定种子断言 MPD ∈ [0.35, 0.55] mm）。
+- 落地 2026-10 生成器行为修正批（宏观谱 ISO 边际重构、病害伯努利采样、固定 AGC 标定、坑槽/车辙/沉陷/裂缝/水泥病害几何修正、死配置清理），全部旧口径保留为显式回退 flag；新旧行为的对比数字待补正。
+- 落地 2026-10 结构批：two-segment 纹理谱形（VT 2015 两区间幂律，导入系数）、按 pavement_type 的 MPD 材质分档、AM 慢变包络（默认关闭）、病害过渡带剖面参数（缝深指数/缝缘崩碎带/坑缘剥落剖面/修补边缘剖面/错台圆角）、观测模型 line-profiler 档位分发钩子（传感器模块由传感组提供）、基层条件与病害因果链（HDM-4 导入系数 + TPM 占用调制，默认关闭，受控场景绕过）。旧口径全部可用显式 flag 回退；导入文献系数均显著标注"导入而非自校准"。
 
 ### 路线图
 
