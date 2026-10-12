@@ -59,6 +59,7 @@ RoadMC 包含两个同等重要的模块：
 | 架构对比 | ✅ 5 个主流点云分割架构按同一协议跑满 30 轮（见"架构对比"） |
 | 通道混合消融 | ✅ 4 个变体 × 3 个种子全部完成，变体间平均差小于组内波动，**不作机制性结论** |
 | 生成器真实性选项 | ✅ 粗糙度混合、纹理沿程不均匀、缘石条带、辐射标定四项已入码，全部默认关闭，不改变 v2 行为 |
+| 生成器行为修正 | ✅ 2026-10 修正批已入码：宏观谱 ISO 边际重构、病害伯努利采样、固定 AGC 标定、坑槽/车辙/沉陷/裂缝/水泥病害几何修正等，**改变默认输出**；旧口径全部保留为显式回退 flag（见"生成器行为修正与回退"），新旧行为对比数字**待补正** |
 | 域差距诊断 | v2 联合 MMD `0.136`（41 帧），441 帧扩展复核 `0.1368`；真实性配置的对比数字**待补正**（实现曾丢失，2026-10 已按规格重写并通过功能验收，待真实数据复验后回填） |
 | 真实域性能 | 无真实语义 mIoU。可用的 M2S-RoAD 样本不带标签，只用于域差距诊断 |
 
@@ -188,6 +189,8 @@ $$
 
 生成过程不是向规则网格添加随机噪声，而是先构造表面与病害，再模拟传感器采样。生成器显式区分三层分辨率：物理表面网格间距（`generate_synthetic.py` 用 `--surface-grid-spacing`，类别预算脚本用 `--grid-res`，v2 取 `0.02 m`）、传感器输出点数（`--num-points`）、下游模型输入点数。毫米级表面网格不会自动保留到最终点云，每场景的三层分辨率与保护采样记录都写入 `resolution_metadata_json`。
 
+边界声明：两类路面**共享同一几何宏观谱与纹理谱，不建模材料纹理分化**——`pavement_type` 只决定病害集合与强度材料先验（基线反照率），水泥拉毛/刻槽纹理、接缝周期谱分量等均为未实现的后续项；基层/路基/垫层相关机理（沉陷-软弱点耦合、反射裂缝、错台-唧泥成因链）同样不在建模范围内。
+
 ### 生成数据集
 
 ```powershell
@@ -275,6 +278,59 @@ python roadmc/scripts/generate_class_budget.py `
 ```
 
 这套配置对联合 MMD 的影响**待补正**：将用真实数据按上表同一规则复验后回填。
+
+### 生成器行为修正与回退（2026-10）
+
+2026-10 的一批审计修正**改变了若干默认生成行为**。新默认口径：
+
+- 宏观谱：ISO 带按 ISO 一维边际谱逐行重构权重，消除离散边际与 ISO 定义之间的系统性方差偏差，并取消实现级 std 重定标；
+- 病害选择：`disease_probs` 恢复文档声明的『出现概率』语义——逐病害独立伯努利抽样后按 `--max-diseases` 封顶，期望每场景病害数 ≈ Σp，**允许出现 0 病害的背景场景**（旧口径把概率归一化为权重、每场景恒定抽满，出现率远高于名义值）；
+- 强度 AGC：从逐场景 p99 归一改为固定绝对标定（`radiometric.agc_reference_power`，工程标定值）——沥青/水泥的材料基底签名在强度通道保留，不再随场景构成漂移；
+- 坑槽：轻/重两级共用 β~U(2,5)（仅凭剖面形状不再可 100% 判定轻/重，消除几何域标签泄漏），半径与深度加有界纵横比先验，微坑强度随破损面积增长，剥落标注不超出主凹陷足迹；
+- 沉陷：中心内缩量不小于当次采样半径（完整碗形恒在路面足迹内），标签盘半径显式化为影响半径 R；
+- 车辙：名义深度按 1/(1+ε) 归一（实现峰值不再越过 JTG 10/15mm 分界），中心走轮迹带先验（与裂缝/坑槽一致）；
+- 裂缝：走向扰动去周期化，缝宽判据侧截断改拒绝重采，面状裂缝槽形与线状裂缝的边缘连续原则对齐，并补 measure-then-label 标签机制；
+- 水泥病害：板裂缝限制在单一板块内、错台阶跃限于接缝两侧相邻两块板、边角剥落深度截断到档位上限、破碎板 Voronoi 脊线刻槽按板裁剪并取最大深度；
+- 泛油：从恒定 40% 面积、贯穿全路长的硬边界条带改为轮迹带上的随机斑块（面积占比 U(5%,25%)，logistic 平滑边界）；
+- 朗伯项：cosθ 不再取绝对值（背向面强度趋 0），反照率截断上限 0.95 → 0.98。
+
+每一项都保留显式回退通道（旧口径仅作回归对照保留，不是推荐配置）。两个生成脚本接受同一组 flag：
+
+| 回退 flag | 恢复的旧行为 |
+| --- | --- |
+| `--macro-spectrum legacy` | 历史点采样谱权重 + std 重定标 |
+| `--disease-sampling legacy` | 概率归一化加权恒定计数（`--no-stratified` 保留为其 bernoulli 旧别名，已弃用） |
+| `--pothole-beta-legacy` / `--pothole-micropits-legacy` / `--pothole-aspect-legacy` | 坑槽 β 字面量分级 / 钳制微坑计数 / 取消纵横比先验 |
+| `--pothole-spall-band 0.8 1.2` | 坑缘剥落环外扩到 1.2R |
+| `--agc-mode scene-p99` | 逐场景 p99 AGC |
+| `--rutting-modulation-legacy` / `--rutting-center-legacy` | 取消深度归一 / 车辙中心恒在中线 |
+| `--crack-perturb-legacy` / `--crack-width-trunc clip` / `--areacrack-lambda-legacy` / `--areacrack-label-legacy` | 裂缝走向周期化环绕 / 缝宽钳制 / λ=w/2 槽形 / 面状标签直接采信 severity |
+| `--concrete-legacy` | 水泥四项旧行为（板缝跨板、错台全条带、剥落无界指数、脊线逐条累加） |
+| `--depression-center-legacy` / `--depression-label-legacy` | 沉陷固定内缩 0.5 m / depth·1% 隐式标签外扩 |
+| `--bleeding-geometry-legacy` | 泛油恒定 40% 面积条带 |
+| `--lambert-abs-legacy` / `--albedo-clip-hi 0.95` | cosθ 取绝对值 / 反照率上限 0.95 |
+| `--micro-texture-grid-legacy` / `--het-field-1d` | 纹理谱频率网格历史口径 / het 一维调制场 |
+
+同一命令把全部口径恢复到 2026-10 之前（供回归门使用）：
+
+```powershell
+python roadmc/scripts/generate_synthetic.py `
+  --macro-spectrum legacy --disease-sampling legacy `
+  --pothole-beta-legacy --pothole-micropits-legacy --pothole-aspect-legacy `
+  --pothole-spall-band 0.8 1.2 --agc-mode scene-p99 `
+  --rutting-modulation-legacy --rutting-center-legacy `
+  --crack-perturb-legacy --crack-width-trunc clip `
+  --areacrack-lambda-legacy --areacrack-label-legacy --concrete-legacy `
+  --depression-center-legacy --depression-label-legacy `
+  --bleeding-geometry-legacy --lambert-abs-legacy --albedo-clip-hi 0.95 `
+  --micro-texture-grid-legacy
+```
+
+配置 schema 同步变更（构造时传旧关键字会报 `TypeError`）：`PotholeConfig` 删除 `max_radius_light` / `edge_spall_prob`；`DepressionConfig.max_radius` 改为 `radius_range=(0.5, 2.0)`；`RavelingConfig.pitting_depth` 改为 `erosion_depth=(0.002, 0.005)`；`BleedingConfig.intensity_boost`（实测对输出零影响的死参数）改为 `intensity_multiplier=0.55`；`MicroTextureConfig.octaves` 删除（谱合成路径早已不使用）；`CrackConfig.severity_ratio` 改为 `None`（= 使用 `disease.severity_ratio`）并接线为裂缝专属覆盖。这些字段此前从未被读取或从未被正确读取（名实不符），详见 config.py 内注释。
+
+合入顺序说明：上述口径中的一部分由 `primitives.py` 侧消费（谱重构、坑槽/裂缝/水泥几何、沉陷标签半径、纹理网格口径、het 场维度）。生成器的装配层按两类通道下发：签名级新增 kwargs（如 `macro_spectrum_mode`）按基元当前签名转发或剔除；`params` 字典内的键始终随字典下发，但装配层会检查基元源码是否已读取该键。基元侧批次尚未合入时，"请求行为 ≠ 基元当前行为"的键每键发一次警告，并写入场景元数据 `pending_primitive_upgrades`（该元数据按场景准确记录，只含本场景实际遇到的键）；请求行为 = 基元当前行为（即全部回退 flag 的 legacy 等价值）的键静默——因此 full-legacy 回退运行的待合入集合为空，与新默认运行在回归门上可区分，不会无声地宣称已切换。基元侧合入后同一装配代码自动生效，待合入集合随之变空。
+
+新默认口径与旧口径数据集（含与真实侧）的对比数字：**待补正**。
 
 ## 模型训练
 
@@ -454,6 +510,8 @@ python roadmc/scripts/diagnose_domain_gap.py `
 | 34 | 坑洞 | 35 | 拱起 |
 | 36 | 露骨 | 37 | 水泥修补 |
 
+> 注：标签 17-18（波浪拥包）的轻/重分级口径（单侧波高 vs 峰谷差）需人工核对 JTG 5210-2018 原文，当前实现按单侧波高。
+
 ## 仓库结构
 
 ```text
@@ -500,6 +558,7 @@ readmeimage/
 - 修正域差距诊断中三类导致读数不可比的缺陷（法向来源、强度量程、采样窗口），联合 MMD 由 0.458 降到 0.136，并在 441 帧的扩展子集上复现。
 - 在生成器上恢复四项真实性配置（粗糙度混合、纹理沿程不均匀、缘石条带、辐射标定），默认关闭、关闭时输出与 v2 逐位一致；与真实侧的对比数字待补正。
 - 定位并规避 M2S-RoAD 的 `range == 0` 无效回波编码问题。
+- 落地 2026-10 生成器行为修正批（宏观谱 ISO 边际重构、病害伯努利采样、固定 AGC 标定、坑槽/车辙/沉陷/裂缝/水泥病害几何修正、死配置清理），全部旧口径保留为显式回退 flag；新旧行为的对比数字待补正。恢复纹理 MPD 物理回归测试（`tests/test_texture_metrics.py`，固定种子断言 MPD ∈ [0.35, 0.55] mm）。
 
 ### 路线图
 

@@ -16,8 +16,11 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import math
 import os
+import textwrap
 import warnings
 
 import numpy as np
@@ -39,7 +42,11 @@ try:
     )
     from .config import (
         NUM_CLASSES,
+        BleedingConfig,
+        DepressionConfig,
         GeneratorConfig,
+        PatchingConfig,
+        PotholeConfig,
     )
     from .labels import TargetLabelSpec, target_spec_for_label
     from .primitives import (
@@ -72,7 +79,11 @@ except ImportError:
             _sys.path.insert(0, _p)
     from config import (  # type: ignore[no-redef]
         NUM_CLASSES,
+        BleedingConfig,
+        DepressionConfig,
         GeneratorConfig,
+        PatchingConfig,
+        PotholeConfig,
     )
     from labels import TargetLabelSpec, target_spec_for_label  # type: ignore[no-redef]
     from primitives import (  # type: ignore[no-redef]
@@ -146,8 +157,12 @@ DISEASE_APPLY_ORDER: dict[str, int] = {
 
 # P1-3 修复：病害标签优先级，数值越高优先级越高
 # 当多个病害覆盖同一区域时，仅保留优先级最高的标签
-# 设计原则：坑槽 > 龟裂 > 纵向裂缝 > 块状裂缝 > 横向裂缝，
-# 大面积病害（车辙、沉陷、波浪拥包）优先级低于局部病害
+# 设计原则（与下表一致）：坑槽 > 龟裂 > 纵向裂缝 > 横向裂缝 ≥ 块状
+# 裂缝（重横向 8→4 高于重块状 4→3；轻横向 7 与重块状 4 同为 3），
+# 大面积病害（车辙、沉陷、波浪拥包）优先级低于局部病害。
+# 打平时的确定性策略：**后应用者保留**——restore 条件是
+# old_prio > new_prio 严格大于，优先级相等时后写入的新标签胜出，
+# 应用先后由 DISEASE_APPLY_ORDER 决定。
 LABEL_PRIORITY: dict[int, int] = {
     0: 0,    # 背景
     # 沥青路面 — 局部破损优先级最高，大面积病害较低
@@ -190,6 +205,428 @@ LABEL_PRIORITY: dict[int, int] = {
     36: 4,   # 露骨
     37: 8,   # 水泥修补
 }
+
+
+# ----------------------------------------------------------------------
+# 病害几何采样助手（单块路径与分段计划路径共用；同一 helper 保证两条
+# 路径的 rng 消耗顺序一致）
+# ----------------------------------------------------------------------
+
+def _sample_wheelpath_x(rng: np.random.Generator, width: float) -> float:
+    """轮迹带横向先验：车道中心 ±0.9 m 的双峰高斯混合（σ=0.25 m）。
+
+    疲劳类病害（龟裂、纵缝、坑槽、车辙）机理上集中在轮迹带；
+    双轮迹间距取 RuttingConfig 的 1.8 m 口径。
+    """
+    center = width / 2.0
+    offset = 0.9 if rng.random() < 0.5 else -0.9
+    return float(np.clip(rng.normal(center + offset, 0.25), 0.3, max(width - 0.3, 0.31)))
+
+
+def _sample_pothole_geometry(
+    rng: np.random.Generator,
+    cfg: PotholeConfig,
+    severity: str,
+) -> tuple[float, float]:
+    """坑槽 (radius, depth) 采样。
+
+    轻/重共用半径区间 [0.05, max_radius_severe]（半径不按严重度切
+    分——解耦设计，平面半径不得成为 100% 可分的非规范线索）；深度
+    按严重度取各自档位。``aspect_ratio_range`` 非 None 时按有界纵横
+    比先验 d/R ∈ (lo, hi) 拒绝重采（排除沉陷碟形与近竖井类非物理
+    极端几何；设计界，非标准规定）；None = 历史 R、d 独立采样。
+    """
+    if cfg.aspect_ratio_range is None:
+        radius = float(rng.uniform(0.05, cfg.max_radius_severe))
+        if severity == "light":
+            depth = float(rng.uniform(0.005, cfg.max_depth_light))
+        else:
+            depth = float(rng.uniform(cfg.max_depth_light * 1.1, cfg.max_depth_severe))
+        return radius, depth
+    lo, hi = cfg.aspect_ratio_range
+    while True:
+        radius = float(rng.uniform(0.05, cfg.max_radius_severe))
+        if severity == "light":
+            depth = float(rng.uniform(0.005, cfg.max_depth_light))
+        else:
+            depth = float(rng.uniform(cfg.max_depth_light * 1.1, cfg.max_depth_severe))
+        ratio = depth / radius
+        if lo <= ratio <= hi:
+            return radius, depth
+
+
+def _sample_depression_geometry(
+    rng: np.random.Generator,
+    cfg: DepressionConfig,
+    width: float,
+    length: float,
+) -> tuple[float, float, float]:
+    """沉陷 (cx, cy, radius) 采样。
+
+    ``center_inset_mode='radius'``（默认）：先拒绝重采 R ≤
+    min(W, L)/2，再令中心内缩量 ≥ R（cx ∈ [R, W−R]、cy ∈ [R, L−R]），
+    完整碗形恒在路面足迹内；``'legacy'``：历史固定内缩 0.5 m（碗形
+    可被路缘截断）。
+    """
+    lo_r, hi_r = cfg.radius_range
+    if cfg.center_inset_mode == "legacy":
+        cx = float(rng.uniform(0.5, width - 0.5))
+        cy = float(rng.uniform(0.5, length - 0.5))
+        radius = float(rng.uniform(lo_r, hi_r))
+        return cx, cy, radius
+    half_min = min(width, length) / 2.0
+    if lo_r > half_min:
+        raise ValueError(
+            f"depression radius_range lower bound {lo_r:g} m exceeds half the "
+            f"smaller road extent ({half_min:g} m): no full bowl fits the "
+            "footprint. Shrink radius_range or enlarge the road."
+        )
+    while True:
+        radius = float(rng.uniform(lo_r, hi_r))
+        if radius <= half_min:
+            break
+    cx = float(rng.uniform(radius, width - radius))
+    cy = float(rng.uniform(radius, length - radius))
+    return cx, cy, radius
+
+
+def _bleeding_hash01(x: np.ndarray, y: np.ndarray, salt: int) -> np.ndarray:
+    """确定性逐点散列，返回 [0, 1) 均匀值（泛油边界过渡判定用）。
+
+    同一物理坐标在任何分段窗口得到同一取值——云无关，保证缝两侧
+    标签逐位一致。与 primitives 的坐标哈希同族，此处独立实现以免
+    耦合基元内部约定。
+    """
+    h = np.sin(x * 127.1 + y * 311.7 + float(salt) * 74.7) * 43758.5453
+    return h - np.floor(h)
+
+
+def _bleeding_patch_params(
+    rng: np.random.Generator,
+    cfg: BleedingConfig,
+    width: float,
+    length: float,
+    salt: int,
+) -> dict:
+    """泛油斑块参数（``geometry_mode='patch'`` 口径）。
+
+    中心走轮迹带先验（机理上泛油与轮迹带交通作用相关）、y 向有限
+    长度、面积占比 U(5%, 25%)（设计先验）。面积分解：w = f·W·u、
+    l = L/u（u ∈ [1.5, min(4, 0.95/f)]），保证 w ≤ W、l ≤ L 且
+    w·l = f·W·L 精确成立。
+    """
+    frac = float(rng.uniform(0.05, 0.25))
+    u = float(rng.uniform(1.5, min(4.0, 0.95 / frac)))
+    w_band = min(frac * width * u, width)
+    l_band = length / u
+    cx = _sample_wheelpath_x(rng, width)
+    cy = float(rng.uniform(l_band / 2.0, length - l_band / 2.0))
+    return {
+        "center": (cx, cy),
+        "width": w_band,
+        "length": l_band,
+        "salt": int(salt),
+    }
+
+
+def _bleeding_region_mask(points: np.ndarray, patch: dict) -> np.ndarray:
+    """泛油斑块的布尔掩码：长方形斑块 + logistic 边界过渡。
+
+    p_in = σ(−signed_dist/τ)，τ = 0.025 m ⇒ 10-90% 过渡带 ≈ 0.11 m
+    （消除历史硬二值边界）；逐点用确定性散列判定（同一物理点在任
+    何段窗口得到同一标签决策，云无关）。
+    """
+    cx, cy = patch["center"]
+    w_band, l_band = float(patch["width"]), float(patch["length"])
+    dx = np.abs(points[:, 0] - cx)
+    dy = np.abs(points[:, 1] - cy)
+    signed_dist = np.maximum(dx - w_band / 2.0, dy - l_band / 2.0)
+    tau = 0.025
+    with np.errstate(over="ignore"):
+        p_in = 1.0 / (1.0 + np.exp(signed_dist / tau))
+    u01 = _bleeding_hash01(points[:, 0], points[:, 1], patch["salt"])
+    return u01 < p_in
+
+
+def _lambert_cos_theta(
+    normals: np.ndarray,
+    d_hat: np.ndarray,
+    cos_abs: bool,
+) -> np.ndarray:
+    """朗伯入射角因子：cosθ = n·(−d̂)（I ∝ ρ·cosθ/R² 的几何项）。
+
+    ``cos_abs=False``（默认）：直接取 n·(−d̂)，背向面 clip 到 0，
+    下限 0.03 仅保留给数值稳定的前向掠射点（0 < cosθ < 0.03）。
+    ``cos_abs=True``：历史口径 clip(|n·(−d̂)|, 0.03, 1)——背向面被
+    当作朝向前亮度（物理方向错误，仅作回退通道保留，
+    CLI --lambert-abs-legacy）。车载俯视路面（法向 ≈ +z、传感器在
+    上）下两种口径差异集中在侧向路缘/坑壁背光面。
+    """
+    raw = np.sum(normals * (-d_hat), axis=1)
+    if cos_abs:
+        return np.clip(np.abs(raw), 0.03, 1.0)
+    cos_t = np.clip(raw, 0.0, 1.0)
+    return np.where(cos_t > 0.0, np.maximum(cos_t, 0.03), 0.0)
+
+
+# ----------------------------------------------------------------------
+# 装配层 ↔ 基元层的合入顺序桥接
+# ----------------------------------------------------------------------
+
+_WARNED_PENDING_KEYS: set[str] = set()
+"""已警告过的待合入键（每键每进程一次，避免批量生成刷屏）。"""
+
+# 本轮装配引入、需基元组消费的 params 键。披露范围仅限这些键——不检查
+# 基元 params 字典里的历史键（如从未被读取的 "grid_res"），避免把既有
+# 死键误报为待合入。
+_INTRODUCED_PARAMS_KEYS: frozenset = frozenset({
+    "beta_mode", "micropit_rate", "micropit_mode", "spall_band",
+    "perturb_mode", "width_truncation", "area_lambda_mode", "area_label_mode",
+    "crack_in_slab", "fault_scope", "edge_spall_mode", "shatter_mode",
+    "label_radius_mode", "modulation_epsilon", "removal_ratio", "erosion_depth",
+})
+
+# 请求值与基元当前行为等价的取值表：某键尚未被基元消费时，若请求值属于
+# 该集合，则行为与基元当前实现一致——跳过/忽略不构成降级，无需披露
+# （例如 full-legacy 回退运行在当前树上应得到空的待合入集合）。值为集合
+# 时任一成员相等即等价；无条目的键请求任何值都视为新行为。
+_LEGACY_EQUIVALENT_VALUES: dict[str, frozenset] = {
+    "macro_spectrum_mode": frozenset({"legacy"}),
+    "grid_convention": frozenset({"legacy"}),
+    "het_field": frozenset({"1d"}),
+    "label_radius_mode": frozenset({"legacy-1pct"}),
+    "beta_mode": frozenset({"legacy"}),
+    "micropit_mode": frozenset({"legacy"}),
+    "perturb_mode": frozenset({"legacy"}),
+    "width_truncation": frozenset({"clip"}),
+    "area_lambda_mode": frozenset({"half"}),
+    "area_label_mode": frozenset({"legacy"}),
+    "fault_scope": frozenset({"legacy-strip"}),
+    "edge_spall_mode": frozenset({"legacy"}),
+    "shatter_mode": frozenset({"legacy"}),
+    "crack_in_slab": frozenset({False}),
+    "aspect_ratio_range": frozenset({None}),
+    "spall_band": frozenset({(0.8, 1.2)}),
+    "modulation_epsilon": frozenset({0.2}),
+    "removal_ratio": frozenset({0.05, 0.20}),
+    "erosion_depth": frozenset({(0.002, 0.005)}),
+}
+
+# 受模式键治理的键：模式键取等价值时被治理键不参与行为（如
+# micropit_mode='legacy' 下旧实现按钳制计数，micropit_rate 不生效），
+# 一并静默。
+_PARAM_MOOT_UNDER: dict[str, tuple[str, frozenset]] = {
+    "micropit_rate": ("micropit_mode", frozenset({"legacy"})),
+}
+
+
+def _surface_moot_keys(micro_cfg) -> frozenset:
+    """当前配置下行为无关（取任何值输出都相同）的表面装配键集合。
+
+    het_sigma_ln == 0 时 het 调制整体关闭——primitives.py 单块路径
+    （``if texture_het_sigma_ln > 0.0``，约 433 行）与条带路径
+    （约 683 行）双重门控——het_field 取 '1d'/'2d' 行为完全相同，
+    故此时 het_field 不进入待合入披露。这正是 full-legacy 回退配方
+    刻意不含 ``--het-field-1d`` 的依据（het 默认关闭，het_field 无
+    默认行为变更，设计稿 tuning#10）：缺少本规则时回退运行会把
+    het_field 误报为 pending，违背 README『full-legacy 回退运行的
+    待合入集合为空』的回归门契约。sigma > 0 时调制实际生效，
+    het_field 恢复参与披露（'2d' 未合入 → pending，'1d' → 等价静默）。
+    """
+    if float(getattr(micro_cfg, "het_sigma_ln", 0.0)) <= 0.0:
+        return frozenset({"het_field"})
+    return frozenset()
+
+_PARAMS_SOURCE_CACHE: dict[int, str] = {}
+
+
+def _register_pending(key: str, callee_name: str) -> None:
+    if key not in _WARNED_PENDING_KEYS:
+        _WARNED_PENDING_KEYS.add(key)
+        warnings.warn(
+            f"primitive {callee_name!r} does not consume {key!r} yet "
+            "(primitives-side change pending); the generator keeps the "
+            "primitive's current behaviour for this knob and the scene "
+            "metadata records it under 'pending_primitive_upgrades'.",
+            stacklevel=3,
+        )
+
+
+def _primitive_accepts_kwarg(callee, name: str) -> bool:
+    try:
+        sig = inspect.signature(callee)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+
+
+def _primitive_source_text(callee) -> str:
+    cached = _PARAMS_SOURCE_CACHE.get(id(callee))
+    if cached is None:
+        try:
+            cached = inspect.getsource(callee)
+        except (OSError, TypeError):
+            cached = ""
+        _PARAMS_SOURCE_CACHE[id(callee)] = cached
+    return cached
+
+
+def _params_key_consumed(callee, key: str, _depth: int = 0) -> bool:
+    """键是否被基元从 params 读取（AST 静态分析，非子串匹配）。
+
+    用 ``ast`` 解析基元源码，只识别三种真实读取形态：
+    ``params["key"]``、``params.get("key"[, ...])``、``"key" in params``
+    （含 ``not in``）。注释与 docstring 不产生对应 AST 节点，不会再
+    因源码文本中出现键名而误判为"已消费"（静默漏报的方向被关闭）。
+    ``inspect.getsource`` 失败或语法解析失败时按未消费处理
+    （over-report，披露语义的安全方向）。另跟随一层"把 params 作为
+    实参传给同一定义命名空间内函数"的调用（经 ``__globals__`` 解析，
+    覆盖键在辅助函数内读取的常见形态）；更深层的间接读取（别名、
+    跨模块）仍按未消费处理并在此声明。
+    """
+    src = _primitive_source_text(callee)
+    if not src:
+        return False
+    try:
+        tree = ast.parse(textwrap.dedent(src))
+    except SyntaxError:
+        return False
+
+    def _const_str(node) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return None
+
+    def _is_params(node) -> bool:
+        return isinstance(node, ast.Name) and node.id == "params"
+
+    helper_names: set[str] = set()
+    for node in ast.walk(tree):
+        # params["key"]
+        if (
+            isinstance(node, ast.Subscript)
+            and _is_params(node.value)
+            and _const_str(node.slice) == key
+        ):
+            return True
+        # params.get("key"[, ...])
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and _is_params(node.func.value)
+            and node.args
+            and _const_str(node.args[0]) == key
+        ):
+            return True
+        # "key" in params / "key" not in params
+        if (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], (ast.In, ast.NotIn))
+            and _const_str(node.left) == key
+            and len(node.comparators) == 1
+            and _is_params(node.comparators[0])
+        ):
+            return True
+        # helper(..., params, ...) → 记录候选辅助函数，稍后一层跟随
+        if (
+            _depth == 0
+            and isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and any(_is_params(a) for a in node.args)
+        ):
+            helper_names.add(node.func.id)
+
+    if _depth == 0 and helper_names:
+        # 用函数自身的定义命名空间解析辅助函数（不依赖 sys.modules，
+        # 动态加载的模块同样适用）。
+        namespace = getattr(callee, "__globals__", None) or {}
+        for name in helper_names:
+            helper = namespace.get(name)
+            if callable(helper) and _params_key_consumed(helper, key, _depth=1):
+                return True
+    return False
+
+
+def _filter_unsupported_kwargs(
+    callee, requested: dict, moot_keys: frozenset = frozenset()
+) -> tuple[dict, list[str]]:
+    """顶层 kwargs 桥接：签名支持的键透传；不支持的键剔除。
+
+    被剔除键的处理顺序：(1) 属于 ``moot_keys``（当前配置下行为无关，
+    任何取值输出相同，见 ``_surface_moot_keys``）→ 静默剔除，不披露；
+    (2) 请求值等于 ``_LEGACY_EQUIVALENT_VALUES`` 中的等价值（基元
+    当前行为即所请求行为）→ 静默剔除；(3) 其余登记/警告并返回键名，
+    由调用方并入场景级待合入集合。返回 ``(可转发子集, 本次待合入键)``。
+    """
+    try:
+        sig = inspect.signature(callee)
+    except (TypeError, ValueError):
+        return dict(requested), []
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return dict(requested), []
+    names = frozenset(sig.parameters)
+    accepted: dict = {}
+    pending: list[str] = []
+    callee_name = getattr(callee, "__name__", str(callee))
+    for key, value in requested.items():
+        if key in names:
+            accepted[key] = value
+        elif key in moot_keys:
+            pass  # 当前配置下行为无关，静默剔除
+        elif value in _LEGACY_EQUIVALENT_VALUES.get(key, frozenset()):
+            pass  # 请求值 = 基元当前行为，静默剔除
+        else:
+            pending.append(key)
+            _register_pending(key, callee_name)
+    return accepted, pending
+
+
+def _pending_params_keys(callee, params: dict) -> list[str]:
+    """params 嵌套键的待合入披露（键仍随 params 下发，不剔除）。
+
+    仅检查本轮装配引入的键（``_INTRODUCED_PARAMS_KEYS``）。判定顺序：
+    受模式键治理且模式等价 → 静默；基元源码已从 params 读取该键（AST
+    判定，见 ``_params_key_consumed``）→ 已消费；请求值等于 legacy
+    等价值 → 静默；其余登记/警告并返回键名。
+    基元批次合入后源码引用出现，本函数自动变为空转。
+    """
+    callee_name = getattr(callee, "__name__", str(callee))
+    pending: list[str] = []
+    for key, value in params.items():
+        if key not in _INTRODUCED_PARAMS_KEYS:
+            continue
+        governor = _PARAM_MOOT_UNDER.get(key)
+        if governor is not None:
+            gov_key, gov_legacy = governor
+            if params.get(gov_key) in gov_legacy:
+                continue
+        if _params_key_consumed(callee, key):
+            continue
+        if value in _LEGACY_EQUIVALENT_VALUES.get(key, frozenset()):
+            continue
+        pending.append(key)
+        _register_pending(key, callee_name)
+    return pending
+
+
+def _bridge_depression_params(label_radius_mode: str) -> tuple[dict, list[str]]:
+    """add_depression 的 params 装配桥接（fix#13 基元侧未合入时降级披露）。
+
+    基元签名已支持 params 时透传；否则请求值为 'legacy-1pct'（基元当前
+    行为）时静默省略，其他请求值登记/警告为待合入。
+    """
+    if _primitive_accepts_kwarg(add_depression, "params"):
+        return {"params": {"label_radius_mode": label_radius_mode}}, []
+    if label_radius_mode in _LEGACY_EQUIVALENT_VALUES["label_radius_mode"]:
+        return {}, []
+    _register_pending("label_radius_mode", "add_depression")
+    return {}, ["label_radius_mode"]
+
 
 class SyntheticRoadDataset(_DatasetBase):
     """JTG 5210-2018 合成道路点云数据集。
@@ -348,11 +785,30 @@ class SyntheticRoadDataset(_DatasetBase):
 
         # 2. 路面宏观轮廓 + 纹理谱段 + 设计几何（单次谱合成，法向从
         # 最终高度场统一重算——纹理不再作为独立的逐点位移步骤）。
+        # 诚实化口径：两类路面**共享同一几何宏观谱与纹理谱**；
+        # pavement_type 仅影响病害集合与强度材料先验（基线反照率），
+        # 不建模材料纹理分化。本调用点已停传 pavement_type（fix#17
+        # 调用侧一半；基元签名中残留的形参由基元组批次移除，本组不动
+        # primitives.py）。
+        # macro_spectrum_mode/grid_convention/het_field 为本轮新增装配
+        # 键：基元签名尚未支持时由桥接层跳过转发。请求值等于基元当前
+        # 行为（legacy 等价值）的键静默；其余键记入本场景的
+        # pending_scene，随元数据 pending_primitive_upgrades 披露。
+        pending_scene: set[str] = set()
+        surface_extra, surface_pending = _filter_unsupported_kwargs(
+            generate_road_surface,
+            {
+                "macro_spectrum_mode": self.config.road.macro_spectrum_mode,
+                "grid_convention": self.config.micro_texture.grid_convention,
+                "het_field": self.config.micro_texture.het_field,
+            },
+            moot_keys=_surface_moot_keys(self.config.micro_texture),
+        )
+        pending_scene.update(surface_pending)
         points, normals = generate_road_surface(
             width=width,
             length=length,
             grid_res=grid_res,
-            pavement_type=pavement_type,
             roughness_class=roughness_actual,
             seed=int(rng.integers(0, 2 ** 31)),
             texture_rms=self.config.micro_texture.amplitude,
@@ -362,6 +818,7 @@ class SyntheticRoadDataset(_DatasetBase):
             longitudinal_grade=self.config.road.longitudinal_grade,
             texture_het_sigma_ln=self.config.micro_texture.het_sigma_ln,
             texture_het_corr_len_m=self.config.micro_texture.het_corr_len_m,
+            **surface_extra,
         )
         # 2.4 缘石条带（可选）：行车道横向外侧的抬高顶面条带，几何确定性、
         # 零 rng 消耗。此处只**生成**、暂不并入——第 3 步病害与第 5 步松散
@@ -495,7 +952,14 @@ class SyntheticRoadDataset(_DatasetBase):
                 params: dict = {
                     "d_max": 0.010 if severity == "light" else 0.030,
                     "label_width_floor": grid_res,
+                    # 裂缝形态/截断口径（primitives 侧消费；键名与
+                    # config.crack 字段一一对应）
+                    "perturb_mode": self.config.crack.perturb_mode,
+                    "width_truncation": self.config.crack.width_truncation,
+                    "area_lambda_mode": self.config.crack.area_lambda_mode,
+                    "area_label_mode": self.config.crack.area_label_mode,
                 }
+                pending_scene.update(_pending_params_keys(add_crack, params))
                 if crack_type == "longitudinal":
                     # 纵缝先验：轮迹带边缘（带中心 ±0.3m 摆动）
                     params["x_center"] = self._sample_wheelpath_x(rng, width) + float(
@@ -522,56 +986,88 @@ class SyntheticRoadDataset(_DatasetBase):
                     cy = float(rng.uniform(0.5, length - 0.5))
                 # JTG 5210-2018 坑槽轻/重仅按深度 (25mm) 分级；平面半径
                 # 与严重度解耦采样——旧实现按严重度硬切半径区间，使
-                # 轻/重可被平面尺寸这一非规范线索 100% 分离。
-                radius = float(rng.uniform(0.05, self.config.pothole.max_radius_severe))
-                if severity == "light":
-                    depth = float(rng.uniform(0.005, self.config.pothole.max_depth_light))
-                else:
-                    depth = float(rng.uniform(
-                        self.config.pothole.max_depth_light * 1.1,
-                        self.config.pothole.max_depth_severe,
-                    ))
+                # 轻/重可被平面尺寸这一非规范线索 100% 分离。有界纵横
+                # 比先验拒绝非物理 d/R 极端（config
+                # pothole.aspect_ratio_range；None = 历史独立采样）。
+                radius, depth = _sample_pothole_geometry(
+                    rng, self.config.pothole, severity
+                )
                 edge_quality = float(rng.uniform(0.5, 1.0))
+                pothole_params = {
+                    # β/微坑/剥落环口径（primitives 侧消费；键名与
+                    # config.pothole 字段一一对应）
+                    "beta_mode": self.config.pothole.beta_mode,
+                    "micropit_rate": self.config.pothole.micropit_rate,
+                    "micropit_mode": self.config.pothole.micropit_mode,
+                    "spall_band": tuple(self.config.pothole.spall_band),
+                }
+                pending_scene.update(_pending_params_keys(add_pothole, pothole_params))
                 points, labels = add_pothole(
                     points, labels,
                     center=(cx, cy), radius=radius, depth=depth,
                     edge_quality=edge_quality, severity=severity,
                     seed=seed,
                     beta_range=self.config.pothole.beta_range,
+                    params=pothole_params,
                 )
 
             elif disease_type == "depression":
-                cx = float(rng.uniform(0.5, width - 0.5))
-                cy = float(rng.uniform(0.5, length - 0.5))
-                radius = float(rng.uniform(0.5, self.config.depression.max_radius))
+                cx, cy, radius = _sample_depression_geometry(
+                    rng, self.config.depression, width, length
+                )
                 if severity == "light":
                     depth = float(rng.uniform(*self.config.depression.depth_light))
                 else:
                     depth = float(rng.uniform(*self.config.depression.depth_severe))
+                # label_radius_mode 需基元组为 add_depression 增加 params
+                # 形参（fix#13 基元侧）；请求值等于基元当前行为
+                # （legacy-1pct）时静默省略，否则披露待合入。
+                dep_kwargs, dep_pending = _bridge_depression_params(
+                    self.config.depression.label_radius_mode
+                )
+                pending_scene.update(dep_pending)
                 points, labels = add_depression(
                     points, labels,
                     center=(cx, cy), radius=radius,
                     depth=depth, severity=severity, seed=seed,
+                    **dep_kwargs,
                 )
 
             elif disease_type == "rutting":
-                center_line = width / 2.0
+                # 车辙中心走轮迹带先验（与裂缝/坑槽一致；7m 双车道口径
+                # 仅建模内侧轮迹对——外侧两条轮迹不被疲劳病害命中的
+                # 现假设显性化）。'fixed' = 历史恒位于道路中线。
+                if self.config.rutting.center_mode == "wheelpath":
+                    center_line = self._sample_wheelpath_x(rng, width)
+                else:
+                    center_line = width / 2.0
                 wheel_sep = self.config.rutting.wheel_separation
                 if severity == "light":
                     # JTG 车辙起判阈值 10mm：5-10mm 不构成车辙病害。
                     depth = float(rng.uniform(0.010, self.config.rutting.max_depth_light))
                 else:
                     depth = float(rng.uniform(
-                        self.config.rutting.max_depth_light * 1.1,
+                        self.config.rutting.severe_min_depth,
                         self.config.rutting.max_depth_severe,
                     ))
+                if self.config.rutting.peak_normalize:
+                    # 名义深度按 1/(1+ε) 归一：primitives 的正弦调制使
+                    # 实现峰值 = d·(1+ε)·(track≤1)，除以 (1+ε) 后实现
+                    # 峰值 ≤ 名义深度（light ≤ 15mm、severe > 15mm，
+                    # 不再越过 JTG 档位分界）。
+                    depth = depth / (1.0 + self.config.rutting.modulation_epsilon)
                 rut_width = self.config.rutting.rut_width
+                rutting_params = {
+                    "modulation_epsilon": self.config.rutting.modulation_epsilon,
+                }
+                pending_scene.update(_pending_params_keys(add_rutting, rutting_params))
                 points, labels = add_rutting(
                     points, labels,
                     center_line=center_line,
                     wheel_separation=wheel_sep,
                     depth=depth, width=rut_width,
                     severity=severity, seed=seed,
+                    params=rutting_params,
                 )
 
             elif disease_type == "corrugation":
@@ -588,11 +1084,21 @@ class SyntheticRoadDataset(_DatasetBase):
                 )
 
             elif disease_type == "bleeding":
-                lane_center = rng.uniform(0.3, 0.7) * width
-                region_mask = (
-                    np.abs(points[:, 0] - lane_center)
-                    < self.config.bleeding.region_width * width / 2.0
-                )
+                if self.config.bleeding.geometry_mode == "patch":
+                    # 斑块口径：轮迹带中心、有限 y 长度、面积占比随机、
+                    # logistic 平滑边界（掩码逐点确定性，云无关）。
+                    patch = _bleeding_patch_params(
+                        rng, self.config.bleeding, width, length, salt=seed
+                    )
+                    region_mask = _bleeding_region_mask(points, patch)
+                else:
+                    # legacy-strip：恒定 40% 面积、贯穿全路长、硬二值
+                    # 边界的竖直条带（历史口径）。
+                    lane_center = rng.uniform(0.3, 0.7) * width
+                    region_mask = (
+                        np.abs(points[:, 0] - lane_center)
+                        < self.config.bleeding.region_width * width / 2.0
+                    )
                 labels = add_bleeding(
                     points, labels,
                     region_mask=region_mask, seed=seed,
@@ -633,7 +1139,17 @@ class SyntheticRoadDataset(_DatasetBase):
                         "x_offset": self.config.concrete_damage.x_offset,
                         "y_offset": self.config.concrete_damage.y_offset,
                         "label_width_floor": grid_res,
+                        # 水泥病害几何口径（primitives 侧消费；键名与
+                        # config.concrete_damage 字段一一对应；聚合回退
+                        # 为 CLI --concrete-legacy）
+                        "crack_in_slab": self.config.concrete_damage.crack_in_slab,
+                        "fault_scope": self.config.concrete_damage.fault_scope,
+                        "edge_spall_mode": self.config.concrete_damage.edge_spall_mode,
+                        "shatter_mode": self.config.concrete_damage.shatter_mode,
                     }
+                    pending_scene.update(
+                        _pending_params_keys(add_concrete_damage, params)
+                    )
                     points, labels = add_concrete_damage(
                         points, labels,
                         damage_type=damage_type, severity=sev,
@@ -729,9 +1245,21 @@ class SyntheticRoadDataset(_DatasetBase):
                 (points[:, 0] >= x_min_r) & (points[:, 0] <= x_max_r)
                 & (points[:, 1] >= y_min_r) & (points[:, 1] <= y_max_r)
             )
+            raveling_params = {
+                # 接线 config.raveling（默认值=历史硬编码，行为逐位不变；
+                # 不传 deterministic_seed 时仍走历史 rng 路径）。
+                "removal_ratio": (
+                    self.config.raveling.point_removal_ratio_light
+                    if severity == "light"
+                    else self.config.raveling.point_removal_ratio_severe
+                ),
+                "erosion_depth": tuple(self.config.raveling.erosion_depth),
+            }
+            pending_scene.update(_pending_params_keys(add_raveling, raveling_params))
             points, labels = add_raveling(
                 points, labels,
                 region_mask=region_mask, severity=severity, seed=seed,
+                params=raveling_params,
             )
 
         # 6. 松散标签膨胀 + NaN 点过滤
@@ -969,6 +1497,13 @@ class SyntheticRoadDataset(_DatasetBase):
         resolution_metadata = self.config.resolution_metadata(
             actual_output_points=len(points_final)
         )
+        if pending_scene:
+            # 本场景实际遇到的待合入键（场景级准确，不携带其他场景的登
+            # 记）：读取方据此知道哪些新口径尚未生效（基元侧改动未合
+            # 入）。full-legacy 回退运行下该集合为空、键不出现。
+            resolution_metadata["pending_primitive_upgrades"] = sorted(
+                pending_scene
+            )
         resolution_metadata["surface_grid"]["curvature_method"] = curvature_method
         resolution_metadata["sensor_output"].update(
             {
@@ -1154,6 +1689,9 @@ class SyntheticRoadDataset(_DatasetBase):
         #    （设计稿的云无关规则）。坑槽不需要预抽：影响半径 ≤0.45 m
         #    < halo，各相交段的扩展云包含**同一份**按同序排布的环带
         #    网格点，同种子下 rng.choice 选出同一点集。
+        # 场景级待合入键集合（与单块路径同语义；元数据只披露本场景遇到
+        # 的键，legacy 等价值请求静默）。
+        pending_scene: set[str] = set()
         x_max_grid = (nx - 1) * grid_res
         y_max_grid = (ny_total - 1) * grid_res
         x_grid_global = np.arange(0.0, width, grid_res)
@@ -1179,8 +1717,14 @@ class SyntheticRoadDataset(_DatasetBase):
                         "d_max": 0.010 if severity == "light" else 0.030,
                         "label_width_floor": grid_res,
                         "num_curve_samples": 400,
+                        # 裂缝形态/截断口径（与单块路径同键）
+                        "perturb_mode": config.crack.perturb_mode,
+                        "width_truncation": config.crack.width_truncation,
+                        "area_lambda_mode": config.crack.area_lambda_mode,
+                        "area_label_mode": config.crack.area_label_mode,
                     }
                 )
+                pending_scene.update(_pending_params_keys(add_crack, params))
                 if crack_type == "longitudinal":
                     x_center = self._sample_wheelpath_x(rng, width) + float(
                         rng.normal(0.0, 0.15)
@@ -1267,14 +1811,7 @@ class SyntheticRoadDataset(_DatasetBase):
                 else:
                     cx = self._sample_wheelpath_x(rng, width)
                     cy = float(rng.uniform(0.5, length - 0.5))
-                radius = float(rng.uniform(0.05, config.pothole.max_radius_severe))
-                if severity == "light":
-                    depth = float(rng.uniform(0.005, config.pothole.max_depth_light))
-                else:
-                    depth = float(rng.uniform(
-                        config.pothole.max_depth_light * 1.1,
-                        config.pothole.max_depth_severe,
-                    ))
+                radius, depth = _sample_pothole_geometry(rng, config.pothole, severity)
                 edge_quality = float(rng.uniform(0.5, 1.0))
                 entry["args"] = {
                     "center": (cx, cy),
@@ -1289,11 +1826,17 @@ class SyntheticRoadDataset(_DatasetBase):
                 # 截断剥落环）。
                 params["deterministic_seed"] = seed
                 params["pit_seed"] = int(rd.integers(0, 2 ** 31))
+                # β/微坑/剥落环口径（与单块路径同键）
+                params["beta_mode"] = config.pothole.beta_mode
+                params["micropit_rate"] = config.pothole.micropit_rate
+                params["micropit_mode"] = config.pothole.micropit_mode
+                params["spall_band"] = tuple(config.pothole.spall_band)
+                pending_scene.update(_pending_params_keys(add_pothole, params))
 
             elif disease_type == "depression":
-                cx = float(rng.uniform(0.5, width - 0.5))
-                cy = float(rng.uniform(0.5, length - 0.5))
-                radius = float(rng.uniform(0.5, config.depression.max_radius))
+                cx, cy, radius = _sample_depression_geometry(
+                    rng, config.depression, width, length
+                )
                 if severity == "light":
                     depth = float(rng.uniform(*config.depression.depth_light))
                 else:
@@ -1301,22 +1844,39 @@ class SyntheticRoadDataset(_DatasetBase):
                 entry["args"] = {
                     "center": (cx, cy), "radius": radius, "depth": depth,
                 }
+                # 标签半径口径在施加阶段经 _bridge_depression_params 下发
+                # （请求值等于基元当前行为时静默，否则记入场景待合入集合）。
+                entry["label_radius_mode"] = config.depression.label_radius_mode
 
             elif disease_type == "rutting":
+                # 车辙中心走轮迹带先验（与单块路径同口径、同 rng 消耗
+                # 顺序：先中心后深度）；'fixed' = 历史恒位于道路中线。
+                if config.rutting.center_mode == "wheelpath":
+                    center_line = self._sample_wheelpath_x(rng, width)
+                else:
+                    center_line = width / 2.0
                 if severity == "light":
                     depth = float(rng.uniform(0.010, config.rutting.max_depth_light))
                 else:
                     depth = float(rng.uniform(
-                        config.rutting.max_depth_light * 1.1,
+                        config.rutting.severe_min_depth,
                         config.rutting.max_depth_severe,
                     ))
+                if config.rutting.peak_normalize:
+                    # 与单块路径同式：实现峰值 = d·(1+ε) ≤ 名义深度。
+                    depth = depth / (1.0 + config.rutting.modulation_epsilon)
                 entry["args"] = {
-                    "center_line": width / 2.0,
+                    "center_line": center_line,
                     "wheel_separation": config.rutting.wheel_separation,
                     "width": config.rutting.rut_width,
                 }
-                # 全局 y 幅 × 0.5（设计稿：不得用段内云 y 范围，分段会漂移）
-                params["modulation_wavelength"] = length * 0.5
+                # 全局 y 幅 × modulation_wavelength_ratio（设计稿：不得用
+                # 段内云 y 范围，分段会漂移）
+                params["modulation_wavelength"] = (
+                    length * config.rutting.modulation_wavelength_ratio
+                )
+                params["modulation_epsilon"] = config.rutting.modulation_epsilon
+                pending_scene.update(_pending_params_keys(add_rutting, params))
                 entry["depth"] = depth
 
             elif disease_type == "corrugation":
@@ -1338,40 +1898,20 @@ class SyntheticRoadDataset(_DatasetBase):
                 params["envelope_sigma"] = float(rd.uniform(0.7, 1.3))
 
             elif disease_type == "bleeding":
-                entry["lane_center"] = float(rng.uniform(0.3, 0.7) * width)
+                if config.bleeding.geometry_mode == "patch":
+                    # 斑块口径：与单块路径同 helper、同 rng 消耗顺序；
+                    # 掩码在施加阶段按坐标确定性散列构建（云无关）。
+                    entry["patch"] = _bleeding_patch_params(
+                        rng, config.bleeding, width, length, salt=seed
+                    )
+                else:
+                    # legacy-strip：恒定 40% 面积、贯穿全路长的竖直条带。
+                    entry["lane_center"] = float(rng.uniform(0.3, 0.7) * width)
 
             elif disease_type == "patching":
-                patch_cfg = config.patching
-                max_pw = min(patch_cfg.max_width, width * 0.8)
-                max_pl = min(patch_cfg.max_length, length * 0.8)
-                min_pw = min(patch_cfg.min_width, max_pw)
-                min_pl = min(patch_cfg.min_length, max_pl)
-                patch_width = float(rng.uniform(min_pw, max_pw))
-                patch_length = float(rng.uniform(min_pl, max_pl))
-                half_w = patch_width * 0.5 + patch_cfg.edge_width
-                half_l = patch_length * 0.5 + patch_cfg.edge_width
-                center_x = (
-                    width * 0.5
-                    if width <= 2.0 * half_w
-                    else float(rng.uniform(half_w, width - half_w))
+                entry["args"] = self._sample_patch_args(
+                    rng, config.patching, width, length, label=20
                 )
-                center_y = (
-                    length * 0.5
-                    if length <= 2.0 * half_l
-                    else float(rng.uniform(half_l, length - half_l))
-                )
-                elevation = float(
-                    rng.uniform(-0.4 * patch_cfg.max_elevation, patch_cfg.max_elevation)
-                )
-                angle_rad = float(rng.uniform(-np.pi / 12.0, np.pi / 12.0))
-                entry["args"] = {
-                    "center": (center_x, center_y),
-                    "width": patch_width,
-                    "length": patch_length,
-                    "angle_rad": angle_rad,
-                    "elevation": elevation,
-                    "edge_width": patch_cfg.edge_width,
-                }
                 # 参考面在宏观 + 设计几何的粗网格上拟合（纹理零均值，
                 # lstsq 天然平均掉）；宏观场合成后回填。
                 entry["needs_reference_plane"] = True
@@ -1387,41 +1927,10 @@ class SyntheticRoadDataset(_DatasetBase):
                 if damage_type_c == "patching":
                     # 复用 patching 计划（标签 37）
                     entry["type"] = "patching"
-                    patch_cfg = config.patching
-                    max_pw = min(patch_cfg.max_width, width * 0.8)
-                    max_pl = min(patch_cfg.max_length, length * 0.8)
-                    min_pw = min(patch_cfg.min_width, max_pw)
-                    min_pl = min(patch_cfg.min_length, max_pl)
-                    patch_width = float(rng.uniform(min_pw, max_pw))
-                    patch_length = float(rng.uniform(min_pl, max_pl))
-                    half_w = patch_width * 0.5 + patch_cfg.edge_width
-                    half_l = patch_length * 0.5 + patch_cfg.edge_width
-                    center_x = (
-                        width * 0.5
-                        if width <= 2.0 * half_w
-                        else float(rng.uniform(half_w, width - half_w))
+                    entry["args"] = self._sample_patch_args(
+                        rng, config.patching, width, length, label=37
                     )
-                    center_y = (
-                        length * 0.5
-                        if length <= 2.0 * half_l
-                        else float(rng.uniform(half_l, length - half_l))
-                    )
-                    elevation = float(
-                        rng.uniform(
-                            -0.4 * patch_cfg.max_elevation, patch_cfg.max_elevation
-                        )
-                    )
-                    angle_rad = float(rng.uniform(-np.pi / 12.0, np.pi / 12.0))
-                    entry["args"] = {
-                        "center": (center_x, center_y),
-                        "width": patch_width,
-                        "length": patch_length,
-                        "angle_rad": angle_rad,
-                        "elevation": elevation,
-                        "edge_width": patch_cfg.edge_width,
-                    }
                     entry["needs_reference_plane"] = True
-                    entry["patch_label"] = 37
                 else:
                     sev = "-" if damage_type_c in CONCRETE_NO_SEVERITY else severity
                     entry["severity"] = sev
@@ -1435,7 +1944,15 @@ class SyntheticRoadDataset(_DatasetBase):
                             "label_width_floor": grid_res,
                             "grid_res": grid_res,
                             "domain_bounds": (0.0, x_max_grid, 0.0, y_max_grid),
+                            # 水泥病害几何口径（与单块路径同键）
+                            "crack_in_slab": config.concrete_damage.crack_in_slab,
+                            "fault_scope": config.concrete_damage.fault_scope,
+                            "edge_spall_mode": config.concrete_damage.edge_spall_mode,
+                            "shatter_mode": config.concrete_damage.shatter_mode,
                         }
+                    )
+                    pending_scene.update(
+                        _pending_params_keys(add_concrete_damage, params)
                     )
                     slab_len = config.concrete_damage.slab_length
                     slab_wid = config.concrete_damage.slab_width
@@ -1554,9 +2071,28 @@ class SyntheticRoadDataset(_DatasetBase):
                     y_frac_min * y_max_grid,
                     y_frac_max * y_max_grid,
                 ),
+                # 接线 config.raveling（默认值=历史硬编码，行为逐位不变）；
+                # 键的待合入披露在计划阶段做一次，施加阶段直接转发。
+                "params": {
+                    "deterministic_seed": rav_seed,
+                    "removal_ratio": (
+                        config.raveling.point_removal_ratio_light
+                        if raveling_entry[1] == "light"
+                        else config.raveling.point_removal_ratio_severe
+                    ),
+                    "erosion_depth": tuple(config.raveling.erosion_depth),
+                },
             }
+            pending_scene.update(
+                _pending_params_keys(add_raveling, raveling_plan["params"])
+            )
 
         # 6. 宏观粗网格（全局一次）+ 修补参考面回填
+        macro_extra, macro_pending = _filter_unsupported_kwargs(
+            synthesize_strip_macro_band,
+            {"macro_spectrum_mode": config.road.macro_spectrum_mode},
+        )
+        pending_scene.update(macro_pending)
         macro_band = synthesize_strip_macro_band(
             width,
             length,
@@ -1564,6 +2100,7 @@ class SyntheticRoadDataset(_DatasetBase):
             roughness_actual,
             np.random.default_rng(surface_seed),
             macro_grid_factor=config.strip.macro_grid_factor,
+            **macro_extra,
         )
         for entry in plan:
             if not entry.get("needs_reference_plane"):
@@ -1649,6 +2186,16 @@ class SyntheticRoadDataset(_DatasetBase):
         asm_feats = np.zeros((n_alloc, 3), dtype=np.float32)
 
         sensor_origin = self._sensor_pose()
+        strip_extra, strip_pending = _filter_unsupported_kwargs(
+            generate_strip_surface,
+            {
+                "macro_spectrum_mode": config.road.macro_spectrum_mode,
+                "grid_convention": config.micro_texture.grid_convention,
+                "het_field": config.micro_texture.het_field,
+            },
+            moot_keys=_surface_moot_keys(config.micro_texture),
+        )
+        pending_scene.update(strip_pending)
         strip_gen = generate_strip_surface(
             width,
             length,
@@ -1666,6 +2213,7 @@ class SyntheticRoadDataset(_DatasetBase):
             texture_het_corr_len_m=config.micro_texture.het_corr_len_m,
             macro_grid_factor=config.strip.macro_grid_factor,
             macro_band=macro_band,
+            **strip_extra,
         )
         speckle_rng = np.random.default_rng(speckle_seed)
         speckle_m = config.radiometric.speckle_m
@@ -1715,10 +2263,17 @@ class SyntheticRoadDataset(_DatasetBase):
                         **entry["args"],
                     )
                 elif etype == "depression":
+                    # label_radius_mode 经 _bridge_depression_params 下发：
+                    # 请求值等于基元当前行为（legacy-1pct）时静默省略，
+                    # 否则记入本场景待合入集合。
+                    dep_kwargs, dep_pending = _bridge_depression_params(
+                        entry["label_radius_mode"]
+                    )
+                    pending_scene.update(dep_pending)
                     pts, labels = add_depression(
                         pts, labels,
                         severity=entry["severity"], seed=seed,
-                        **entry["args"],
+                        **entry["args"], **dep_kwargs,
                     )
                 elif etype == "rutting":
                     pts, labels = add_rutting(
@@ -1734,15 +2289,19 @@ class SyntheticRoadDataset(_DatasetBase):
                         params=params, **entry["args"],
                     )
                 elif etype == "bleeding":
-                    region_mask = (
-                        np.abs(pts[:, 0] - entry["lane_center"])
-                        < config.bleeding.region_width * width / 2.0
-                    )
+                    if "patch" in entry:
+                        # 斑块口径：掩码按坐标确定性散列逐点判定（云无关，
+                        # 缝两侧逐位一致）。
+                        region_mask = _bleeding_region_mask(pts, entry["patch"])
+                    else:
+                        region_mask = (
+                            np.abs(pts[:, 0] - entry["lane_center"])
+                            < config.bleeding.region_width * width / 2.0
+                        )
                     labels = add_bleeding(pts, labels, region_mask=region_mask, seed=seed)
                 elif etype == "patching":
                     pts, labels = add_patching(
                         pts, labels,
-                        label=entry.get("patch_label", 20),
                         params=params, **entry["args"],
                     )
                 elif etype == "concrete_damage":
@@ -1812,7 +2371,7 @@ class SyntheticRoadDataset(_DatasetBase):
                     seed=raveling_plan["seed"],
                     # 云无关：摘除/侵蚀按坐标哈希逐点确定，缝两侧一致
                     # （松散框可占 0.2-0.5·L，必然跨段，无段能完整包含）。
-                    params={"deterministic_seed": raveling_plan["seed"]},
+                    params=raveling_plan["params"],
                 )
 
             # 松散标签膨胀 + NaN 过滤（与单块路径同逻辑，halo 供 KDTree）
@@ -1850,6 +2409,9 @@ class SyntheticRoadDataset(_DatasetBase):
                 pts_v, nrm_v, labels_v, pavement_type, sensor_origin,
                 albedo_interp, config.radiometric.albedo_sigma_ln, base,
                 depression_depth,
+                bleeding_multiplier=config.bleeding.intensity_multiplier,
+                cos_abs=config.radiometric.cos_abs,
+                albedo_clip_hi=config.radiometric.albedo_clip_hi,
             )
 
             owned_road = road_mask_v & (row_idx_v >= y0o) & (row_idx_v < y1o)
@@ -1886,8 +2448,14 @@ class SyntheticRoadDataset(_DatasetBase):
         asm_power = asm_power[:n_final]
         asm_feats = asm_feats[:n_final]
 
-        # 9. 整条带 p99 AGC + 逐段斑点/量化（两遍扫）
-        scale = float(np.percentile(asm_power, 99.0))
+        # 9. AGC 标定 + 逐段斑点/量化（两遍扫）。'fixed'（默认）= 固定
+        # 绝对标定（config.radiometric.agc_reference_power，工程标定值）：
+        # 不随场景构成漂移、材料基底签名保留；'scene-p99' = 历史整条带
+        # p99 归一（回退口径）。
+        if config.radiometric.agc_mode == "fixed":
+            scale = float(config.radiometric.agc_reference_power)
+        else:
+            scale = float(np.percentile(asm_power, 99.0))
         for seg in seg_layout:
             start = seg["road"][0]
             end = seg["curb"][1] if seg["curb"] else seg["road"][1]
@@ -2009,6 +2577,11 @@ class SyntheticRoadDataset(_DatasetBase):
             "skipped_under_observation_off" if config.lidar_scan.enable else None
         )
         resolution_metadata = config.resolution_metadata(actual_output_points=n_final)
+        if pending_scene:
+            # 与单块路径同语义：本场景实际遇到的待合入键（场景级准确）。
+            resolution_metadata["pending_primitive_upgrades"] = sorted(
+                pending_scene
+            )
         resolution_metadata["surface_grid"]["curvature_method"] = "skipped_observation_off"
         resolution_metadata["sensor_output"].update(
             {
@@ -2107,26 +2680,29 @@ class SyntheticRoadDataset(_DatasetBase):
         albedo_sigma_ln: float,
         base: float,
         depression_depth: np.ndarray,
+        bleeding_multiplier: float = 0.55,
+        cos_abs: bool = False,
+        albedo_clip_hi: float = 0.98,
     ) -> np.ndarray:
         """分段体制的强度场第一遍：received_power = ρ·shading·cosθ/R²。
 
         与 :meth:`_compute_intensity` 的场部分逐式相同（反照率乘子、
-        凹陷遮蔽、几何项），AGC/斑点/量化移到整条带 p99 之后的第二遍。
+        凹陷遮蔽、几何项），AGC/斑点/量化移到整条带标定之后的第二遍。
         """
         N = labels.shape[0]
         mult = np.ones(N, dtype=np.float64)
-        mult[labels == 19] = 0.55
+        mult[labels == 19] = bleeding_multiplier
         mult[(labels == 20) | (labels == 37)] = 0.85
         mult[(labels == 11) | (labels == 12)] = 1.15
         mult[labels == 36] = 1.20
         mult[labels == 29] = 1.10
         rho_field = np.exp(albedo_sigma_ln * albedo_interp(points[:, :2]))
-        rho = np.clip(base * mult * rho_field, 0.02, 0.95)
+        rho = np.clip(base * mult * rho_field, 0.02, albedo_clip_hi)
         shading = 0.25 + 0.75 * np.exp(-depression_depth / 0.012)
         d = points - sensor_origin[None, :]
         R2 = np.sum(d * d, axis=1) + 1e-12
         d_hat = d / np.sqrt(R2)[:, None]
-        cos_theta = np.clip(np.abs(np.sum(normals * (-d_hat), axis=1)), 0.03, 1.0)
+        cos_theta = _lambert_cos_theta(normals, d_hat, cos_abs)
         return rho * shading * cos_theta / R2
 
     def _select_pavement_type(self, rng: np.random.Generator) -> str:
@@ -2159,15 +2735,28 @@ class SyntheticRoadDataset(_DatasetBase):
         rng: np.random.Generator,
         pavement_type: str,
     ) -> list[tuple[str, str]]:
-        """根据路面类型和配置概率随机选择病害组合。"""
+        """根据路面类型和配置概率随机选择病害组合。
+
+        ``sampling_mode='bernoulli'``（默认）：按 ``disease_probs`` 逐
+        病害独立伯努利抽样——概率即文档声明的『出现概率』语义，期望
+        每场景病害数 ≈ Σp（默认配置 ≈ 0.8 种），**允许 0 病害背景场
+        景**——再按 ``max_diseases_per_scene`` 封顶。
+        ``sampling_mode='legacy'``：历史口径——概率归一化为权重、无放
+        回抽恰好 min(max_diseases, n_available) 种（每场景病害数恒
+        定，各病害出现率远高于名义概率）。
+        ``use_stratified=False`` 仍强制伯努利（旧 --no-stratified 语义，
+        已弃用）。
+        """
         disease_probs = self.config.disease.disease_probs
         max_diseases = self.config.disease.max_diseases_per_scene
         severity_ratio = self.config.disease.severity_ratio
-        use_stratified = self.config.disease.use_stratified
+        sampling_mode = self.config.disease.sampling_mode
+        if not self.config.disease.use_stratified:
+            sampling_mode = "bernoulli"
 
         available = ASPHALT_DISEASE_KEYS if pavement_type == "asphalt" else ["concrete_damage"]
 
-        if use_stratified:
+        if sampling_mode == "legacy":
             weighted = [(d, disease_probs.get(d, 0.0)) for d in available]
             weights = np.array([w for _, w in weighted], dtype=np.float64)
             valid = weights > 0.0
@@ -2182,6 +2771,7 @@ class SyntheticRoadDataset(_DatasetBase):
                     rng.choice([d for d, _ in weighted], size=n_select, replace=False, p=weights)
                 )
         else:
+            # 伯努利：每种病害独立出现；概率 0 的病害从不生成。
             selected = []
             for disease in available:
                 prob = disease_probs.get(disease, 0.0)
@@ -2196,7 +2786,13 @@ class SyntheticRoadDataset(_DatasetBase):
             if disease == "bleeding":
                 result.append((disease, "light"))
             else:
-                severity = "light" if rng.random() < severity_ratio else "severe"
+                # crack.severity_ratio 为 per-type 覆盖键（None = 用
+                # disease.severity_ratio 全局值）。
+                if disease == "crack" and self.config.crack.severity_ratio is not None:
+                    ratio = float(self.config.crack.severity_ratio)
+                else:
+                    ratio = severity_ratio
+                severity = "light" if rng.random() < ratio else "severe"
                 result.append((disease, severity))
 
         return result
@@ -2211,7 +2807,27 @@ class SyntheticRoadDataset(_DatasetBase):
         rng: np.random.Generator,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Sample and apply one physically continuous repair patch."""
-        cfg = self.config.patching
+        args = self._sample_patch_args(rng, self.config.patching, width, length, patch_label)
+        return add_patching(points, labels, **args)
+
+    @staticmethod
+    def _sample_patch_args(
+        rng: np.random.Generator,
+        cfg: PatchingConfig,
+        width: float,
+        length: float,
+        label: int,
+    ) -> dict:
+        """Sample one repair-patch geometry（单块路径与分段计划路径共用）。
+
+        替换三处 ~30 行复制的抽样块。rng 消耗顺序（三处历史调用点一
+        致，勿改动）：宽 → 长 → center_x → center_y → elevation →
+        angle。elevation 域取 ``cfg.elevation_range``（默认 (-0.006,
+        0.015)，与历史 uniform(-0.4·max_elevation, max_elevation) 逐位
+        一致——0.4·0.015 与 0.006 在 IEEE 双精度下精确相等）。
+
+        返回值即 :func:`add_patching` 的关键字参数（含 ``label``）。
+        """
         max_patch_width = min(cfg.max_width, width * 0.8)
         max_patch_length = min(cfg.max_length, length * 0.8)
         min_patch_width = min(cfg.min_width, max_patch_width)
@@ -2230,30 +2846,21 @@ class SyntheticRoadDataset(_DatasetBase):
         else:
             center_y = float(rng.uniform(half_length, length - half_length))
 
-        elevation = float(rng.uniform(-0.4 * cfg.max_elevation, cfg.max_elevation))
+        elevation = float(rng.uniform(*cfg.elevation_range))
         angle_rad = float(rng.uniform(-np.pi / 12.0, np.pi / 12.0))
-        return add_patching(
-            points,
-            labels,
-            center=(center_x, center_y),
-            width=patch_width,
-            length=patch_length,
-            label=patch_label,
-            angle_rad=angle_rad,
-            elevation=elevation,
-            edge_width=cfg.edge_width,
-        )
+        return {
+            "center": (center_x, center_y),
+            "width": patch_width,
+            "length": patch_length,
+            "label": int(label),
+            "angle_rad": angle_rad,
+            "elevation": elevation,
+            "edge_width": cfg.edge_width,
+        }
 
-    @staticmethod
-    def _sample_wheelpath_x(rng: np.random.Generator, width: float) -> float:
-        """轮迹带横向先验：车道中心 ±0.9 m 的双峰高斯混合（σ=0.25 m）。
-
-        疲劳类病害（龟裂、纵缝、坑槽、车辙）机理上集中在轮迹带；
-        双轮迹间距取 RuttingConfig 的 1.8 m 口径。
-        """
-        center = width / 2.0
-        offset = 0.9 if rng.random() < 0.5 else -0.9
-        return float(np.clip(rng.normal(center + offset, 0.25), 0.3, max(width - 0.3, 0.31)))
+    # 委托到模块级实现：病害几何采样助手（_bleeding_patch_params 等）
+    # 与类内调用点共用同一函数，保证单块/分段两条路径的 rng 消耗一致。
+    _sample_wheelpath_x = staticmethod(_sample_wheelpath_x)
 
     def _sensor_pose(self) -> np.ndarray:
         """整条观测管线共用的传感器位姿 (x, y, z)，米制路面坐标。"""
@@ -2275,15 +2882,20 @@ class SyntheticRoadDataset(_DatasetBase):
     ) -> tuple[np.ndarray, np.ndarray]:
         """辐射强度模型：I ∝ ρ(x,y)·cosθ / R²，加斑点噪声与 8-bit 量化。
 
-        激光雷达方程 (Jelalian 1992) 的朗伯近似。类别信息只能通过
-        **空间相关、类间高度重叠**的材料反照率场 ρ(x,y) 间接进入强度
-        —— 不存在按标签查表的固定偏移（旧实现的偏移使单通道强度即可
-        近乎完美分类，构成隐性标签泄漏并被审计确认为强度域差主因）。
+        激光雷达方程 (Jelalian 1992) 的朗伯近似。类别信息通过两条
+        受控通道进入强度：**五类材料标签的反照率乘子**（泛油/修补/
+        松散/露骨/唧泥 ×0.55/0.85/1.15/1.20/1.10）与**空间相关对数
+        正态反照率场 ρ(x,y)**（σ_ln=0.25 的乘性场保证类内方差大、类
+        间分布高度重叠——实测泛油/背景单通道 AUC ≈ 0.62，远非可分）。
+        旧实现额外的**加性固定偏移**使单通道强度即可近乎完美分类，
+        构成隐性标签泄漏，已被移除并被审计确认为强度域差主因；按标
+        签查表的乘子保留但与重叠场相乘，泄漏量级可控。
 
         组成：
-        - 材料反照率均值（905 nm 量级的物理方向）：沥青 ~0.17 /
-          水泥 ~0.40；泛油（沥青结合料油膜，NIR 强吸收 + 镜面损耗）
-          **变暗** ×0.55；修补（富油新料）×0.85；松散/露骨（集料
+        - 材料反照率均值（宽带太阳反照率公开区间的占位取值，未按
+          905 nm 实测标定）：沥青 ~0.17 / 水泥 ~0.40；泛油（沥青结合料油膜，NIR 强吸收 + 镜面损耗）
+          **变暗** ×``bleeding.intensity_multiplier``（默认 0.55，占位
+          值待实测标定）；修补（富油新料）×0.85；松散/露骨（集料
           外露）×1.15-1.2。裂缝/坑槽类不做材料偏移——凹陷内的变暗
           由几何遮蔽因子产生。
         - 空间相关反照率场：对数正态乘性场（FFT 低通，相关长度
@@ -2291,11 +2903,14 @@ class SyntheticRoadDataset(_DatasetBase):
           保证类内方差大、类间分布重叠。
         - 几何遮蔽：低于局部参考面的点按 exp(-depth/12 mm) 变暗
           （深槽回波弱），参考面取 0.08 m 粗网格中位数。
-        - cosθ/R² 几何项、AGC 归一（99 分位）、乘性 Gamma 斑点
+        - cosθ/R² 几何项（cosθ 口径见 ``radiometric.cos_abs``）、AGC
+          归一（``radiometric.agc_mode``：'fixed' 固定绝对标定 /
+          'scene-p99' 历史逐场景 99 分位）、反照率截断
+          （``radiometric.albedo_clip_hi``）、乘性 Gamma 斑点
           （M=``radiometric.speckle_m``）、uint8 量化。
 
         分布参数取自 ``config.radiometric``，默认值逐字等于历史硬编码
-        （0.25 / 0.3 / 12.0），因此默认构造时输出逐点一致。注意
+        （0.25 / 0.3 / 12.0），因此默认构造时这些项输出逐点一致。注意
         ``received_power`` 同时供 σ_r 异方差与辐射耦合丢点使用，改动
         这些参数会经丢点间接改变输出点数——这是预期的物理耦合，不是
         点数缺陷。
@@ -2313,7 +2928,7 @@ class SyntheticRoadDataset(_DatasetBase):
         else:
             base = float(rng.uniform(0.32, 0.48))
         mult = np.ones(N, dtype=np.float64)
-        mult[labels == 19] = 0.55                       # 泛油：NIR 变暗（修正方向）
+        mult[labels == 19] = self.config.bleeding.intensity_multiplier
         mult[(labels == 20) | (labels == 37)] = 0.85    # 修补：富油新料略暗
         mult[(labels == 11) | (labels == 12)] = 1.15    # 松散：集料外露略亮
         mult[labels == 36] = 1.20                       # 露骨
@@ -2340,7 +2955,9 @@ class SyntheticRoadDataset(_DatasetBase):
             field, bounds_error=False, fill_value=0.0,
         )
         rho_field = np.exp(self.config.radiometric.albedo_sigma_ln * interp(points[:, :2]))
-        rho = np.clip(base * mult * rho_field, 0.02, 0.95)
+        rho = np.clip(
+            base * mult * rho_field, 0.02, self.config.radiometric.albedo_clip_hi
+        )
 
         # --- 几何遮蔽：相对局部参考面的凹陷深度（与遮挡模型共用） ---
         if depression_depth is None:
@@ -2351,11 +2968,17 @@ class SyntheticRoadDataset(_DatasetBase):
         d = points - sensor_origin[None, :]
         R2 = np.sum(d * d, axis=1) + 1e-12
         d_hat = d / np.sqrt(R2)[:, None]
-        cos_theta = np.clip(np.abs(np.sum(normals * (-d_hat), axis=1)), 0.03, 1.0)
+        cos_theta = _lambert_cos_theta(normals, d_hat, self.config.radiometric.cos_abs)
         received_power = rho * shading * cos_theta / R2
 
         # --- AGC 归一 + 斑点噪声 + 量化 ---
-        scale = float(np.percentile(received_power, 99.0))
+        # 'fixed'（默认）：固定绝对标定（agc_reference_power，工程标定
+        # 值）——不随场景构成漂移、材料基底签名保留；'scene-p99'：历史
+        # 逐场景 99 分位归一（回退口径）。
+        if self.config.radiometric.agc_mode == "fixed":
+            scale = float(self.config.radiometric.agc_reference_power)
+        else:
+            scale = float(np.percentile(received_power, 99.0))
         intensity = received_power / max(scale, 1e-12)
         speckle_m = self.config.radiometric.speckle_m
         intensity = intensity * rng.gamma(shape=speckle_m, scale=1.0 / speckle_m, size=N)
