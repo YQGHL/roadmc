@@ -50,8 +50,8 @@ DEFAULT_MAX_SURFACE_MEMORY_MIB: float = 4096.0
 ASPHALT_LABELS: tuple[int, ...] = tuple(range(0, 21))
 CONCRETE_LABELS: tuple[int, ...] = tuple(range(21, 38))
 
-# ISO 8608 拟合有效带上限 (cycle/m)：波长 0.354 m。更短波长属于 ISO 13473
-# 纹理域，由生成器的纹理谱段负责，两带互补不重叠。
+# ISO 8608 拟合有效带上限 (cycle/m)：波长 0.353 m（1/2.83 ≈ 0.3534）。更短
+# 波长属于 ISO 13473 纹理域，由生成器的纹理谱段负责，两带互补不重叠。
 ISO8608_BAND_MAX_CYCLES_PER_M: float = 2.83
 
 # ISO 8608 路面功率谱密度参数 — 各粗糙度等级对应的不平整度系数 (×10⁻⁶ m³/cycle)
@@ -130,6 +130,17 @@ class RoadSurfaceConfig:
             {'D': 0.5, 'E': 0.5}）。None 表示关闭（默认），此时按
             roughness_class 单等级生成；键取值域复用 ISO_ROUGHNESS 的
             键集合。权重不在此处归一化存储，抽样时归一。
+        macro_spectrum_mode: 宏观谱权重的构造口径。
+            'iso-marginal'（默认）——ISO 带按 ISO 一维边际谱逐 fy 行
+            重构权重（G₁^ISO = Gd0·n0²/f²，近轴单元取行残差），离散
+            var_iso 与 ISO 边际谱的离散采样和一致（注意与连续积分不
+            同：f_min=1/L 处对 1/f² 的左 Riemann 和存在过计，随 L 增
+            大收敛），幅值合成 a = √(Φ·Δf)·Ŵ（含 Hermitian 共轭），
+            无实现级 std 重定标；ISO 段与纹理段在 2.83 c/m 的带边以
+            半个倍频程余弦 taper 过渡（消除谱指数/幅值跳变）。
+            'legacy' —— 恢复历史点采样权重 Φ = Gd0·n0²/4·Ω⁻³、实现
+            级 std 重定标与带边硬切换（宏观 σ 约为 ISO 边际口径的
+            2 倍，保留仅供回归对照，见 CLI --macro-spectrum）。
     """
 
     width: float = 7.0
@@ -141,8 +152,14 @@ class RoadSurfaceConfig:
     crossfall_shape: Literal["crowned", "plane"] = "crowned"
     longitudinal_grade: float = 0.0
     roughness_mix: dict[str, float] | None = None
+    macro_spectrum_mode: Literal["iso-marginal", "legacy"] = "iso-marginal"
 
     def __post_init__(self) -> None:
+        if self.macro_spectrum_mode not in ("iso-marginal", "legacy"):
+            raise ValueError(
+                "macro_spectrum_mode must be 'iso-marginal' or 'legacy', "
+                f"got {self.macro_spectrum_mode!r}"
+            )
         if not math.isfinite(self.width) or self.width <= 0:
             raise ValueError(f"width must be > 0, got {self.width}")
         if not math.isfinite(self.length) or self.length <= 0:
@@ -212,34 +229,62 @@ class RoadSurfaceConfig:
 class MicroTextureConfig:
     """宏观纹理谱段参数（自仿射表面，谱斜率 -(2H+2)）。
 
-    纹理段占据 ISO 8608 带上限 (2.83 c/m) 到网格 Nyquist 之间的
-    波数带，对应 ISO 13473 宏观纹理域。<0.5mm 的真·微观纹理在
-    毫米级网格上不可表达，本模块不声明它。
+    纹理段占据 ISO 8608 带上限 (2.83 c/m) 到网格 Nyquist 之间的波数
+    带，覆盖 ISO 13473 宏观+兆观纹理带上段；5 mm 网格下不可表达
+    0.5-10 mm 波长（含宏观纹理主体）。<0.5mm 的真·微观纹理在毫米级
+    网格上不可表达，本模块不声明它。
 
     Attributes:
-        amplitude: 纹理位移 RMS (米)。语义严格等于输出 RMS（经
-            Parseval 校准）。默认 0.0008m = 0.8mm（覆盖宏观+兆观
-            纹理带 10-353mm），H=0.7 谱形下实测 MPD/RMS ≈ 0.46，
-            对应 MPD ≈ 0.37mm，落入密级配沥青 ISO 13473-1 实测
-            区间 0.3-1.2mm（由回归测试闭环断言）。
-        hurst: Hurst 指数 H，控制谱斜率 β = 2H+2。沥青宏观纹理
-            实测 H ≈ 0.6-0.9，默认 0.7。
-        octaves: 已弃用（旧逐点噪声实现的参数），保留仅为向后
-            兼容，谱合成路径不使用。
+        amplitude: 纹理位移 RMS (米)。语义为稠密网格（点密度不低于
+            网格密度）上严格等于位移 RMS（经 Parseval 校准）；稀疏
+            点云上 RMS 衰减（见 primitives.add_micro_texture 文档）。
+            默认 0.0008m = 0.8mm（覆盖宏观+兆观纹理带 10-353mm），
+            H=0.7 谱形下 MPD（100mm 基线、去趋势、两半段峰值均值减
+            段均值估计器）/纹理带 RMS ≈ 0.52，对应 MPD ≈ 0.42-0.45mm
+            （2×2m 与 7×5m 补丁实测，回归测试
+            tests/test_texture_metrics.py 固定种子断言 MPD ∈
+            [0.35, 0.55] mm）。量级与密级配沥青实测 MPD 文献一致
+            （测定方法见 ASTM E1845 / ISO 13473-1；量级综述 DOI
+            10.1016/j.jreng.2022.05.003），0.3-1.2mm 为设计目标区间
+            而非标准值。
+        hurst: Hurst 指数 H，控制谱斜率 β = 2H+2。H 默认 0.7；
+            0.6-0.9 为工程经验区间（无直接文献支撑，未实测标定）。
+        grid_convention: 纹理谱频率网格口径。
+            'consistent'（默认）——fftfreq 间距与实空间 linspace
+            (x_min, x_max, gx) 的间距 extent/(gx-1) 一致，消除历史
+            ~1/gx 的频率口径偏差；
+            'legacy' —— 恢复 fftfreq(d=extent/gx) 历史口径（CLI
+            --micro-texture-grid-legacy）。
         het_sigma_ln: 纹理沿程不均匀的对数域调制强度 σ。0.0 表示关闭
             （默认，行为与历史一致）；> 0 时纹理段幅值乘以均值为 1 的
-            对数正态沿程调制场。
-        het_corr_len_m: 沿里程 y 的高斯低通相关长度 (米)，仅在
+            对数正态调制场。σ 与相关长度均为**无依据设计参数**（无
+            文献引用）；敏感性：mean(M) ≈ exp(-σ²/2)，σ=0.3 时
+            M ∈ (0.585, 1.367)，σ=0.6 时 M ∈ (0.301, 1.642)。
+        het_corr_len_m: 调制场的高斯低通相关长度 (米)，仅在
             het_sigma_ln > 0 时生效。
+        het_field: 调制场维度。'2d'（默认）——x/y 二维调制场（x/y
+            相关长度可异，默认同 het_corr_len_m）；'1d' —— 历史
+            沿里程 y 一维、横跨整幅路宽同缩放的调制场（CLI
+            --het-field-1d）。
     """
 
     amplitude: float = 0.0008
     hurst: float = 0.7
-    octaves: int = 6
+    grid_convention: Literal["consistent", "legacy"] = "consistent"
     het_sigma_ln: float = 0.0
     het_corr_len_m: float = 2.0
+    het_field: Literal["2d", "1d"] = "2d"
 
     def __post_init__(self) -> None:
+        if self.grid_convention not in ("consistent", "legacy"):
+            raise ValueError(
+                "grid_convention must be 'consistent' or 'legacy', "
+                f"got {self.grid_convention!r}"
+            )
+        if self.het_field not in ("2d", "1d"):
+            raise ValueError(
+                f"het_field must be '2d' or '1d', got {self.het_field!r}"
+            )
         if not math.isfinite(self.het_sigma_ln) or self.het_sigma_ln < 0.0:
             raise ValueError(
                 f"het_sigma_ln must be finite and ≥ 0, got {self.het_sigma_ln}"
@@ -260,45 +305,144 @@ class CrackConfig:
 
     Attributes:
         crack_types: 允许生成的裂缝类型列表。
-        severity_ratio: 轻度裂缝占比，默认 0.6 (重度 0.4)。
+        severity_ratio: 轻度裂缝占比的 **per-type 覆盖**。None（默认）
+            表示使用 ``disease.severity_ratio`` 全局值；设为 float 时
+            仅覆盖裂缝类的轻度占比（历史版本此处为 0.6 但从未被读取，
+            属静默失效——现接线为覆盖键）。
         bezier_points: Bézier 曲线控制点数，默认 4。
         fractal_perturbation: value-noise 分形扰动幅度（fBm 型多倍频
             value noise，非 Perlin 梯度噪声——见 primitives.py 实现）。
+        perturb_mode: 裂缝走向扰动口径。'nonperiodic'（默认）——在
+            覆盖全长的无界域网格上插值，无周期重复；'legacy' ——
+            恢复 (x·f) % 1 周期化环绕（每 0.5 m 精确重复，CLI
+            --crack-perturb-legacy）。注意切换会改变 rng 流消耗，
+            同 seed 场景整体漂移属预期。
+        width_truncation: 对数正态缝宽判据侧截断方式。
+            'resample'（默认）——越界拒绝重采样（平滑截断分布）；
+            'clip' —— 历史钳制到判据边界（分布原子，CLI
+            --crack-width-trunc clip）。
+        area_lambda_mode: 面状裂缝（龟裂/块裂）槽形 λ 口径。
+            'quarter'（默认）——λ=w/4，缝缘深度 e⁻⁴≈1.8%·d_max，与
+            线状裂缝的边缘连续原则一致；'half' —— 历史 λ=w/2（缝缘
+            0.368·d_max 台阶，CLI --areacrack-lambda-legacy）。
+        area_label_mode: 面状裂缝标签口径。'measure'（默认）——按
+            Voronoi 单元等效边长度量对照 JTG 块度阈值定标签
+            （measure-then-label，与线状裂缝同型；阈值需人工核对
+            JTG 5210-2018 原文）；'legacy' —— 直接采信 severity
+            字符串（CLI --areacrack-label-legacy）。
     """
 
     crack_types: list[str] = field(
         default_factory=lambda: ["longitudinal", "transverse", "alligator", "block"]
     )
-    severity_ratio: float = 0.6
+    severity_ratio: float | None = None
     bezier_points: int = 4
     fractal_perturbation: float = 0.02
+    perturb_mode: Literal["nonperiodic", "legacy"] = "nonperiodic"
+    width_truncation: Literal["resample", "clip"] = "resample"
+    area_lambda_mode: Literal["quarter", "half"] = "quarter"
+    area_label_mode: Literal["measure", "legacy"] = "measure"
+
+    def __post_init__(self) -> None:
+        if self.severity_ratio is not None and not (
+            math.isfinite(self.severity_ratio) and 0.0 <= self.severity_ratio <= 1.0
+        ):
+            raise ValueError(
+                "severity_ratio must be None or in [0,1], "
+                f"got {self.severity_ratio}"
+            )
+        if self.perturb_mode not in ("nonperiodic", "legacy"):
+            raise ValueError(
+                f"perturb_mode must be 'nonperiodic' or 'legacy', got {self.perturb_mode!r}"
+            )
+        if self.width_truncation not in ("resample", "clip"):
+            raise ValueError(
+                f"width_truncation must be 'resample' or 'clip', got {self.width_truncation!r}"
+            )
+        if self.area_lambda_mode not in ("quarter", "half"):
+            raise ValueError(
+                f"area_lambda_mode must be 'quarter' or 'half', got {self.area_lambda_mode!r}"
+            )
+        if self.area_label_mode not in ("measure", "legacy"):
+            raise ValueError(
+                f"area_label_mode must be 'measure' or 'legacy', got {self.area_label_mode!r}"
+            )
 
 
 @dataclass
 class PotholeConfig:
     """坑槽生成参数。
 
+    轻/重仅按深度分级（JTG ≤25mm 口径，阈值原文需人工核对）；半径
+    不按严重度切分（解耦设计：平面半径不得成为 100% 可分的非规范
+    线索），轻/重 (R, d) 支撑集重叠。
+
     Attributes:
-        max_radius_light: 轻度坑槽最大半径 (米)。
-        max_radius_severe: 重度坑槽最大半径 (米)。
+        max_radius_severe: 坑槽最大半径 (米)（轻/重共用同一采样区间
+            [0.05, max_radius_severe]）。
         max_depth_light: 轻度坑槽最大深度 (米)，JTG ≤ 25mm。
         max_depth_severe: 重度坑槽最大深度 (米)，JTG > 25mm。
-        beta_range: 重度坑槽超椭圆指数 β 的采样区间 (lo, hi)。轻度恒为
-            β=2（椭球凹陷）；重度在此区间采样（β>2 为平底坑）。
-        edge_spall_prob: 边缘剥落概率。
+        beta_range: 坑槽超椭圆指数 β 的采样区间 (lo, hi)。默认
+            (2.0, 5.0)：轻/重两级共用、重叠支撑集（历史版本轻度恒
+            β=2、重度 U(3,5)，仅凭剖面形状即可 100% 判定轻/重，构成
+            几何域标签泄漏——已消除）。
+        beta_mode: β 口径。'overlap'（默认，轻/重共用 beta_range）；
+            'legacy' —— 恢复轻=2.0 字面量、重~U(beta_range) 的历史
+            行为（CLI --pothole-beta-legacy，同时建议把 beta_range
+            复位为 (3.0, 5.0) 以逐位复现旧行为）。
+        aspect_ratio_range: 有界纵横比先验 (lo, hi)，d/R 越界拒绝
+            重采（排除沉陷碟形与近竖井类非物理极端几何；设计界，
+            非标准规定）。None = 恢复 R、d 独立采样（CLI
+            --pothole-aspect-legacy）。
+        spall_band: 坑缘剥落环的半径带 (r_lo·R, r_hi·R)。默认
+            (0.8, 1.0)：剥落标注不超出主凹陷足迹（历史 0.8–1.2R 使
+            标注面积最大 1.44× 凹陷面积，CLI --pothole-spall-band）。
+        micropit_rate: 微坑泊松强度基准（λ = micropit_rate ·
+            (R/0.30)²，随破损面积增长；工程设定，取审计建议 3-5 的
+            中值）。历史为 Poisson(max(1,int(R·5))) ≡ Poisson(1)。
+        micropit_mode: 微坑口径。'area'（默认，λ 随面积增长、始终
+            生成）；'legacy' —— 恢复钳制到 1 的历史计数且仅在
+            edge_quality < 1.0 时生成（CLI --pothole-micropits-legacy）。
     """
 
-    max_radius_light: float = 0.15
     max_radius_severe: float = 0.30
     max_depth_light: float = 0.025
     max_depth_severe: float = 0.10
-    beta_range: tuple[float, float] = (3.0, 5.0)
-    edge_spall_prob: float = 0.3
+    beta_range: tuple[float, float] = (2.0, 5.0)
+    beta_mode: Literal["overlap", "legacy"] = "overlap"
+    aspect_ratio_range: tuple[float, float] | None = (0.05, 0.6)
+    spall_band: tuple[float, float] = (0.8, 1.0)
+    micropit_rate: float = 4.0
+    micropit_mode: Literal["area", "legacy"] = "area"
 
     def __post_init__(self) -> None:
         lo, hi = self.beta_range
         if not 0.0 < lo <= hi:
             raise ValueError(f"beta_range must satisfy 0 < lo <= hi, got {self.beta_range}")
+        if self.beta_mode not in ("overlap", "legacy"):
+            raise ValueError(
+                f"beta_mode must be 'overlap' or 'legacy', got {self.beta_mode!r}"
+            )
+        if self.micropit_mode not in ("area", "legacy"):
+            raise ValueError(
+                f"micropit_mode must be 'area' or 'legacy', got {self.micropit_mode!r}"
+            )
+        if not math.isfinite(self.micropit_rate) or self.micropit_rate <= 0:
+            raise ValueError(
+                f"micropit_rate must be finite and > 0, got {self.micropit_rate}"
+            )
+        if self.aspect_ratio_range is not None:
+            alo, ahi = self.aspect_ratio_range
+            if not 0.0 < alo <= ahi:
+                raise ValueError(
+                    "aspect_ratio_range must satisfy 0 < lo <= hi, got "
+                    f"{self.aspect_ratio_range}"
+                )
+        slo, shi = self.spall_band
+        if not 0.0 <= slo < shi:
+            raise ValueError(
+                f"spall_band must satisfy 0 <= lo < hi, got {self.spall_band}"
+            )
 
 
 @dataclass
@@ -306,16 +450,66 @@ class RuttingConfig:
     """车辙生成参数。
 
     Attributes:
-        wheel_separation: 左右轮迹间距 (米)，默认 1.8m。
+        wheel_separation: 重车轮距 (米)，常规取值 1.8m。这是车辆构造
+            参数，**非 BZZ-100 规范参数**（BZZ-100 双轮组内距
+            3δ ≈ 0.32m）。
         rut_width: 单条轮迹宽度 (米)，默认 0.6m。
         max_depth_light: 轻度车辙最大深度 (米)，JTG 10-15mm。
         max_depth_severe: 重度车辙最大深度 (米)，JTG > 15mm。
+        severe_min_depth: 重度车辙最小深度 (米)，默认 0.0165。
+            避开 15mm 分界 ±10% 容差，为分级可分性设计、非标准规定。
+        center_mode: 车辙中心横向口径。'wheelpath'（默认）——走
+            _sample_wheelpath_x 轮迹带先验（车道中心 ±0.9m 双峰、
+            σ=0.25m），与裂缝/坑槽先验一致；7m 双车道口径仅建模
+            内侧轮迹对。'fixed' —— 历史恒位于道路中线（CLI
+            --rutting-center-legacy）。
+        peak_normalize: True（默认）——名义深度按 d' = d/(1+ε) 采样，
+            使实现峰值 ≤ 名义深度 d（不再越过 JTG 10/15mm 类分界）；
+            False —— 历史 unnormalized 口径（CLI
+            --rutting-modulation-legacy）。
+        modulation_epsilon: 纵向正弦调制幅度 ε，默认 0.2。设计假设：
+            纵向变异的真实来源是重车横向分布与轴载波动（Said 2013,
+            ntnu.no），系随机过程而非固定 20% 正弦。
+        modulation_wavelength_ratio: 纵向调制波长 Λ 与条带长之比，
+            默认 0.5。
     """
 
     wheel_separation: float = 1.8
     rut_width: float = 0.6
     max_depth_light: float = 0.015
     max_depth_severe: float = 0.040
+    severe_min_depth: float = 0.0165
+    center_mode: Literal["wheelpath", "fixed"] = "wheelpath"
+    peak_normalize: bool = True
+    modulation_epsilon: float = 0.2
+    modulation_wavelength_ratio: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.center_mode not in ("wheelpath", "fixed"):
+            raise ValueError(
+                f"center_mode must be 'wheelpath' or 'fixed', got {self.center_mode!r}"
+            )
+        if not 0.0 <= self.modulation_epsilon <= 1.0:
+            raise ValueError(
+                f"modulation_epsilon must be in [0,1], got {self.modulation_epsilon}"
+            )
+        if not math.isfinite(self.severe_min_depth) or self.severe_min_depth < 0:
+            raise ValueError(
+                f"severe_min_depth must be finite and >= 0, got {self.severe_min_depth}"
+            )
+        if not self.max_depth_light <= self.severe_min_depth <= self.max_depth_severe:
+            raise ValueError(
+                "severe_min_depth must lie in [max_depth_light, max_depth_severe], "
+                f"got {self.severe_min_depth} in [{self.max_depth_light}, "
+                f"{self.max_depth_severe}]"
+            )
+        if not math.isfinite(self.modulation_wavelength_ratio) or (
+            self.modulation_wavelength_ratio <= 0
+        ):
+            raise ValueError(
+                "modulation_wavelength_ratio must be finite and > 0, got "
+                f"{self.modulation_wavelength_ratio}"
+            )
 
 
 @dataclass
@@ -324,8 +518,10 @@ class CorrugationConfig:
 
     Attributes:
         wavelength_range: 波长范围 (米)。
-        amplitude_light: 轻度振幅 (米)，JTG 10-25mm。
-        amplitude_severe: 重度振幅 (米)，JTG > 25mm。
+        amplitude_light: 轻度振幅 (米)，JTG 10-25mm（口径为单侧波高；
+            若按峰谷差解读则为 2A——JTG 5210-2018 拥包分级口径需人工
+            核对标准原文，当前未核实）。
+        amplitude_severe: 重度振幅 (米)，JTG > 25mm（口径同上，未核实）。
     """
 
     wavelength_range: tuple[float, float] = (0.3, 1.0)
@@ -338,29 +534,76 @@ class DepressionConfig:
     """沉陷生成参数。
 
     Attributes:
-        max_radius: 最大沉陷半径 (米)。
+        radius_range: 沉陷半径采样区间 (米)，默认 (0.5, 2.0)。
         depth_light: 轻度深度范围 (米)，JTG 10-25mm。
         depth_severe: 重度深度范围 (米)，JTG > 25mm。
+        center_inset_mode: 中心内缩口径。'radius'（默认）——中心内缩
+            量 ≥ 当次采样半径（cx ∈ [R, W−R]、cy ∈ [R, L−R]；若
+            R > min(W, L)/2 则拒绝重采 R），完整碗形恒在路面足迹内；
+            'legacy' —— 历史固定内缩 0.5m（碗形可被路缘截断，CLI
+            --depression-center-legacy）。
+        label_radius_mode: 标签半径口径。'R'（默认）——标签盘半径
+            = 影响半径 R（边界信号 = depth·e⁻⁴·⁵ ≈ 1.1%·depth，
+            0.1-0.8mm，远低于 σ_r=10mm，逐点不可分辨、依靠区域聚合
+            可恢复）；'legacy-1pct' —— 历史 |depression| > depth·1%
+            隐式外扩（等价 1.0116R，CLI --depression-label-legacy）。
     """
 
-    max_radius: float = 2.0
+    radius_range: tuple[float, float] = (0.5, 2.0)
     depth_light: tuple[float, float] = (0.010, 0.025)
     depth_severe: tuple[float, float] = (0.025, 0.080)
+    center_inset_mode: Literal["radius", "legacy"] = "radius"
+    label_radius_mode: Literal["R", "legacy-1pct"] = "R"
+
+    def __post_init__(self) -> None:
+        lo, hi = self.radius_range
+        if not 0.0 < lo <= hi:
+            raise ValueError(
+                f"radius_range must satisfy 0 < lo <= hi, got {self.radius_range}"
+            )
+        if self.center_inset_mode not in ("radius", "legacy"):
+            raise ValueError(
+                "center_inset_mode must be 'radius' or 'legacy', got "
+                f"{self.center_inset_mode!r}"
+            )
+        if self.label_radius_mode not in ("R", "legacy-1pct"):
+            raise ValueError(
+                "label_radius_mode must be 'R' or 'legacy-1pct', got "
+                f"{self.label_radius_mode!r}"
+            )
 
 
 @dataclass
 class RavelingConfig:
     """松散生成参数。
 
+    轻度移除 ~5% 点、重度 ~20%；侵蚀深度 ~N(0.5d, 0.3d) 截断到
+    [0, 1.5d]，轻 d=2mm、重 d=5mm（重度实测均值 ≈2.5mm）。历史版
+    本这三个字段从未被读取（primitives 内硬编码同值）——现已接线
+    为 add_raveling params 覆盖键 'removal_ratio'/'erosion_depth'。
+
     Attributes:
         point_removal_ratio_light: 轻度松散点移除比例。
         point_removal_ratio_severe: 重度松散点移除比例。
-        pitting_depth: 点蚀深度 (米)。
+        erosion_depth: 侵蚀深度基准 d 的 (轻, 重) 二元组 (米)。字段名
+            从 pitting 改为 erosion：实现是 i.i.d. 高斯侵蚀，非点蚀
+            坑洞（名实相符；schema 变更见 changelog）。
     """
 
     point_removal_ratio_light: float = 0.05
     point_removal_ratio_severe: float = 0.20
-    pitting_depth: float = 0.003
+    erosion_depth: tuple[float, float] = (0.002, 0.005)
+
+    def __post_init__(self) -> None:
+        for name in ("point_removal_ratio_light", "point_removal_ratio_severe"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0,1], got {value}")
+        lo, hi = self.erosion_depth
+        if not 0.0 < lo <= hi:
+            raise ValueError(
+                f"erosion_depth must satisfy 0 < lo <= hi, got {self.erosion_depth}"
+            )
 
 
 @dataclass
@@ -368,17 +611,51 @@ class BleedingConfig:
     """泛油生成参数。
 
     Attributes:
-        intensity_boost: 反射率增加量 (0-1 范围)。
-        region_width: 泛油区域宽度比例 (0-1)。
+        intensity_multiplier: 泛油区域反照率乘子，默认 0.55（油膜
+            NIR 吸收偏暗，方向有据；数值为**占位值待实测标定**）。
+            历史 0.3/0.99 的 intensity_boost 字段对输出零影响，已
+            删除（schema 变更见 changelog）。
+        geometry_mode: 泛油几何口径。'patch'（默认）——局部斑块：
+            中心走轮迹带先验、y 向有限长度、面积占比 U(5%,25%)
+            （设计先验）、logistic 平滑边界（过渡带 ~0.1m）；
+            'legacy-strip' —— 历史恒定 40% 面积、贯穿全路长、硬二值
+            边界的竖直条带（CLI --bleeding-geometry-legacy）。
+        region_width: 条带宽度比例 (0-1)。仅在
+            geometry_mode='legacy-strip' 时生效（历史硬编码路径）。
     """
 
-    intensity_boost: float = 0.3
+    intensity_multiplier: float = 0.55
+    geometry_mode: Literal["patch", "legacy-strip"] = "patch"
     region_width: float = 0.4
+
+    def __post_init__(self) -> None:
+        if self.geometry_mode not in ("patch", "legacy-strip"):
+            raise ValueError(
+                f"geometry_mode must be 'patch' or 'legacy-strip', got "
+                f"{self.geometry_mode!r}"
+            )
+        if not math.isfinite(self.intensity_multiplier) or self.intensity_multiplier <= 0:
+            raise ValueError(
+                "intensity_multiplier must be finite and > 0, got "
+                f"{self.intensity_multiplier}"
+            )
 
 
 @dataclass
 class PatchingConfig:
-    """Geometric limits for asphalt and concrete repair patches."""
+    """Geometric limits for asphalt and concrete repair patches.
+
+    Attributes:
+        min_width / max_width: 修补宽度范围 (米)。
+        min_length / max_length: 修补长度范围 (米)。
+        edge_width: 边缘混合带宽度 (米)。
+        max_elevation: 修补抬升上限 (米)。
+        elevation_range: 修补面相对参考面的竖向采样域 (米)，默认
+            (-0.006, 0.015)（= 历史实际采样域 [-6, +15]mm；注意不是
+            『±15mm』）。负侧 0.4 系数为压实沉降先验（工程假设，无
+            标准依据；北京 DB11 接茬 +0~+5mm、深圳 ≤3mm 为检索摘要，
+            需人工核对，未据此改值）。
+    """
 
     min_width: float = 0.60
     max_width: float = 1.80
@@ -386,6 +663,7 @@ class PatchingConfig:
     max_length: float = 2.80
     edge_width: float = 0.08
     max_elevation: float = 0.015
+    elevation_range: tuple[float, float] = (-0.006, 0.015)
 
     def __post_init__(self) -> None:
         if not 0.0 < self.min_width <= self.max_width:
@@ -396,6 +674,11 @@ class PatchingConfig:
             raise ValueError("edge_width must be > 0")
         if self.max_elevation < 0.0:
             raise ValueError("max_elevation must be >= 0")
+        lo, hi = self.elevation_range
+        if not math.isfinite(lo) or not math.isfinite(hi) or lo >= hi:
+            raise ValueError(
+                f"elevation_range must satisfy lo < hi, got {self.elevation_range}"
+            )
 
 
 @dataclass
@@ -408,6 +691,24 @@ class ConcreteDamageConfig:
         joint_width: 接缝宽度 (米)，默认 8mm。
         x_offset: 板块铺设 x 方向偏移 (米)，默认 0。
         y_offset: 板块铺设 y 方向偏移 (米)，默认 0。
+        crack_in_slab: 板裂缝（slab_crack）是否限制在单一板块内。
+            True（默认）——在板内采样走向与位置并裁剪到板边（历史
+            版本为过全云 bbox 中心的无限长直线，可跨 2-3 块板并穿越
+            接缝）；False —— 历史口径。
+        fault_scope: 错台（faulting）±d_max/2 阶跃的影响域。
+            'adjacent-slabs'（默认）——仅接缝两侧相邻两块板位移，远
+            处板块保持原高程；'legacy-strip' —— 历史全条带位移
+            （100% 点被移动）。
+        edge_spall_mode: 边角剥落（edge_spall）深度/空间口径。
+            'patch-truncated'（默认）——局部斑块内空间相关的连续剥
+            落面，深度截断到 d_max（轻 10mm/重 30mm）；'legacy' ——
+            历史接缝带内逐点无界指数深度（单点可达 ~108mm 尖刺）。
+        shatter_mode: 破碎板（slab_shatter）Voronoi 刻槽口径。
+            'clipped-max'（默认）——无限脊线按板 bbox 裁剪后一并刻
+            槽、多脊线命中取最大深度（单点 |Δz| ≤ d_max）；'legacy'
+            —— 历史仅有限脊线、逐条累加（三线交汇可达 3×d_max）。
+        以上四项的聚合回退为 CLI --concrete-legacy（一次性恢复四项
+        旧行为，供回归门使用）。
     """
 
     slab_length: float = 5.0
@@ -415,6 +716,27 @@ class ConcreteDamageConfig:
     joint_width: float = 0.008
     x_offset: float = 0.0
     y_offset: float = 0.0
+    crack_in_slab: bool = True
+    fault_scope: Literal["adjacent-slabs", "legacy-strip"] = "adjacent-slabs"
+    edge_spall_mode: Literal["patch-truncated", "legacy"] = "patch-truncated"
+    shatter_mode: Literal["clipped-max", "legacy"] = "clipped-max"
+
+    def __post_init__(self) -> None:
+        if self.fault_scope not in ("adjacent-slabs", "legacy-strip"):
+            raise ValueError(
+                f"fault_scope must be 'adjacent-slabs' or 'legacy-strip', got "
+                f"{self.fault_scope!r}"
+            )
+        if self.edge_spall_mode not in ("patch-truncated", "legacy"):
+            raise ValueError(
+                f"edge_spall_mode must be 'patch-truncated' or 'legacy', got "
+                f"{self.edge_spall_mode!r}"
+            )
+        if self.shatter_mode not in ("clipped-max", "legacy"):
+            raise ValueError(
+                f"shatter_mode must be 'clipped-max' or 'legacy', got "
+                f"{self.shatter_mode!r}"
+            )
 
 
 @dataclass
@@ -475,19 +797,44 @@ class CurbConfig:
 class RadiometricConfig:
     """辐射强度模型的分布参数（对数正态反照率场 + Gamma 斑点）。
 
-    默认值逐字等于 _compute_intensity 的历史硬编码（corr 0.3 m、
-    sigma_ln 0.25、Gamma M=12），因此默认构造时强度输出与历史版本
-    逐点一致——本选项的"关闭"语义是"参数化但取值不变"。
+    分布参数（albedo_sigma_ln / albedo_corr_len_m / speckle_m）的
+    默认值逐字等于 _compute_intensity 的历史硬编码（0.25 / 0.3 m /
+    12），默认构造时这些项与历史版本逐点一致。强度归一的 AGC 与
+    几何项默认值则**有意变更默认行为**（固定绝对标定、去 cosθ abs、
+    反照率上限 0.95→0.98），旧口径均保留为显式回退（见各字段）。
 
     Attributes:
         albedo_sigma_ln: 对数正态反照率场的对数域标准差 σ_ln。
         albedo_corr_len_m: 反照率场的高斯低通空间相关长度 (米)。
         speckle_m: 乘性 Gamma 斑点的形状参数 M（均值 1、方差 1/M）。
+        agc_mode: AGC（自动增益控制）口径。
+            'fixed'（默认）——除以固定绝对标定值
+            ``agc_reference_power``：沥青/水泥基底比 (~1:2.25) 在强度
+            通道保留可分辨签名，远场动态范围不再被最近点压缩，且不
+            随场景构成漂移。
+            'scene-p99' —— 历史逐场景 p99 归一（材料签名被整除抵消，
+            CLI --agc-mode scene-p99）。
+        agc_reference_power: 固定 AGC 标定功率（**工程标定值**）：默认
+            传感器位姿 (W/2, -1, 2 m)、参考反照率 ρ_ref=0.17（沥青
+            名义均值）、平路面（shading=1）7×5 m @ 5 mm 网格上
+            ρ·cosθ/R² 的 p99 = 0.025003 ≈ 0.025。仅
+            agc_mode='fixed' 时使用。
+        cos_abs: True —— 历史 cosθ = clip(|n·(−d̂)|, 0.03, 1)（背向面
+            被当作朝向前亮度）；False（默认）——cosθ = n·(−d̂) 直接
+            取值，背向面强度趋 0，下限 0.03 仅保留给数值稳定的前向
+            掠射点（CLI --lambert-abs-legacy）。
+        albedo_clip_hi: 反照率硬截断上限，默认 0.98（历史 0.95 会在
+            最亮类别（露骨/唧泥 on 水泥）的对数正态亮尾堆积，
+            CLI --albedo-clip-hi 0.95）。
     """
 
     albedo_sigma_ln: float = 0.25
     albedo_corr_len_m: float = 0.3
     speckle_m: float = 12.0
+    agc_mode: Literal["fixed", "scene-p99"] = "fixed"
+    agc_reference_power: float = 0.025
+    cos_abs: bool = False
+    albedo_clip_hi: float = 0.98
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.albedo_sigma_ln) or self.albedo_sigma_ln < 0:
@@ -501,6 +848,19 @@ class RadiometricConfig:
         if not math.isfinite(self.speckle_m) or self.speckle_m < 1:
             raise ValueError(
                 f"speckle_m must be finite and >= 1 (Gamma shape), got {self.speckle_m}"
+            )
+        if self.agc_mode not in ("fixed", "scene-p99"):
+            raise ValueError(
+                f"agc_mode must be 'fixed' or 'scene-p99', got {self.agc_mode!r}"
+            )
+        if not math.isfinite(self.agc_reference_power) or self.agc_reference_power <= 0:
+            raise ValueError(
+                "agc_reference_power must be finite and > 0, got "
+                f"{self.agc_reference_power}"
+            )
+        if not math.isfinite(self.albedo_clip_hi) or not 0.0 < self.albedo_clip_hi <= 1.0:
+            raise ValueError(
+                f"albedo_clip_hi must be in (0, 1], got {self.albedo_clip_hi}"
             )
 
 
@@ -548,13 +908,25 @@ class LiDARScanConfig:
 class DiseaseConfig:
     """病害生成参数聚合配置。
 
-    每种病害出现的概率 (0-1)，0 表示不生成该类型。
-    severity_ratio 全局默认轻度占比。
+    ``disease_probs`` 是每种病害的**出现概率** (0-1)：默认
+    ``sampling_mode='bernoulli'`` 下按病害逐个独立伯努利抽样（恢复
+    文档『出现概率』语义），再按 ``max_diseases_per_scene`` 封顶；
+    因此期望每场景病害数 ≈ Σp（默认配置 ≈ 0.8 种），**允许出现 0
+    病害的背景场景**。0 值表示该病害类型从不生成。
+    ``sampling_mode='legacy'`` 恢复历史口径：概率归一化为权重、无
+    放回抽恰好 min(max_diseases, n_available) 种（每场景病害数恒
+    定、concrete_damage 等被归一化为权重而非概率）。
 
     Attributes:
-        disease_probs: 各病害类型生成概率字典。
-        severity_ratio: 全局轻度占比，默认 0.6。
-        max_diseases_per_scene: 每场景最大病害数，默认 3。
+        disease_probs: 各病害类型出现概率字典（0 = 不生成）。
+        severity_ratio: 全局轻度占比，默认 0.6。裂缝类可被
+            ``crack.severity_ratio`` 按类型覆盖。
+        max_diseases_per_scene: 每场景最大病害数，默认 3。0 表示强制
+            无病害背景场景（两种 sampling_mode 下选择均恒为空）。
+        sampling_mode: 病害选择口径，'bernoulli'（默认）| 'legacy'。
+        use_stratified: **已弃用**。False 仍强制伯努利（兼容旧
+            --no-stratified 语义）；True 时选择语义由 sampling_mode
+            决定。保留仅为向后兼容。
     """
 
     disease_probs: dict[str, float] = field(default_factory=lambda: {
@@ -573,12 +945,17 @@ class DiseaseConfig:
     severity_ratio: float = 0.6
     max_diseases_per_scene: int = 3
     use_stratified: bool = True
+    sampling_mode: Literal["bernoulli", "legacy"] = "bernoulli"
 
     def __post_init__(self) -> None:
+        if self.sampling_mode not in ("bernoulli", "legacy"):
+            raise ValueError(
+                f"sampling_mode must be 'bernoulli' or 'legacy', got {self.sampling_mode!r}"
+            )
         if not 0.0 <= self.severity_ratio <= 1.0:
             raise ValueError(f"severity_ratio must be in [0,1], got {self.severity_ratio}")
-        if self.max_diseases_per_scene < 1:
-            raise ValueError(f"max_diseases_per_scene must be ≥ 1, got {self.max_diseases_per_scene}")
+        if self.max_diseases_per_scene < 0:
+            raise ValueError(f"max_diseases_per_scene must be ≥ 0, got {self.max_diseases_per_scene}")
         for k, v in self.disease_probs.items():
             if not 0.0 <= v <= 1.0:
                 raise ValueError(f"disease_probs['{k}'] = {v} not in [0,1]")
@@ -1180,9 +1557,8 @@ class GeneratorConfig:
                 **estimate.as_dict(),
                 "max_surface_points": int(self.max_surface_points),
                 "max_surface_memory_mib": float(self.max_surface_memory_mib),
-                # 谱带审计：等级标签指谱系数 Gd(n0)。补丁尺寸截断了
-                # ISO 带的低频侧（IRI 加权带基本缺失），因此合成场景
-                # 不携带 IRI 声明。
+                # 谱带审计：等级标签指谱系数 Gd(n0)。补丁长度 L 截断了
+                # λ > L 的低频侧（IRI 加权带基本缺失）。
                 "roughness_band_cycles_per_m": [
                     1.0 / float(max(self.road.width, self.road.length)),
                     min(
@@ -1199,6 +1575,7 @@ class GeneratorConfig:
                 "texture_hurst": float(self.micro_texture.hurst),
                 "texture_het_sigma_ln": float(self.micro_texture.het_sigma_ln),
                 "texture_het_corr_len_m": float(self.micro_texture.het_corr_len_m),
+                "macro_spectrum_mode": str(self.road.macro_spectrum_mode),
                 # 粗糙度混合开启时逐场景实际抽到的等级在场景字段
                 # roughness_class 里；这里记录配置层面的抽样规格。
                 "roughness_class": (
@@ -1242,6 +1619,12 @@ class GeneratorConfig:
         metadata["surface_grid"]["assembly_mib"] = float(estimate.assembly_mib)
         metadata["sensor_output"] = {
             "observation_model": str(self.observation_model),
+            "agc_mode": str(self.radiometric.agc_mode),
+            "agc_reference_power": (
+                None
+                if self.radiometric.agc_mode == "scene-p99"
+                else float(self.radiometric.agc_reference_power)
+            ),
             "mode": self.sensor_output_mode,
                 "requested_points": requested_points,
                 "requested_density_points_per_m2": self.sensor_output_density_points_per_m2,
@@ -1272,6 +1655,12 @@ class GeneratorConfig:
                 else int(self.model_target_points)
             ),
             "sampling_applied_by_generator": False,
+        }
+        # 病害选择口径审计：bernoulli（默认，disease_probs 即出现概率）
+        # 或 legacy（加权恒定计数）。
+        metadata["disease_sampling"] = {
+            "sampling_mode": str(self.disease.sampling_mode),
+            "max_diseases_per_scene": int(self.disease.max_diseases_per_scene),
         }
         return metadata
 

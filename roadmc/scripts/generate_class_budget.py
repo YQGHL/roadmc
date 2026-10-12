@@ -411,6 +411,219 @@ def _auto_workers() -> int:
     return max(1, min(8, mp.cpu_count() - 2))
 
 
+def _add_realism_flags(parser: argparse.ArgumentParser) -> None:
+    """Register the 2026-10 generator behaviour-fix rollback flags.
+
+    默认值选择修正后的行为；每个 flag 恢复一项具体的旧行为，供回归
+    门按 rollback_recipe 逐项复现旧输出。与 generate_synthetic.py 的
+    同名 flag 语义一致（唯 --disease-sampling 在此直接给默认值，本
+    脚本无 --no-stratified 旧别名）。
+    """
+    g = parser.add_argument_group("生成器行为修正回退（2026-10）")
+    g.add_argument(
+        "--macro-spectrum",
+        choices=["iso-marginal", "legacy"],
+        default="iso-marginal",
+        help="宏观谱权重口径：iso-marginal（默认，ISO 一维边际重构）| legacy（历史点采样权重 + std 重定标）",
+    )
+    g.add_argument(
+        "--disease-sampling",
+        choices=["bernoulli", "legacy"],
+        default="bernoulli",
+        help="病害选择口径：bernoulli（默认，disease_probs 即出现概率，允许 0 病害场景）| legacy（概率归一化加权恒定计数）",
+    )
+    g.add_argument(
+        "--pothole-beta-legacy",
+        action="store_true",
+        help="坑槽 β 恢复历史口径（轻=2.0 字面量、重~U(3,5)，beta_range 同步复位）",
+    )
+    g.add_argument(
+        "--pothole-micropits-legacy",
+        action="store_true",
+        help="微坑恢复历史口径（Poisson(1) 且仅在 edge_quality<1.0 时生成）",
+    )
+    g.add_argument(
+        "--pothole-aspect-legacy",
+        action="store_true",
+        help="取消坑槽 d/R 纵横比先验（恢复 R、d 独立采样）",
+    )
+    g.add_argument(
+        "--pothole-spall-band",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("LO", "HI"),
+        help="坑缘剥落环半径带 (lo·R, hi·R)，默认 0.8 1.0；历史口径传 0.8 1.2",
+    )
+    g.add_argument(
+        "--agc-mode",
+        choices=["fixed", "scene-p99"],
+        default="fixed",
+        help="强度 AGC 口径：fixed（默认，固定绝对标定）| scene-p99（历史逐场景 99 分位归一）",
+    )
+    g.add_argument(
+        "--rutting-modulation-legacy",
+        action="store_true",
+        help="取消车辙名义深度 1/(1+ε) 归一化（历史口径）",
+    )
+    g.add_argument(
+        "--rutting-center-legacy",
+        action="store_true",
+        help="车辙中心恢复恒位于道路中线（不走轮迹带先验）",
+    )
+    g.add_argument(
+        "--crack-perturb-legacy",
+        action="store_true",
+        help="恢复裂缝走向扰动的 %%1 周期化环绕（历史口径）",
+    )
+    g.add_argument(
+        "--crack-width-trunc",
+        choices=["resample", "clip"],
+        default="resample",
+        help="缝宽判据侧截断：resample（默认，拒绝重采）| clip（历史钳制到边界）",
+    )
+    g.add_argument(
+        "--areacrack-lambda-legacy",
+        action="store_true",
+        help="恢复面状裂缝槽形 λ=w/2（历史口径）",
+    )
+    g.add_argument(
+        "--areacrack-label-legacy",
+        action="store_true",
+        help="面状裂缝标签恢复直接采信 severity 字符串（历史口径）",
+    )
+    g.add_argument(
+        "--concrete-legacy",
+        action="store_true",
+        help="一次性恢复水泥病害四项旧行为（板内裂缝/错台全条带/边角剥落无界指数/破碎板脊线累加）",
+    )
+    g.add_argument(
+        "--depression-center-legacy",
+        action="store_true",
+        help="沉陷中心恢复固定内缩 0.5 m（历史口径）",
+    )
+    g.add_argument(
+        "--depression-label-legacy",
+        action="store_true",
+        help="沉陷标签恢复 depth·1%% 隐式外扩（历史口径）",
+    )
+    g.add_argument(
+        "--bleeding-geometry-legacy",
+        action="store_true",
+        help="泛油恢复恒定 40%% 面积、贯穿全路长条带（历史口径）",
+    )
+    g.add_argument(
+        "--lambert-abs-legacy",
+        action="store_true",
+        help="恢复 cosθ 取 |n·(−d̂)| 的历史口径（背向面按朝向计亮）",
+    )
+    g.add_argument(
+        "--albedo-clip-hi",
+        type=float,
+        default=0.98,
+        help="反照率截断上限（默认 0.98；历史口径传 0.95）",
+    )
+    g.add_argument(
+        "--micro-texture-grid-legacy",
+        action="store_true",
+        help="恢复纹理谱 fftfreq(d=extent/gx) 历史频率网格口径",
+    )
+    g.add_argument(
+        "--het-field-1d",
+        action="store_true",
+        help="纹理 het 调制恢复沿里程 y 一维广播（历史口径；默认二维调制场）",
+    )
+
+
+def _apply_realism_overrides(
+    args: argparse.Namespace,
+    config: GeneratorConfig,
+) -> GeneratorConfig:
+    """Translate the realism rollback flags into GeneratorConfig fields."""
+    return replace(
+        config,
+        pothole=replace(
+            config.pothole,
+            beta_mode="legacy" if args.pothole_beta_legacy else config.pothole.beta_mode,
+            beta_range=(3.0, 5.0) if args.pothole_beta_legacy else config.pothole.beta_range,
+            micropit_mode=(
+                "legacy" if args.pothole_micropits_legacy else config.pothole.micropit_mode
+            ),
+            aspect_ratio_range=(
+                None if args.pothole_aspect_legacy else config.pothole.aspect_ratio_range
+            ),
+            spall_band=(
+                tuple(args.pothole_spall_band)
+                if args.pothole_spall_band is not None
+                else config.pothole.spall_band
+            ),
+        ),
+        rutting=replace(
+            config.rutting,
+            peak_normalize=not args.rutting_modulation_legacy,
+            center_mode=(
+                "fixed" if args.rutting_center_legacy else config.rutting.center_mode
+            ),
+        ),
+        crack=replace(
+            config.crack,
+            perturb_mode=(
+                "legacy" if args.crack_perturb_legacy else config.crack.perturb_mode
+            ),
+            width_truncation=args.crack_width_trunc,
+            area_lambda_mode=(
+                "half" if args.areacrack_lambda_legacy else config.crack.area_lambda_mode
+            ),
+            area_label_mode=(
+                "legacy" if args.areacrack_label_legacy else config.crack.area_label_mode
+            ),
+        ),
+        concrete_damage=(
+            replace(
+                config.concrete_damage,
+                crack_in_slab=False,
+                fault_scope="legacy-strip",
+                edge_spall_mode="legacy",
+                shatter_mode="legacy",
+            )
+            if args.concrete_legacy
+            else config.concrete_damage
+        ),
+        depression=replace(
+            config.depression,
+            center_inset_mode=(
+                "legacy" if args.depression_center_legacy else config.depression.center_inset_mode
+            ),
+            label_radius_mode=(
+                "legacy-1pct"
+                if args.depression_label_legacy
+                else config.depression.label_radius_mode
+            ),
+        ),
+        bleeding=replace(
+            config.bleeding,
+            geometry_mode=(
+                "legacy-strip" if args.bleeding_geometry_legacy else config.bleeding.geometry_mode
+            ),
+        ),
+        radiometric=replace(
+            config.radiometric,
+            agc_mode=args.agc_mode,
+            cos_abs=True if args.lambert_abs_legacy else config.radiometric.cos_abs,
+            albedo_clip_hi=args.albedo_clip_hi,
+        ),
+        micro_texture=replace(
+            config.micro_texture,
+            grid_convention=(
+                "legacy"
+                if args.micro_texture_grid_legacy
+                else config.micro_texture.grid_convention
+            ),
+            het_field="1d" if args.het_field_1d else config.micro_texture.het_field,
+        ),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default="./data/class_budget_output")
@@ -527,9 +740,10 @@ def main() -> None:
         "--max-diseases",
         type=int,
         default=1,
-        help="每场景最多病害数（默认 1 = 历史硬编码值）",
+        help="每场景最多病害数（默认 1 = 历史硬编码值；0 = 仅无病害背景场景）",
     )
     parser.add_argument("--dry-run", action="store_true")
+    _add_realism_flags(parser)
     args = parser.parse_args()
 
     if args.target_scenes_per_class < 1:
@@ -554,8 +768,8 @@ def main() -> None:
         raise ValueError("--albedo-sigma-ln must be >= 0")
     if args.speckle_m < 1:
         raise ValueError("--speckle-m must be >= 1")
-    if args.max_diseases < 1:
-        raise ValueError("--max-diseases must be >= 1")
+    if args.max_diseases < 0:
+        raise ValueError("--max-diseases must be >= 0 (0 = disease-free background scenes)")
     if args.roughness_mix is not None and args.roughness_mix.strip():
         print(
             "[note] --roughness-mix is set: the ISO 8608 class is drawn per scene "
@@ -578,6 +792,7 @@ def main() -> None:
             pavement_type=args.pavement,
             roughness_class=args.roughness,
             roughness_mix=_parse_roughness_mix(args.roughness_mix),
+            macro_spectrum_mode=args.macro_spectrum,
         ),
         micro_texture=MicroTextureConfig(
             amplitude=args.texture_rms,
@@ -589,13 +804,17 @@ def main() -> None:
             albedo_sigma_ln=args.albedo_sigma_ln,
             speckle_m=args.speckle_m,
         ),
-        disease=DiseaseConfig(max_diseases_per_scene=args.max_diseases),
+        disease=DiseaseConfig(
+            max_diseases_per_scene=args.max_diseases,
+            sampling_mode=args.disease_sampling,
+        ),
         seed=args.seed,
         num_points=args.num_points,
         # 与 generate_synthetic.py 同一冻结体制：CLI 默认 off（直出全表面），
         # on 为 legacy 回归口径（显式传值时与历史版本逐位一致）。
         observation_model=args.observation_model,
     )
+    config = _apply_realism_overrides(args, config)
     estimate = config.estimate_surface_generation()
     if args.workers <= 0:
         # 自动 worker 数必须尊重并行内存预算：毫米条带单 worker 峰值

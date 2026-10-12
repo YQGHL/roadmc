@@ -59,6 +59,7 @@ road morphology + damage deformation + LiDAR observation
 | Architecture comparison | ✅ Five mainstream point-cloud segmentation networks run to 30 epochs under the identical protocol (see below) |
 | Channel-mixing ablation | ✅ Four variants × three seeds complete; between-variant differences are smaller than within-variant spread, **no mechanistic claim** |
 | Generator realism options | ✅ Roughness mixture, along-track texture heterogeneity, curb strip, radiometric calibration — all implemented, all off by default, v2 behaviour unchanged |
+| Generator behaviour fixes | ✅ The 2026-10 fix batch is in: ISO-marginal macro-spectrum reweighting, Bernoulli disease sampling, fixed-absolute AGC calibration, geometry corrections for potholes / rutting / depressions / cracks / concrete distresses — **default output changes**; every legacy behaviour is kept behind an explicit rollback flag (see "Generator behaviour fixes and rollback"); new-vs-old comparison numbers **pending re-validation** |
 | Domain-gap diagnostics | v2 joint MMD `0.136` (41 frames), replicated at `0.1368` on a 441-frame subset; the realism-config comparison is **pending re-validation** (the implementation was lost and re-written to spec in 2026-10; numbers to be backfilled) |
 | Real-domain performance | No real semantic mIoU. The available M2S-RoAD samples are unlabelled and used only for domain-gap diagnostics |
 
@@ -188,6 +189,8 @@ $$
 
 The generator constructs the surface and the damage deformation first, then applies the observation model. It explicitly separates three resolutions: the physical surface grid spacing (`--surface-grid-spacing` in `generate_synthetic.py`, `--grid-res` in the class-budget script, `0.02 m` in v2), the sensor output point count (`--num-points`), and the downstream model input budget. Millimetre-scale surface grids do not automatically survive into the final cloud; each scene records all three resolutions and the protection-sampling audit in `resolution_metadata_json`.
 
+Boundary statement: both pavement types **share the same geometric macro spectrum and texture spectrum — material texture differentiation is not modelled**. `pavement_type` only selects the disease set and the radiometric material prior (base albedo); concrete tining/broom texture and joint periodicity are unimplemented follow-ups. Subgrade-related mechanisms (depression–weak-base coupling, reflective cracking, faulting–pumping causality chains) are likewise out of scope.
+
 ### Generating a dataset
 
 ```powershell
@@ -275,6 +278,59 @@ python roadmc/scripts/generate_class_budget.py `
 ```
 
 How this configuration moves the joint MMD is **pending re-validation**: it will be re-measured against real data under the same rule as the table above and backfilled.
+
+### Generator behaviour fixes and rollback (2026-10)
+
+A 2026-10 audit-and-fix batch **changes several default generation behaviours**. The new defaults:
+
+- Macro spectrum: the ISO band is reweighted row-by-row to the ISO one-dimensional marginal spectrum, removing the systematic variance bias between the discrete marginal and the ISO definition, and the implementation-level std rescaling is dropped;
+- Disease selection: `disease_probs` regains its documented "probability of occurrence" semantics — an independent Bernoulli draw per disease, capped by `--max-diseases`; the expected number of diseases per scene is ≈ Σp and **scenes with zero diseases are allowed** (the legacy scheme normalized the probabilities into weights and always drew a fixed count, so appearance rates far exceeded the nominal values);
+- Intensity AGC: per-scene p99 normalization is replaced by a fixed absolute calibration (`radiometric.agc_reference_power`, an engineering calibration constant) — the asphalt/concrete material signature survives in the intensity channel and no longer drifts with scene composition;
+- Potholes: light and severe share β~U(2,5) (profile shape alone no longer separates the two grades — geometric label leakage removed), a bounded aspect-ratio prior constrains radius/depth, micro-pit intensity scales with damaged area, and spall labels stay inside the main depression footprint;
+- Depressions: the centre inset is at least the sampled radius (the full bowl always lies inside the carriageway footprint), and the label disc radius is explicit (= R);
+- Rutting: nominal depth is divided by (1+ε) so the realized peak no longer crosses the JTG 10/15 mm grade boundary, and the centre follows the wheelpath prior (consistent with cracks and potholes);
+- Cracks: de-periodized centreline perturbation, rejection resampling for the width-truncation criterion, area-crack groove shape aligned with the linear-crack edge-continuity principle, and a measure-then-label mechanism for area cracks;
+- Concrete distresses: slab cracks are confined to a single slab, faulting steps affect only the two slabs adjacent to the joint, edge spall depth is truncated to the grade limit, and shatter Voronoi ridges are clipped per slab with max-depth accumulation;
+- Bleeding: the constant-40%-area, full-length, hard-edged strip becomes randomized patches on the wheelpath (area fraction U(5%, 25%), logistic-smoothed boundary);
+- Lambert term: cosθ no longer takes an absolute value (back-facing points no longer read as front-lit), and the albedo clip ceiling moves 0.95 → 0.98.
+
+Every item keeps an explicit rollback channel (the legacy behaviours are retained for regression gating only, not as recommended settings). Both generation scripts accept the same flags:
+
+| Rollback flag | Legacy behaviour restored |
+| --- | --- |
+| `--macro-spectrum legacy` | Legacy point-sampled spectrum weights + std rescaling |
+| `--disease-sampling legacy` | Weight-normalized fixed-count selection (`--no-stratified` survives as a deprecated alias of the bernoulli mode) |
+| `--pothole-beta-legacy` / `--pothole-micropits-legacy` / `--pothole-aspect-legacy` | Literal per-grade β / clamped micro-pit count / no aspect-ratio prior |
+| `--pothole-spall-band 0.8 1.2` | Spall band extended to 1.2R |
+| `--agc-mode scene-p99` | Per-scene p99 AGC |
+| `--rutting-modulation-legacy` / `--rutting-center-legacy` | Depth normalization off / rutting centre fixed on the road centreline |
+| `--crack-perturb-legacy` / `--crack-width-trunc clip` / `--areacrack-lambda-legacy` / `--areacrack-label-legacy` | Periodic wrap-around perturbation / width clipping / λ=w/2 groove / area-crack labels taken from the severity string |
+| `--concrete-legacy` | All four legacy concrete behaviours (cross-slab cracks, full-strip faulting, unbounded exponential spall, additive ridge grooves) |
+| `--depression-center-legacy` / `--depression-label-legacy` | Fixed 0.5 m centre inset / implicit depth·1% label expansion |
+| `--bleeding-geometry-legacy` | Constant-40%-area strip |
+| `--lambert-abs-legacy` / `--albedo-clip-hi 0.95` | cosθ taken as absolute value / albedo ceiling 0.95 |
+| `--micro-texture-grid-legacy` / `--het-field-1d` | Legacy texture frequency grid / 1-D het modulation field |
+
+One command restores every pre-2026-10 behaviour (for regression gating):
+
+```powershell
+python roadmc/scripts/generate_synthetic.py `
+  --macro-spectrum legacy --disease-sampling legacy `
+  --pothole-beta-legacy --pothole-micropits-legacy --pothole-aspect-legacy `
+  --pothole-spall-band 0.8 1.2 --agc-mode scene-p99 `
+  --rutting-modulation-legacy --rutting-center-legacy `
+  --crack-perturb-legacy --crack-width-trunc clip `
+  --areacrack-lambda-legacy --areacrack-label-legacy --concrete-legacy `
+  --depression-center-legacy --depression-label-legacy `
+  --bleeding-geometry-legacy --lambert-abs-legacy --albedo-clip-hi 0.95 `
+  --micro-texture-grid-legacy
+```
+
+Config schema changes (constructing with the old keywords now raises `TypeError`): `PotholeConfig` drops `max_radius_light` / `edge_spall_prob`; `DepressionConfig.max_radius` becomes `radius_range=(0.5, 2.0)`; `RavelingConfig.pitting_depth` becomes `erosion_depth=(0.002, 0.005)`; `BleedingConfig.intensity_boost` (measured to have zero effect on output) becomes `intensity_multiplier=0.55`; `MicroTextureConfig.octaves` is removed (the spectral path stopped using it long ago); `CrackConfig.severity_ratio` becomes `None` (= use `disease.severity_ratio`) and is wired as a crack-specific override. Those fields were never read, or never read correctly, before — see the config.py comments for the details.
+
+Merge-order note: part of the knobs above are consumed on the `primitives.py` side (spectrum reweighting, pothole/crack/concrete geometry, depression label radius, texture grid convention, het field dimension). The assembly layer uses two channels: signature-level new kwargs (e.g. `macro_spectrum_mode`) are forwarded or dropped according to each primitive's current signature, while keys inside a `params` dict always travel with the dict — but the assembly layer checks whether the primitive's source actually reads them. While the primitives-side batch is not merged, every key whose requested behaviour differs from the primitive's current behaviour warns once and is recorded in the scene metadata `pending_primitive_upgrades` (recorded scene-accurately, containing only the keys this scene actually hit); requests whose behaviour equals the primitive's current behaviour — i.e. every rollback flag's legacy value — stay silent, so a full-legacy rollback run yields an empty pending set and is distinguishable from a new-default run at the regression gate. Nothing switches silently. Once the primitives side lands, the same assembly code activates the knobs and the pending set empties.
+
+Comparison numbers between the new-default and legacy datasets (including against real data): **pending re-validation**.
 
 ## Model Training
 
@@ -454,6 +510,8 @@ Each scene is stored as a compressed `.npz` file:
 | 34 | Pitting | 35 | Blowup |
 | 36 | Exposed aggregate | 37 | Concrete patching |
 
+> Note: the light/severe grading convention for labels 17-18 (corrugation) — single-sided wave height vs peak-to-valley — needs manual verification against the JTG 5210-2018 original text; the current implementation uses single-sided height.
+
 ## Repository Structure
 
 ```text
@@ -500,6 +558,7 @@ readmeimage/
 - Corrected three defects that made domain-gap readings non-comparable (normal source, intensity range, sampling window), reducing joint MMD from 0.458 to 0.136, and replicated the result on a 441-frame subset.
 - Restored four realism option groups on the generator (roughness mixture, along-track texture heterogeneity, curb strip, radiometric calibration), all off by default with bit-identical default output; the real-domain comparison is pending re-validation.
 - Located and worked around the M2S-RoAD `range == 0` no-return encoding issue.
+- Landed the 2026-10 generator behaviour-fix batch (ISO-marginal macro spectrum, Bernoulli disease sampling, fixed-absolute AGC calibration, pothole/rutting/depression/crack/concrete geometry corrections, dead-config cleanup) with every legacy behaviour kept behind an explicit rollback flag; new-vs-old comparison numbers pending re-validation. Restored the texture MPD physical regression test (`tests/test_texture_metrics.py`, fixed-seed assertion MPD ∈ [0.35, 0.55] mm).
 
 ### Roadmap
 

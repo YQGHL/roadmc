@@ -105,7 +105,7 @@ def generate_dataset(
     config: GeneratorConfig,
     split: str,
     output_dir: Path,
-    use_stratified: bool = True,
+    sampling_mode: str = "bernoulli",
     num_workers: int = 1,
 ) -> dict:
     from roadmc.data.synthetic.generator import SyntheticRoadDataset
@@ -118,7 +118,7 @@ def generate_dataset(
         scene_config = replace(config, seed=config.seed + 100000)
     scene_config = replace(
         scene_config,
-        disease=replace(scene_config.disease, use_stratified=use_stratified),
+        disease=replace(scene_config.disease, sampling_mode=sampling_mode),
     )
 
     class_counts = dict.fromkeys(range(NUM_CLASSES), 0)
@@ -294,26 +294,263 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pavement", type=str, default="mixed", choices=["asphalt", "concrete", "mixed"], help="路面类型")
     parser.add_argument("--roughness", type=str, default="B", choices=["A", "B", "C", "D", "E"], help="ISO 8608 粗糙度等级")
-    parser.add_argument("--max-diseases", type=int, default=3, help="每场景最多病害数")
-    parser.add_argument("--no-stratified", action="store_true", help="禁用分层采样")
+    parser.add_argument("--max-diseases", type=int, default=3, help="每场景最多病害数（0 = 仅无病害背景场景）")
+    parser.add_argument(
+        "--no-stratified",
+        action="store_true",
+        help="（已弃用）--disease-sampling bernoulli 的旧别名：伯努利语义现已是默认；保留仅为兼容现有脚本",
+    )
     parser.add_argument("--workers", type=int, default=1, help="并行 worker 数")
+    _add_realism_flags(parser)
     return parser
+
+
+def _add_realism_flags(parser: argparse.ArgumentParser) -> None:
+    """Register the 2026-10 generator behaviour-fix rollback flags.
+
+    默认值选择修正后的行为；每个 flag 恢复一项具体的旧行为，供回归
+    门按 rollback_recipe 逐项复现旧输出（默认全部不传 = 全新行为）。
+    """
+    g = parser.add_argument_group("生成器行为修正回退（2026-10）")
+    g.add_argument(
+        "--macro-spectrum",
+        choices=["iso-marginal", "legacy"],
+        default="iso-marginal",
+        help="宏观谱权重口径：iso-marginal（默认，ISO 一维边际重构）| legacy（历史点采样权重 + std 重定标）",
+    )
+    g.add_argument(
+        "--disease-sampling",
+        choices=["bernoulli", "legacy"],
+        default=None,
+        help="病害选择口径：bernoulli（默认，disease_probs 即出现概率，允许 0 病害场景）| legacy（概率归一化加权恒定计数）",
+    )
+    g.add_argument(
+        "--pothole-beta-legacy",
+        action="store_true",
+        help="坑槽 β 恢复历史口径（轻=2.0 字面量、重~U(3,5)，beta_range 同步复位）",
+    )
+    g.add_argument(
+        "--pothole-micropits-legacy",
+        action="store_true",
+        help="微坑恢复历史口径（Poisson(1) 且仅在 edge_quality<1.0 时生成）",
+    )
+    g.add_argument(
+        "--pothole-aspect-legacy",
+        action="store_true",
+        help="取消坑槽 d/R 纵横比先验（恢复 R、d 独立采样）",
+    )
+    g.add_argument(
+        "--pothole-spall-band",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("LO", "HI"),
+        help="坑缘剥落环半径带 (lo·R, hi·R)，默认 0.8 1.0；历史口径传 0.8 1.2",
+    )
+    g.add_argument(
+        "--agc-mode",
+        choices=["fixed", "scene-p99"],
+        default="fixed",
+        help="强度 AGC 口径：fixed（默认，固定绝对标定）| scene-p99（历史逐场景 99 分位归一）",
+    )
+    g.add_argument(
+        "--rutting-modulation-legacy",
+        action="store_true",
+        help="取消车辙名义深度 1/(1+ε) 归一化（历史口径）",
+    )
+    g.add_argument(
+        "--rutting-center-legacy",
+        action="store_true",
+        help="车辙中心恢复恒位于道路中线（不走轮迹带先验）",
+    )
+    g.add_argument(
+        "--crack-perturb-legacy",
+        action="store_true",
+        help="恢复裂缝走向扰动的 %%1 周期化环绕（历史口径）",
+    )
+    g.add_argument(
+        "--crack-width-trunc",
+        choices=["resample", "clip"],
+        default="resample",
+        help="缝宽判据侧截断：resample（默认，拒绝重采）| clip（历史钳制到边界）",
+    )
+    g.add_argument(
+        "--areacrack-lambda-legacy",
+        action="store_true",
+        help="恢复面状裂缝槽形 λ=w/2（历史口径）",
+    )
+    g.add_argument(
+        "--areacrack-label-legacy",
+        action="store_true",
+        help="面状裂缝标签恢复直接采信 severity 字符串（历史口径）",
+    )
+    g.add_argument(
+        "--concrete-legacy",
+        action="store_true",
+        help="一次性恢复水泥病害四项旧行为（板内裂缝/错台全条带/边角剥落无界指数/破碎板脊线累加）",
+    )
+    g.add_argument(
+        "--depression-center-legacy",
+        action="store_true",
+        help="沉陷中心恢复固定内缩 0.5 m（历史口径）",
+    )
+    g.add_argument(
+        "--depression-label-legacy",
+        action="store_true",
+        help="沉陷标签恢复 depth·1%% 隐式外扩（历史口径）",
+    )
+    g.add_argument(
+        "--bleeding-geometry-legacy",
+        action="store_true",
+        help="泛油恢复恒定 40%% 面积、贯穿全路长条带（历史口径）",
+    )
+    g.add_argument(
+        "--lambert-abs-legacy",
+        action="store_true",
+        help="恢复 cosθ 取 |n·(−d̂)| 的历史口径（背向面按朝向计亮）",
+    )
+    g.add_argument(
+        "--albedo-clip-hi",
+        type=float,
+        default=0.98,
+        help="反照率截断上限（默认 0.98；历史口径传 0.95）",
+    )
+    g.add_argument(
+        "--micro-texture-grid-legacy",
+        action="store_true",
+        help="恢复纹理谱 fftfreq(d=extent/gx) 历史频率网格口径",
+    )
+    g.add_argument(
+        "--het-field-1d",
+        action="store_true",
+        help="纹理 het 调制恢复沿里程 y 一维广播（历史口径；默认二维调制场）",
+    )
+
+
+def _resolve_disease_sampling(args: argparse.Namespace) -> str:
+    """Resolve --disease-sampling / deprecated --no-stratified into one mode."""
+    if args.no_stratified:
+        if args.disease_sampling is not None and args.disease_sampling != "bernoulli":
+            raise ValueError(
+                "--no-stratified (deprecated alias for --disease-sampling "
+                "bernoulli) conflicts with --disease-sampling "
+                f"{args.disease_sampling!r}"
+            )
+        warnings.warn(
+            "--no-stratified is deprecated: it maps to --disease-sampling "
+            "bernoulli, which is now the default. Use --disease-sampling "
+            "legacy to restore the weighted constant-count behaviour.",
+            stacklevel=2,
+        )
+        return "bernoulli"
+    return args.disease_sampling or "bernoulli"
+
+
+def _apply_realism_overrides(
+    args: argparse.Namespace,
+    config: GeneratorConfig,
+) -> GeneratorConfig:
+    """Translate the realism rollback flags into GeneratorConfig fields."""
+    return replace(
+        config,
+        pothole=replace(
+            config.pothole,
+            beta_mode="legacy" if args.pothole_beta_legacy else config.pothole.beta_mode,
+            beta_range=(3.0, 5.0) if args.pothole_beta_legacy else config.pothole.beta_range,
+            micropit_mode=(
+                "legacy" if args.pothole_micropits_legacy else config.pothole.micropit_mode
+            ),
+            aspect_ratio_range=(
+                None if args.pothole_aspect_legacy else config.pothole.aspect_ratio_range
+            ),
+            spall_band=(
+                tuple(args.pothole_spall_band)
+                if args.pothole_spall_band is not None
+                else config.pothole.spall_band
+            ),
+        ),
+        rutting=replace(
+            config.rutting,
+            peak_normalize=not args.rutting_modulation_legacy,
+            center_mode=(
+                "fixed" if args.rutting_center_legacy else config.rutting.center_mode
+            ),
+        ),
+        crack=replace(
+            config.crack,
+            perturb_mode=(
+                "legacy" if args.crack_perturb_legacy else config.crack.perturb_mode
+            ),
+            width_truncation=args.crack_width_trunc,
+            area_lambda_mode=(
+                "half" if args.areacrack_lambda_legacy else config.crack.area_lambda_mode
+            ),
+            area_label_mode=(
+                "legacy" if args.areacrack_label_legacy else config.crack.area_label_mode
+            ),
+        ),
+        concrete_damage=(
+            replace(
+                config.concrete_damage,
+                crack_in_slab=False,
+                fault_scope="legacy-strip",
+                edge_spall_mode="legacy",
+                shatter_mode="legacy",
+            )
+            if args.concrete_legacy
+            else config.concrete_damage
+        ),
+        depression=replace(
+            config.depression,
+            center_inset_mode=(
+                "legacy" if args.depression_center_legacy else config.depression.center_inset_mode
+            ),
+            label_radius_mode=(
+                "legacy-1pct"
+                if args.depression_label_legacy
+                else config.depression.label_radius_mode
+            ),
+        ),
+        bleeding=replace(
+            config.bleeding,
+            geometry_mode=(
+                "legacy-strip" if args.bleeding_geometry_legacy else config.bleeding.geometry_mode
+            ),
+        ),
+        radiometric=replace(
+            config.radiometric,
+            agc_mode=args.agc_mode,
+            cos_abs=True if args.lambert_abs_legacy else config.radiometric.cos_abs,
+            albedo_clip_hi=args.albedo_clip_hi,
+        ),
+        micro_texture=replace(
+            config.micro_texture,
+            grid_convention=(
+                "legacy"
+                if args.micro_texture_grid_legacy
+                else config.micro_texture.grid_convention
+            ),
+            het_field="1d" if args.het_field_1d else config.micro_texture.het_field,
+        ),
+    )
 
 
 def _config_from_args(args: argparse.Namespace) -> GeneratorConfig:
     """Translate CLI names into the backward-compatible config fields."""
 
-    return GeneratorConfig(
+    config = GeneratorConfig(
         road=RoadSurfaceConfig(
             width=args.width,
             length=args.length,
             grid_res=args.surface_grid_spacing,
             roughness_class=args.roughness,
             pavement_type=args.pavement,
+            macro_spectrum_mode=args.macro_spectrum,
         ),
         disease=DiseaseConfig(
             max_diseases_per_scene=args.max_diseases,
             use_stratified=not args.no_stratified,
+            sampling_mode=_resolve_disease_sampling(args),
         ),
         seed=args.seed,
         num_points=args.sensor_output_points,
@@ -324,6 +561,7 @@ def _config_from_args(args: argparse.Namespace) -> GeneratorConfig:
         # CLI 默认 off（冻结决策）；GeneratorConfig 的库内默认仍是 "on"。
         observation_model=args.observation_model,
     )
+    return _apply_realism_overrides(args, config)
 
 
 def _validate_request(
@@ -334,8 +572,8 @@ def _validate_request(
 
     if args.train_count < 0 or args.val_count < 0:
         raise ValueError("--train-count and --val-count must be >= 0")
-    if args.max_diseases < 1:
-        raise ValueError("--max-diseases must be >= 1")
+    if args.max_diseases < 0:
+        raise ValueError("--max-diseases must be >= 0 (0 = disease-free background scenes)")
     if args.workers < 0:
         raise ValueError("--workers must be >= 0; zero retains legacy single-worker behavior")
 
@@ -444,6 +682,7 @@ def _print_resolution_summary(
 def main() -> None:
     args = _build_parser().parse_args()
     config = _config_from_args(args)
+    effective_sampling = config.disease.sampling_mode
     workers, estimated_parallel_mib = _validate_request(args, config)
 
     output_dir = Path(args.output_dir)
@@ -453,8 +692,8 @@ def main() -> None:
     _print_resolution_summary(config, workers, estimated_parallel_mib)
 
     stats = {
-        "train": generate_dataset(args.train_count, config, "train", output_dir, use_stratified=not args.no_stratified, num_workers=workers),
-        "val": generate_dataset(args.val_count, config, "val", output_dir, use_stratified=not args.no_stratified, num_workers=workers),
+        "train": generate_dataset(args.train_count, config, "train", output_dir, sampling_mode=effective_sampling, num_workers=workers),
+        "val": generate_dataset(args.val_count, config, "val", output_dir, sampling_mode=effective_sampling, num_workers=workers),
     }
 
     print("\n" + "=" * 60)
@@ -474,7 +713,10 @@ def main() -> None:
             "seed": args.seed,
             "max_diseases": args.max_diseases,
             "num_classes": NUM_CLASSES,
+            "sampling_mode": effective_sampling,
             "use_stratified": not args.no_stratified,
+            "macro_spectrum": args.macro_spectrum,
+            "agc_mode": args.agc_mode,
             "max_surface_points": args.max_surface_points,
             "max_surface_memory_mib": args.max_surface_memory_mib,
             "max_parallel_memory_mib": args.max_parallel_memory_mib,

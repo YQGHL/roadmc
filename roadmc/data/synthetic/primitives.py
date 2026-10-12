@@ -157,6 +157,7 @@ def _fractal_perturbation(
     persistence: float = 0.5,
     scale: float = 1.0,
     seed: int = 0,
+    periodic: bool = True,
 ) -> np.ndarray:
     """Multi-octave fractal noise (value noise) for crack path perturbation.
 
@@ -166,14 +167,23 @@ def _fractal_perturbation(
         f(\\mathbf{x}) = \\sum_{k=0}^{\\text{octaves}-1}
         p^k \\cdot \\text{noise}\\left(\\frac{l^k \\mathbf{x}}{s}\\right)
 
+    实现是**多倍频程 value noise**（节点值插值），不是 Perlin 梯度噪声。
+
+    ``periodic=True``（历史口径）：在固定 8×8 网格上按 ``(x·f) % 1``
+    环绕采样——默认 ``scale=0.5`` 下沿走向每 0.5 m 精确重复，是可辨的
+    合成痕迹。``periodic=False``（默认调用口径，见 ``perturb_mode``）：
+    按曲线**弧长域**在覆盖全长的网格上直接插值，网格尺寸随曲线长度增长
+    （节点数 ~ 弧长/单元尺寸），无周期重复。
+
     Args:
         x: x 坐标。
         y: y 坐标。
         octaves: 倍频程数。
         lacunarity: 频率倍增因子。
         persistence: 振幅衰减因子。
-        scale: 空间尺度。
+        scale: 空间尺度（首倍频程单元尺寸，米）。
         seed: 随机种子。
+        periodic: True = 历史 (x·f)%1 环绕；False = 无界弧长域插值。
 
     Returns:
         扰动值数组，与 x, y 形状相同。
@@ -186,20 +196,39 @@ def _fractal_perturbation(
     xi = np.asarray(x)
     yi = np.asarray(y)
 
-    for _o in range(octaves):
-        grid_size = 8
-        noise_grid = rng.uniform(-1.0, 1.0, (grid_size, grid_size))
+    if not periodic:
+        # 弧长参数域（按折线累计距离），网格覆盖全长、尺寸随长度增长。
+        seg = np.hypot(np.diff(np.asarray(x, dtype=np.float64)),
+                       np.diff(np.asarray(y, dtype=np.float64)))
+        s = np.concatenate([[0.0], np.cumsum(seg)]) if seg.size else np.zeros(1)
+        s_max = float(s[-1]) if s.size else 0.0
 
-        interp = interpolate.RegularGridInterpolator(
-            (np.linspace(0, 1, grid_size), np.linspace(0, 1, grid_size)),
-            noise_grid,
-            bounds_error=False,
-            fill_value=0.0,
-        )
+    for o in range(octaves):
+        if periodic:
+            grid_size = 8
+            noise_grid = rng.uniform(-1.0, 1.0, (grid_size, grid_size))
 
-        sample_x = (xi * frequency) % 1.0
-        sample_y = (yi * frequency) % 1.0
-        result += amplitude * interp(np.stack([sample_x, sample_y], axis=-1))
+            interp = interpolate.RegularGridInterpolator(
+                (np.linspace(0, 1, grid_size), np.linspace(0, 1, grid_size)),
+                noise_grid,
+                bounds_error=False,
+                fill_value=0.0,
+            )
+
+            sample_x = (xi * frequency) % 1.0
+            sample_y = (yi * frequency) % 1.0
+            result += amplitude * interp(np.stack([sample_x, sample_y], axis=-1))
+        else:
+            cell = max(scale / (lacunarity ** o), 1e-9)
+            n_grid = int(np.clip(np.ceil(s_max / cell) + 1, 4, 4096))
+            noise_grid = rng.uniform(-1.0, 1.0, n_grid)
+            interp = interpolate.RegularGridInterpolator(
+                (np.linspace(0.0, max(s_max, cell), n_grid),),
+                noise_grid,
+                bounds_error=False,
+                fill_value=0.0,
+            )
+            result += amplitude * interp(s)
 
         amplitude *= persistence
         frequency *= lacunarity
@@ -304,11 +333,93 @@ def _bilinear_interpolation(
 # 1.1.1 — 路面宏观轮廓生成 (ISO 8608 PSD)
 
 
+def _iso_taper_weight(omega: np.ndarray, taper: tuple[float, float] | None) -> np.ndarray:
+    """ISO 带边缘的半个倍频程余弦 taper 权重（tuning#1）。
+
+    ``taper=(f_lo, f_hi)``（默认 :math:`f_{\\mathrm{iso,max}}/\\sqrt2` 到
+    :math:`f_{\\mathrm{iso,max}}\\sqrt2`，即半个倍频程）：Ω ≤ f_lo 取 1、
+    Ω ≥ f_hi 取 0、其间 :math:`\\cos^2` 平滑过渡，消除 ISO 段 (Ω⁻³) 与
+    纹理段 (Ω^-(2H+2)) 在带边的谱指数/幅值跳变。``None`` 返回全 1
+    （历史硬切换）。
+    """
+    if taper is None:
+        return np.ones_like(omega)
+    lo, hi = taper
+    c = np.clip((omega - lo) / (hi - lo), 0.0, 1.0)
+    return 0.5 * (1.0 + np.cos(np.pi * c))
+
+
+def _iso_marginal_psd_2d(
+    fx: np.ndarray,
+    fy: np.ndarray,
+    dfx: float,
+    Gd0: float,
+    n0: float,
+    f_iso_max: float,
+    taper: tuple[float, float] | None = None,
+) -> np.ndarray:
+    """ISO 8608 带的 2D 权重场：逐 fy 行按 ISO 一维边际重构（fix#1）。
+
+    ISO 8608 定义的是**一维**纵断面谱 :math:`G_d(f) = G_d(n_0)(n_0/f)^2`。
+    各向同性二维表面的边缘化一致性要求（Dodds & Robson 1973; Kamash &
+    Robson 1978; Bogsjö 2008）
+
+    .. math::
+        \\int_{-\\infty}^{\\infty} \\Phi(f_x, f_y)\\,df_x = G_{1D}(f_y)/2
+        \\quad (\\text{two-sided } \\Phi,\\ \\text{one-sided } G_{1D}),
+
+    即每行的双边行和 :math:`\\sum_k \\Phi_{kl}\\,\\Delta f_x` 必须等于
+    :math:`G^{\\mathrm{ISO}}_1(f_{y,l})/2 = G_d0\\,n_0^2 / (2 f_{y,l}^2)`。
+    历史实现的点采样 :math:`\\Phi = G_d0 n_0^2/4\\,\\Omega^{-3}` 因 k=0
+    单元的矩形积分严重高估行和（Ω⁻³ 在近轴快速衰减），使离散 2D 方差
+    远大于 ISO 边际积分。
+
+    本函数逐行重构：k ≠ 0 单元保留点采样形状（带内 :math:`\\Omega^{-3}`），
+    **近轴 k=0 单元取行残差** :math:`(G_1(f_y)/2 - \\sum_{k\\neq0}\\Phi\\Delta f_x)/\\Delta f_x`
+    并截断 ≥ 0，从而每行行和精确等于 ISO 边际。fy = 0 行（G₁ 发散）保留
+    点采样值（k=0 单元本就为 0）。``taper`` 非 None 时对带边施加余弦过渡
+    （见 :func:`_iso_taper_weight`）。
+
+    Args:
+        fx, fy: 频率轴 (cycle/m)，``fx`` 需含 0 频且关于 0 对称排列
+            （``np.fft.fftfreq`` 或 ``np.arange(-K, K+1)*dfx`` 均可）。
+        dfx: x 方向频率间距 (cycle/m)。
+        Gd0: ISO 8608 谱常数 (m³/cycle)。
+        n0: ISO 参考频率 (cycle/m)，= 0.1。
+        f_iso_max: ISO 带上限 (cycle/m)。
+        taper: (f_lo, f_hi) 余弦过渡带，None = 硬切换。
+
+    Returns:
+        Φ 数组，形状 ``(len(fx), len(fy))``，实对称（Hermitian ⇒ 实场）。
+    """
+    FX, FY = np.meshgrid(fx, fy, indexing="ij")
+    omega = np.sqrt(FX**2 + FY**2)
+    C = 0.25 * Gd0 * n0**2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        base = np.where(
+            (omega > 0.0) & (omega <= f_iso_max),
+            C * np.where(omega > 0.0, omega, 1.0) ** (-3.0),
+            0.0,
+        )
+    k0 = int(np.argmin(np.abs(fx)))  # 近轴 k=0 单元
+    base[k0, :] = 0.0
+    fy_abs = np.abs(fy)
+    valid = (fy_abs > 0.0) & (fy_abs <= f_iso_max)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        target = np.where(
+            valid,
+            Gd0 * n0**2 / np.where(fy_abs > 0.0, fy_abs, 1.0) ** 2 / 2.0,
+            0.0,
+        )
+    s_rest = base.sum(axis=0) * dfx
+    base[k0, :] = np.maximum(target - s_rest, 0.0) / dfx
+    return base * _iso_taper_weight(omega, taper)
+
+
 def generate_road_surface(
     width: float,
     length: float,
     grid_res: float,
-    pavement_type: str = "asphalt",
     roughness_class: str = "A",
     seed: int | None = None,
     *,
@@ -319,50 +430,66 @@ def generate_road_surface(
     longitudinal_grade: float = 0.0,
     texture_het_sigma_ln: float = 0.0,
     texture_het_corr_len_m: float = 2.0,
+    macro_spectrum_mode: str = "iso-marginal",
+    grid_convention: str = "consistent",
+    het_field: str = "2d",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate a road surface via a piecewise isotropic radial PSD.
 
     高度场由三部分构成：确定性设计几何 + ISO 8608 宏观粗糙度 + 自仿射
     宏观纹理，随机部分共用一次 FFT 合成。
 
+    **两类路面共享同一几何宏观谱与纹理谱**：``pavement_type`` 不参与
+    几何生成（本函数不产出标签，也不建模材料纹理分化；该形参已按设计稿
+    移除，见 README 边界声明）。
+
     **ISO 8608 段** — ISO 定义的是一维纵断面谱
     :math:`G_d(n) = G_d(n_0)(n/n_0)^{-w}` (:math:`n_0=0.1`, :math:`w=2`)。
     各向同性二维表面必须满足边缘化一致性
     :math:`G_{1D}(n_x) = \\int \\Phi(\\sqrt{n_x^2+n_y^2})\\,dn_y`
-    (Dodds & Robson 1973; Kamash & Robson 1978; Bogsjö 2008)，对 w=2 解得
+    (Dodds & Robson 1973; Kamash & Robson 1978; Bogsjö 2008)。本实现
+    （``macro_spectrum_mode='iso-marginal'``，默认）按 ISO 一维边际
+    **逐 fy 行重构权重**：每行双边行和
+    :math:`\\sum_k \\Phi_{kl}\\,\\Delta f_x = G_1^{\\mathrm{ISO}}(f_{y,l})/2`
+    （:math:`G_1^{\\mathrm{ISO}}(f)=G_d0\\,n_0^2/f^2`；近轴 k=0 单元取
+    行残差并截断 ≥ 0），因此离散边际与 ISO 定义一致（见
+    :func:`_iso_marginal_psd_2d`）。ISO 段与纹理段在 2.83 c/m 的带边以
+    半个倍频程余弦 taper 过渡（tuning#1），消除谱指数/幅值跳变。
 
-    .. math::
-        \\Phi_{\\mathrm{ISO}}(\\Omega) = \\frac{G_d(n_0)\\,n_0^2}{4}\\,
-        \\Omega^{-3}, \\qquad \\Omega \\le 2.83\\ \\mathrm{c/m}.
+    幅值合成取 :math:`a_{kl} = \\sqrt{\\Phi_{kl}\\,\\Delta f_x\\Delta f_y}\\,
+    \\hat W_{kl}`（``numpy.fft.ifft2`` 归一化下等价于
+    :math:`\\sqrt{\\Phi_{kl}}/\\Delta x\\cdot\\hat W_{kl}`，Hermitian 共轭
+    保证实场），方差目标为离散 Parseval 和
+    :math:`\\sigma^2 = \\sum \\Phi\\,\\Delta f_x \\Delta f_y` (m²)，
+    **不做实现级 std 重定标**。
+
+    ``macro_spectrum_mode='legacy'`` 恢复历史口径：点采样权重
+    :math:`\\Phi = G_d0 n_0^2/4\\,\\Omega^{-3}`、带边硬切换、以及把每次
+    实现精确缩放到目标 RMS 的实现级重定标（宏观 σ 约为 ISO 边际口径的
+    2 倍；CLI ``--macro-spectrum legacy``，仅供回归对照）。
 
     **纹理段** — 自仿射 (fBm 型) 表面谱
     :math:`\\Phi_{\\mathrm{tex}}(\\Omega) \\propto \\Omega^{-(2H+2)}`
-    (Persson 2006)，占据 :math:`(2.83, f_{\\mathrm{Nyq}}]`，
-    总能量按 Parseval 校准到 ``texture_rms``。
-
-    方差目标为离散 Parseval 和
-    :math:`\\sigma^2 = \\sum \\Phi\\,\\Delta f_x \\Delta f_y` (单位 m²)。
-    每次实现被精确缩放到目标 RMS —— 这是受控方差的设计选择，便于
-    等级间可比性（样本方差的自然涨落被抑制，见项目文档声明）。
+    (Persson 2006)，占据 taper 带以上，总能量按 Parseval 校准到
+    ``texture_rms``。
 
     **设计几何** — 排水横坡（双向路拱或单向坡）与纵坡：
     :math:`z_c(x) = -i_c\\,|x - W/2|` (crowned) 或 `-i_c\\,x` (plane)，
     :math:`z_g(y) = i_g\\,y`。法向量从叠加后的最终高度场统一重算，
     因此包含坡度与纹理的贡献。
 
-    **纹理沿程不均匀** — ``texture_het_sigma_ln > 0`` 时（默认 0 = 关闭，
-    行为与历史逐位一致），先以 ISO 带边界 :math:`f_{\\mathrm{iso,max}}`
-    做高低通分解，仅对短波（纹理段）施加沿里程 y 的均值为 1 对数正态
-    幅值调制 :math:`M(y)`；调制场由一维高斯低通白噪声标准化得到，
-    相关长度 ``texture_het_corr_len_m``。ISO 长波段不被调制，且
-    :math:`M` 按 :math:`\\mathrm{mean}(M^2)=1` 归一，重组后经既有全局
-    Parseval 再定标，总方差仍精确等于目标 :math:`\\sigma^2`。
+    **纹理沿程不均匀** — ``texture_het_sigma_ln > 0`` 时（默认 0 = 关闭），
+    以 ISO 带边界 :math:`f_{\\mathrm{iso,max}}` 做高低通分解，仅对短波
+    （纹理段）施加均值为 1 的对数正态幅值调制 :math:`M`；``het_field='2d'``
+    （默认）为 x/y 二维调制场、``'1d'`` 为历史沿里程 y 一维场。ISO 长波
+    段不被调制，且 :math:`M` 按 :math:`\\mathrm{mean}(M^2)=1` 归一。
+    （注：历史路径为 1-D，故 ``macro_spectrum_mode='legacy'`` 与
+    ``het_field='1d'`` 的组合才与历史逐位一致。）
 
     Args:
         width:  路面宽度 (m)，x 方向。
         length: 路面长度 (m)，y 方向。
         grid_res: 网格分辨率 (m)。
-        pavement_type: 路面类型 ('asphalt' | 'concrete')，仅影响标签。
         roughness_class: ISO 8608 粗糙度等级 'A'–'E'。
         seed: 随机种子。
         texture_rms: 宏观纹理位移 RMS (m)。0 表示无纹理段。
@@ -371,16 +498,34 @@ def generate_road_surface(
         crossfall_shape: 'crowned' 双向路拱 | 'plane' 单向坡。
         longitudinal_grade: 纵坡坡率。
         texture_het_sigma_ln: 纹理沿程不均匀的对数域调制强度 σ_ln。
-            0.0 = 关闭（默认），此时不做分解、不抽取额外随机数，输出
-            与合并谱单次 FFT 的历史路径逐位一致。
-        texture_het_corr_len_m: 沿里程 y 的高斯低通相关长度 (米)，
+            0.0 = 关闭（默认），此时不做分解、不抽取额外随机数。
+        texture_het_corr_len_m: 调制场的高斯低通相关长度 (米)，
             仅在 ``texture_het_sigma_ln > 0`` 时生效。
-
+        macro_spectrum_mode: 宏观谱口径 'iso-marginal'（默认）| 'legacy'。
+        grid_convention: 纹理谱频率网格口径 'consistent'（默认）| 'legacy'。
+            高度场在 ``np.arange(0, extent, grid_res)`` 采样网格上用
+            ``fftfreq(d=grid_res)`` 合成，采样间距与频率间距本已一致，
+            两种口径在此路径上取值相同（历史 ~1/gx 频率口径偏差只存在于
+            散点路径 :func:`add_micro_texture`）；本形参为装配层一致性
+            保留。
+        het_field: 纹理沿程不均匀调制场维度 '2d'（默认）| '1d'。
 
     Returns:
         points:  点云 (N, 3) = [x, y, z]。
         normals: 单位法向量 (N, 3)，含坡度与纹理贡献。
     """
+    if macro_spectrum_mode not in ("iso-marginal", "legacy"):
+        raise ValueError(
+            f"macro_spectrum_mode must be 'iso-marginal' or 'legacy', got "
+            f"{macro_spectrum_mode!r}"
+        )
+    if grid_convention not in ("consistent", "legacy"):
+        raise ValueError(
+            f"grid_convention must be 'consistent' or 'legacy', got {grid_convention!r}"
+        )
+    if het_field not in ("2d", "1d"):
+        raise ValueError(f"het_field must be '2d' or '1d', got {het_field!r}")
+
     rng = np.random.default_rng(seed)
 
     x = np.arange(0.0, width, grid_res)
@@ -400,27 +545,43 @@ def generate_road_surface(
     dfy = 1.0 / (ny * grid_res)
 
     f_iso_max = min(ISO8608_BAND_MAX_CYCLES_PER_M, nyquist)
+    # 带边半个倍频程余弦 taper（tuning#1）；legacy 为硬切换。
+    taper = None
+    if macro_spectrum_mode == "iso-marginal" and nyquist > f_iso_max:
+        taper = (f_iso_max / math.sqrt(2.0), f_iso_max * math.sqrt(2.0))
 
-    # ISO 8608 段：各向同性径向谱 Φ(Ω) = (Gd0·n0²/4)·Ω⁻³，带限到 2.83 c/m。
-    with np.errstate(divide="ignore", invalid="ignore"):
-        psd_iso = np.where(
-            (omega > 0.0) & (omega <= f_iso_max),
-            0.25 * Gd0 * n0**2 * np.where(omega > 0.0, omega, 1.0) ** (-3.0),
-            0.0,
-        )
-    var_iso = float(np.sum(psd_iso) * dfx * dfy)
+    if macro_spectrum_mode == "legacy":
+        with np.errstate(divide="ignore", invalid="ignore"):
+            psd_iso = np.where(
+                (omega > 0.0) & (omega <= f_iso_max),
+                0.25 * Gd0 * n0**2 * np.where(omega > 0.0, omega, 1.0) ** (-3.0),
+                0.0,
+            )
+        var_iso = float(np.sum(psd_iso) * dfx * dfy)
+    else:
+        psd_iso = _iso_marginal_psd_2d(fx, fy, dfx, Gd0, n0, f_iso_max, taper)
+        var_iso = float(np.sum(psd_iso) * dfx * dfy)
 
-    # 纹理段：Φ ∝ Ω^-(2H+2)，占据 (2.83, Nyquist]，能量校准到 texture_rms²。
+    # 纹理段：Φ ∝ Ω^-(2H+2)，占据 ISO 带以上，能量校准到 texture_rms²。
     var_tex = 0.0
     psd_tex = np.zeros_like(psd_iso)
     if texture_rms > 0.0 and nyquist > f_iso_max:
         beta = 2.0 * texture_hurst + 2.0
-        with np.errstate(divide="ignore", invalid="ignore"):
-            raw = np.where(
-                omega > f_iso_max,
-                np.where(omega > 0.0, omega, 1.0) ** (-beta),
-                0.0,
-            )
+        if macro_spectrum_mode == "legacy":
+            with np.errstate(divide="ignore", invalid="ignore"):
+                raw = np.where(
+                    omega > f_iso_max,
+                    np.where(omega > 0.0, omega, 1.0) ** (-beta),
+                    0.0,
+                )
+        else:
+            f_tex_lo = taper[0] if taper is not None else f_iso_max
+            with np.errstate(divide="ignore", invalid="ignore"):
+                raw = np.where(
+                    omega > f_tex_lo,
+                    np.where(omega > 0.0, omega, 1.0) ** (-beta),
+                    0.0,
+                ) * (1.0 - _iso_taper_weight(omega, taper))
         raw_var = float(np.sum(raw) * dfx * dfy)
         if raw_var > 0.0:
             psd_tex = raw * (texture_rms**2 / raw_var)
@@ -432,31 +593,46 @@ def generate_road_surface(
     W_hat = np.fft.fft2(white_noise)
     if texture_het_sigma_ln > 0.0:
         # 纹理沿程不均匀：高低通分解后仅调制短波分量。两分量共用同一
-        # W_hat，分解本身确定；调制场 M(y) 为中位数 1 且 mean(M²)=1
-        # （二阶矩归一，非算术均值 1：归一后 mean(M)≈exp(-σ²/2)<1），
-        # 只沿里程轴 (indexing='ij' 的轴 1) 变化并广播到横向。h_tex 零均值
-        # 使乘积均值≈0，方差由 E[M²]=1 决定，故总方差不变。
-        h_iso = np.real(np.fft.ifft2(np.sqrt(psd_iso) * W_hat))
-        h_tex = np.real(np.fft.ifft2(np.sqrt(psd_tex) * W_hat))
-        e = rng.normal(0.0, 1.0, ny)
-        g = ndimage.gaussian_filter1d(
-            e, sigma=texture_het_corr_len_m / grid_res, mode="reflect"
-        )
+        # W_hat，分解本身确定；调制场 M 为 mean(M²)=1 归一（二阶矩归一，
+        # 非算术均值 1：归一后 mean(M)≈exp(-σ²/2)<1）。h_tex 零均值使乘积
+        # 均值≈0，方差由 E[M²]=1 决定，故总方差近似不变。
+        if macro_spectrum_mode == "legacy":
+            h_iso = np.real(np.fft.ifft2(np.sqrt(psd_iso) * W_hat))
+            h_tex = np.real(np.fft.ifft2(np.sqrt(psd_tex) * W_hat))
+        else:
+            h_iso = np.real(np.fft.ifft2(np.sqrt(psd_iso) / grid_res * W_hat))
+            h_tex = np.real(np.fft.ifft2(np.sqrt(psd_tex) / grid_res * W_hat))
+        if het_field == "2d":
+            e = rng.normal(0.0, 1.0, (nx, ny))
+            g = ndimage.gaussian_filter(
+                e, sigma=texture_het_corr_len_m / grid_res, mode="reflect"
+            )
+        else:
+            e = rng.normal(0.0, 1.0, ny)
+            g = ndimage.gaussian_filter1d(
+                e, sigma=texture_het_corr_len_m / grid_res, mode="reflect"
+            )
         z = (g - g.mean()) / max(float(g.std()), 1e-15)
         M = np.exp(texture_het_sigma_ln * z)
         M = M / np.sqrt(np.mean(M**2))
-        h_field = h_iso + h_tex * M[None, :]
+        h_field = h_iso + h_tex * (M if het_field == "2d" else M[None, :])
     else:
-        # 关闭态：合并谱单次 FFT，与历史路径逐位一致（不得改写为分解式，
-        # sqrt(a)+sqrt(b) ≠ sqrt(a+b) 会破坏逐位一致性）。
-        h_field = np.real(np.fft.ifft2(np.sqrt(psd_2d) * W_hat))
+        # 关闭态：合并谱单次 FFT。iso-marginal 用 a=√(Φ)/Δx·Ŵ（方差
+        # 精确等于 ΣΦΔfxΔfy）；legacy 保持历史 √Φ·Ŵ + 全局重定标（不得
+        # 改写，sqrt(a)+sqrt(b) ≠ sqrt(a+b) 会破坏逐位一致性）。
+        if macro_spectrum_mode == "legacy":
+            h_field = np.real(np.fft.ifft2(np.sqrt(psd_2d) * W_hat))
+        else:
+            h_field = np.real(np.fft.ifft2(np.sqrt(psd_2d) / grid_res * W_hat))
     h_field = h_field - np.mean(h_field)
 
-    # Parseval 定标：σ² = ΣΦ·Δfx·Δfy (m²)，实现级精确缩放（受控方差）。
-    rms_target = np.sqrt(max(var_iso + var_tex, 0.0))
-    rms_current = np.std(h_field)
-    if rms_current > 1e-15 and rms_target > 0.0:
-        h_field = h_field * (rms_target / rms_current)
+    if macro_spectrum_mode == "legacy":
+        # 历史实现级 Parseval 重定标（受控方差）；iso-marginal 不做重定标
+        # ——其幅值合成已使方差等于 ΣΦΔfxΔfy。
+        rms_target = np.sqrt(max(var_iso + var_tex, 0.0))
+        rms_current = np.std(h_field)
+        if rms_current > 1e-15 and rms_target > 0.0:
+            h_field = h_field * (rms_target / rms_current)
 
     # 确定性设计几何：横坡/路拱 + 纵坡。法向量必须包含坡度贡献，
     # 因此在计算法向之前叠加。
@@ -480,48 +656,71 @@ def generate_road_surface(
 
 
 def _iso_band_variance_fine(
-    width: float, length: float, grid_res: float, Gd0: float
+    width: float,
+    length: float,
+    grid_res: float,
+    Gd0: float,
+    macro_spectrum_mode: str = "iso-marginal",
 ) -> float:
-    """ISO 8608 带（Ω ≤ f_iso_max）在**细网格（单块路径）**离散频率集上的
-    精确 Parseval 方差，供分段宏观场定标使用。
+    """ISO 8608 带在**细网格（单块路径）**离散频率集上的精确 Parseval 方差，
+    供分段宏观场定标使用。
 
-    单块 :func:`generate_road_surface` 的 ``var_iso`` 为
-    ``Σ Φ·dfx·dfy``，其中 ``fx = fftfreq(nx, grid_res) = k/width``（
-    ``nx = ceil(width/grid_res)``）、``fy = l/length``。这里用同一组
-    频率（``k/width``、``l/length``）在带内求和：因 Φ 带外为 0，只需
-    ``|k| ≤ f_iso_max·width``、``|l| ≤ f_iso_max·length`` 的项，网格规模
-    仅 ~O((f·W)·(f·L))（3 m/50 m@2 mm 为 9×142），代价可忽略。粗网格
-    ``dfx = 1/(nx_c·h_macro) ≠ 1/width``，直接用粗网格和定标会引入
-    ~1.3% 的宏观 RMS 偏差（见 :func:`synthesize_strip_macro_band`）。
+    ``macro_spectrum_mode='iso-marginal'``（默认）复现
+    :func:`generate_road_surface` 的逐 fy 行重构权重 + 带边余弦 taper：
+    在对称频率集 ``fx = k/(nx·grid_res)``、``fy = l/(ny·grid_res)``
+    （``nx = ceil(width/grid_res)``）上用同一 :func:`_iso_marginal_psd_2d`
+    构造 Φ 并求和。仅需 ``|Ω| ≲ f_iso_max·√2`` 的项，网格规模
+    ~O((f·W)·(f·L))（3 m/50 m@2 mm 为 ~15×142），代价可忽略。
+
+    ``'legacy'`` 恢复历史点采样权重（Φ = Gd0·n0²/4·Ω⁻³、硬带边、
+    dfx=1/width），供分段路径的回归对照。
 
     Args:
         width, length: 条带几何 (m)。
         grid_res: 细网格分辨率 (m)，用于 f_iso_max。
         Gd0: ISO 8608 功率谱密度常数 (m³/cycle)，= 等级×1e-6。
+        macro_spectrum_mode: 'iso-marginal' | 'legacy'。
 
     Returns:
         细网格 ISO 带方差 (m²)。
     """
 
     n0 = 0.1
-    f_iso_max = min(ISO8608_BAND_MAX_CYCLES_PER_M, 0.5 / grid_res)
-    dfx = 1.0 / width
-    dfy = 1.0 / length
-    kx = np.arange(
-        -int(np.ceil(f_iso_max * width)), int(np.ceil(f_iso_max * width)) + 1
-    )
-    ky = np.arange(
-        -int(np.ceil(f_iso_max * length)), int(np.ceil(f_iso_max * length)) + 1
-    )
-    FX = (kx * dfx)[:, None]
-    FY = (ky * dfy)[None, :]
-    omega = np.sqrt(FX**2 + FY**2)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        psd = np.where(
-            (omega > 0.0) & (omega <= f_iso_max),
-            0.25 * Gd0 * n0**2 * np.where(omega > 0.0, omega, 1.0) ** (-3.0),
-            0.0,
+    nyquist_fine = 0.5 / grid_res
+    f_iso_max = min(ISO8608_BAND_MAX_CYCLES_PER_M, nyquist_fine)
+
+    if macro_spectrum_mode == "legacy":
+        dfx = 1.0 / width
+        dfy = 1.0 / length
+        kx = np.arange(
+            -int(np.ceil(f_iso_max * width)), int(np.ceil(f_iso_max * width)) + 1
         )
+        ky = np.arange(
+            -int(np.ceil(f_iso_max * length)), int(np.ceil(f_iso_max * length)) + 1
+        )
+        FX = (kx * dfx)[:, None]
+        FY = (ky * dfy)[None, :]
+        omega = np.sqrt(FX**2 + FY**2)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            psd = np.where(
+                (omega > 0.0) & (omega <= f_iso_max),
+                0.25 * Gd0 * n0**2 * np.where(omega > 0.0, omega, 1.0) ** (-3.0),
+                0.0,
+            )
+        return float(np.sum(psd) * dfx * dfy)
+
+    # iso-marginal：细网格 fftfreq 口径 dfx = 1/(nx·grid_res)。
+    nx = max(1, int(math.ceil(width / grid_res)))
+    ny = max(1, int(math.ceil(length / grid_res)))
+    dfx = 1.0 / (nx * grid_res)
+    dfy = 1.0 / (ny * grid_res)
+    taper = None
+    if nyquist_fine > f_iso_max:
+        taper = (f_iso_max / math.sqrt(2.0), f_iso_max * math.sqrt(2.0))
+    f_hi = taper[1] if taper is not None else f_iso_max
+    kx = np.arange(-int(np.ceil(f_hi * width)), int(np.ceil(f_hi * width)) + 1)
+    ky = np.arange(-int(np.ceil(f_hi * length)), int(np.ceil(f_hi * length)) + 1)
+    psd = _iso_marginal_psd_2d(kx * dfx, ky * dfy, dfx, Gd0, n0, f_iso_max, taper)
     return float(np.sum(psd) * dfx * dfy)
 
 
@@ -533,20 +732,23 @@ def synthesize_strip_macro_band(
     rng_surface: np.random.Generator,
     *,
     macro_grid_factor: float = 4.0,
+    macro_spectrum_mode: str = "iso-marginal",
 ) -> dict:
     """Synthesize the ISO 8608 macro band once for the whole strip on a
     coarse grid.
 
     分段体制的宏观长波段**整条带全局一次**合成：粗网格间距
     ``h_macro = 1 / (macro_grid_factor * f_iso_max)``（对 ISO 带上限取
-    ``macro_grid_factor`` 倍过采样），PSD 与 :func:`generate_road_surface`
-    的 ISO 段逐字相同（Φ = Gd0·n0²/4·Ω⁻³，Ω ≤ f_iso_max）。**Parseval
-    定标取细网格（单块路径）的 ISO 带离散和**——粗网格的
-    ``dfx = 1/(nx_c·h_macro)`` 与细网格的 ``dfx = 1/width`` 不同（nx_c·h
-    ≈ width + h_macro），直接用粗网格和定标会偏 -2.58%（2 mm/3×50 m）或
-    +2.36%（5 mm/7×5 m），即宏观 RMS 偏差 ~1.3%；改用细网格频率集上的
-    小规模精确求和（ka·dfx、kb·dfy，仅 |k| ≤ f_iso_max·W/L 项，成本可
-    忽略）后与单块宏观方差一致。宏观场全局单块 ⇒ 接缝处精确连续，与
+    ``macro_grid_factor`` 倍过采样）。谱定义与 :func:`generate_road_surface`
+    一致：``'iso-marginal'``（默认）为逐 fy 行重构的 ISO 边际权重 +
+    带边余弦 taper，``'legacy'`` 为历史点采样 Φ = Gd0·n0²/4·Ω⁻³ 硬带边。
+
+    **Parseval 定标取细网格（单块路径）的 ISO 带离散和**——粗网格的
+    ``dfx = 1/(nx_c·h_macro)`` 与细网格不同（nx_c·h ≈ width + h_macro），
+    直接用粗网格和定标会引入 ~1.3% 的宏观 RMS 偏差；故用
+    :func:`_iso_band_variance_fine`（同口径）的小规模精确求和把粗网格
+    实现在定标到细网格目标 RMS。这是**跨网格一致性归一**（不是单块路径
+    取消的实现级 std 重定标）。宏观场全局单块 ⇒ 接缝处精确连续，与
     粗糙度等级无关。
 
     Args:
@@ -557,6 +759,7 @@ def synthesize_strip_macro_band(
         rng_surface: 表面随机流（与单块路径同源：由 surface seed 派生），
             宏观白噪声从此抽取。
         macro_grid_factor: 粗网格过采样倍数。
+        macro_spectrum_mode: 宏观谱口径 'iso-marginal'（默认）| 'legacy'。
 
     Returns:
         dict(x=..., y=..., field=(nx_c, ny_c) float64, spacing_m=h_macro)
@@ -573,23 +776,35 @@ def synthesize_strip_macro_band(
 
     fx = np.fft.fftfreq(nx_c, d=h_macro)
     fy = np.fft.fftfreq(ny_c, d=h_macro)
-    FX, FY = np.meshgrid(fx, fy, indexing="ij")
-    omega = np.sqrt(FX**2 + FY**2)
+    dfx = 1.0 / (nx_c * h_macro)
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        psd_iso = np.where(
-            (omega > 0.0) & (omega <= f_iso_max),
-            0.25 * Gd0 * n0**2 * np.where(omega > 0.0, omega, 1.0) ** (-3.0),
-            0.0,
-        )
+    if macro_spectrum_mode == "legacy":
+        FX, FY = np.meshgrid(fx, fy, indexing="ij")
+        omega = np.sqrt(FX**2 + FY**2)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            psd_iso = np.where(
+                (omega > 0.0) & (omega <= f_iso_max),
+                0.25 * Gd0 * n0**2 * np.where(omega > 0.0, omega, 1.0) ** (-3.0),
+                0.0,
+            )
+        white = rng_surface.normal(0.0, 1.0, (nx_c, ny_c))
+        macro = np.real(np.fft.ifft2(np.sqrt(psd_iso) * np.fft.fft2(white)))
+    else:
+        # 粗网格 Nyquist = 0.5/h_macro = macro_grid_factor·f_iso_max > f_iso_max·√2
+        # （factor ≥ 4），故 taper 带可表示。
+        nyquist_c = 0.5 / h_macro
+        taper = None
+        if nyquist_c > f_iso_max:
+            taper = (f_iso_max / math.sqrt(2.0), f_iso_max * math.sqrt(2.0))
+        psd_iso = _iso_marginal_psd_2d(fx, fy, dfx, Gd0, n0, f_iso_max, taper)
+        white = rng_surface.normal(0.0, 1.0, (nx_c, ny_c))
+        macro = np.real(np.fft.ifft2(np.sqrt(psd_iso) / h_macro * np.fft.fft2(white)))
 
-    # 细网格（单块口径）ISO 带方差：细网格 fx = k/(nx·grid_res) = k/width，
-    # fy = l/length。仅需 |k| ≤ f_iso_max·width、|l| ≤ f_iso_max·length 的
-    # 频率（带外 PSD 为 0），网格极小（3m/50m@2mm → 9×142）。
-    var_iso = _iso_band_variance_fine(width, length, grid_res, Gd0)
+    # 细网格（单块口径）ISO 带方差：同口径小规模精确求和。
+    var_iso = _iso_band_variance_fine(
+        width, length, grid_res, Gd0, macro_spectrum_mode
+    )
 
-    white = rng_surface.normal(0.0, 1.0, (nx_c, ny_c))
-    macro = np.real(np.fft.ifft2(np.sqrt(psd_iso) * np.fft.fft2(white)))
     macro = macro - np.mean(macro)
     rms_current = float(np.std(macro))
     rms_target = math.sqrt(max(var_iso, 0.0))
@@ -617,6 +832,9 @@ def generate_strip_surface(
     texture_het_corr_len_m: float = 2.0,
     macro_grid_factor: float = 4.0,
     macro_band: dict | None = None,
+    macro_spectrum_mode: str = "iso-marginal",
+    grid_convention: str = "consistent",
+    het_field: str = "2d",
 ):
     """Segmented strip surface synthesis (yields one extended segment at a
     time to keep the working set bounded).
@@ -624,20 +842,23 @@ def generate_strip_surface(
     谱分解（与 :func:`generate_road_surface` 单块路径的谱定义一致）：
 
     1. **宏观长波**（ISO 8608 段）：整条带全局一次合成于粗网格（见
-       :func:`synthesize_strip_macro_band`），粗→细用
-       ``RegularGridInterpolator(method="cubic")`` 逐段采样。接缝处
-       精确连续。
-    2. **短波纹理**（(f_iso_max, Nyquist]）：每段在扩展域（拥有行 +
-       两侧 halo 行）上独立 FFT，Φ ∝ Ω^{-(2H+2)}，Parseval 定标到
-       ``texture_rms``；段种子从专用子 rng 按段序抽取，与分段数确定
-       对应。
+       :func:`synthesize_strip_macro_band`，口径由 ``macro_spectrum_mode``
+       决定：iso-marginal 逐 fy 行重构 + 带边 taper / legacy 点采样），
+       粗→细用 ``RegularGridInterpolator(method="cubic")`` 逐段采样。
+       接缝处精确连续。
+    2. **短波纹理**（带边 taper 以上至 Nyquist）：每段在扩展域（拥有行 +
+       两侧 halo 行）上独立 FFT，Φ ∝ Ω^{-(2H+2)}，Parseval 校准到
+       ``texture_rms``；iso-marginal 下幅值 a=√(Φ)/Δx·Ŵ（无实现级
+       std 重定标），legacy 保留历史 √Φ·Ŵ + 逐段重定标。段种子从专用
+       子 rng 按段序抽取，与分段数确定对应。
     3. **跨段混合**：缝两侧各 2·blend_band_rows 行的重叠带上按
        root-raised-cosine 混合（cos²+sin²=1，独立等方差高斯场混合后
        方差保持）。同一混合带只计算一次，两个段看到**同一份**混合值
        ⇒ 逐位一致。
-    4. **texture-het 调制**：M(y) 全局 1-D（白噪声 → gaussian_filter1d
-       → 标准化 → exp(σ·z) → mean(M²)=1），混合后统一乘 M 的全局切片
-       （单一施加位点）；het 关闭时零新增随机流。
+    4. **texture-het 调制**：''het_field='1d'`` 为历史全局 M(y)
+       （白噪声 → gaussian_filter1d → 标准化 → exp(σ·z) → mean(M²)=1）；
+       ``'2d'`` 为全局二维调制场（粗网格生成后逐段插值）。混合后统一
+       乘调制场（单一施加位点）；het 关闭时零新增随机流。
     5. **设计几何**（crossfall/crowned 折角与纵坡）不进粗网格——折角
        不是带限信号——在混合后的细网格上解析叠加（与单块路径同次序），
        法向从最终高度场统一重算。
@@ -651,6 +872,10 @@ def generate_strip_surface(
         blend_band_rows: 缝两侧混合带半宽（行数，= halo 行数 m_rows）。
         macro_band: 预先合成好的宏观粗网格（:func:`synthesize_strip_macro_band`
             的返回值）；None 时内部按相同流程合成（独立调用/测试用）。
+        macro_spectrum_mode: 宏观谱口径 'iso-marginal'（默认）| 'legacy'。
+        grid_convention: 纹理频率网格口径（本路径采样网格与 fftfreq 本已
+            一致，两取值相同；为装配层一致性保留）。
+        het_field: 纹理沿程不均匀调制场维度 '2d'（默认）| '1d'。
 
     Yields:
         ``(seg_index, y0_ext, y1_ext, y0_owned, y1_owned, x_grid,
@@ -665,11 +890,17 @@ def generate_strip_surface(
     nx, ny_total = len(x), len(y)
     nyquist = 0.5 / grid_res
     f_iso_max = min(ISO8608_BAND_MAX_CYCLES_PER_M, nyquist)
+    iso_marginal = macro_spectrum_mode != "legacy"
+    taper = None
+    if iso_marginal and nyquist > f_iso_max:
+        taper = (f_iso_max / math.sqrt(2.0), f_iso_max * math.sqrt(2.0))
+    f_tex_lo = taper[0] if taper is not None else f_iso_max
 
     if macro_band is None:
         macro_band = synthesize_strip_macro_band(
             width, length, grid_res, roughness_class, rng_surface,
             macro_grid_factor=macro_grid_factor,
+            macro_spectrum_mode=macro_spectrum_mode,
         )
     macro_interp = interpolate.RegularGridInterpolator(
         (macro_band["x"], macro_band["y"]),
@@ -679,17 +910,36 @@ def generate_strip_surface(
         fill_value=0.0,
     )
 
-    # texture-het 全局 1-D 调制场（整条 y 轴，天然跨段连续）。
+    # texture-het 全局调制场（1-D 沿 y 或 2-D 粗网格），整条带共享 ⇒ 天然
+    # 跨段连续。
+    het_m: np.ndarray | None = None
+    het_interp = None
     if texture_het_sigma_ln > 0.0:
-        e = rng_tex.normal(0.0, 1.0, ny_total)
-        g = ndimage.gaussian_filter1d(
-            e, sigma=texture_het_corr_len_m / grid_res, mode="reflect"
-        )
-        zmod = (g - g.mean()) / max(float(g.std()), 1e-15)
-        het_m = np.exp(texture_het_sigma_ln * zmod)
-        het_m = het_m / np.sqrt(np.mean(het_m**2))
-    else:
-        het_m = None
+        if het_field == "2d":
+            het_cell = max(texture_het_corr_len_m / 2.0, 4.0 * grid_res)
+            gx_c = max(4, int(math.ceil(width / het_cell)) + 1)
+            gy_c = max(4, int(math.ceil(length / het_cell)) + 1)
+            e2 = rng_tex.normal(0.0, 1.0, (gx_c, gy_c))
+            g2 = ndimage.gaussian_filter(
+                e2, sigma=texture_het_corr_len_m / het_cell, mode="reflect"
+            )
+            z2 = (g2 - g2.mean()) / max(float(g2.std()), 1e-15)
+            M2 = np.exp(texture_het_sigma_ln * z2)
+            M2 = M2 / np.sqrt(np.mean(M2**2))
+            het_interp = interpolate.RegularGridInterpolator(
+                (np.linspace(0.0, width, gx_c), np.linspace(0.0, length, gy_c)),
+                M2,
+                bounds_error=False,
+                fill_value=1.0,
+            )
+        else:
+            e = rng_tex.normal(0.0, 1.0, ny_total)
+            g = ndimage.gaussian_filter1d(
+                e, sigma=texture_het_corr_len_m / grid_res, mode="reflect"
+            )
+            zmod = (g - g.mean()) / max(float(g.std()), 1e-15)
+            het_m = np.exp(texture_het_sigma_ln * zmod)
+            het_m = het_m / np.sqrt(np.mean(het_m**2))
 
     beta = 2.0 * texture_hurst + 2.0
 
@@ -704,23 +954,35 @@ def generate_strip_surface(
         dfx = 1.0 / (nx * grid_res)
         dfy = 1.0 / (ext_rows * grid_res)
         if texture_rms > 0.0 and nyquist > f_iso_max:
+            w_tex = (
+                1.0 - _iso_taper_weight(omega, taper) if taper is not None else 1.0
+            )
             with np.errstate(divide="ignore", invalid="ignore"):
                 raw = np.where(
-                    omega > f_iso_max,
+                    omega > f_tex_lo,
                     np.where(omega > 0.0, omega, 1.0) ** (-beta),
                     0.0,
-                )
+                ) * w_tex
             raw_var = float(np.sum(raw) * dfx * dfy)
             if raw_var <= 0.0:
                 h = np.zeros((nx, ext_rows))
             else:
-                h = np.real(np.fft.ifft2(
-                    np.sqrt(raw * (texture_rms**2 / raw_var))
-                    * np.fft.fft2(rng_k.normal(0.0, 1.0, (nx, ext_rows)))
-                ))
-                std = float(np.std(h))
-                if std > 1e-15:
-                    h = h * (texture_rms / std)
+                white_k = rng_k.normal(0.0, 1.0, (nx, ext_rows))
+                if iso_marginal:
+                    # a = √(Φ)/Δx·Ŵ（Hermitian ⇒ 实场），方差 = ΣΦΔfxΔfy。
+                    h = np.real(np.fft.ifft2(
+                        np.sqrt(raw * (texture_rms**2 / raw_var)) / grid_res
+                        * np.fft.fft2(white_k)
+                    ))
+                else:
+                    # legacy：√Φ·Ŵ + 实现级逐段 std 重定标。
+                    h = np.real(np.fft.ifft2(
+                        np.sqrt(raw * (texture_rms**2 / raw_var))
+                        * np.fft.fft2(white_k)
+                    ))
+                    std = float(np.std(h))
+                    if std > 1e-15:
+                        h = h * (texture_rms / std)
         else:
             h = np.zeros((nx, ext_rows))
         return h
@@ -731,9 +993,15 @@ def generate_strip_surface(
     def _finalize(seg_k: int, bounds: tuple[int, int, int, int], tex: np.ndarray):
         y0o, y1o, y0e, y1e = bounds
         h = tex
-        if het_m is not None:
-            h = h * het_m[y0e:y1e][None, :]
         Y_e = y[y0e:y1e]
+        if het_interp is not None:
+            X_e, YY_e = np.meshgrid(x, Y_e, indexing="ij")
+            M_seg = het_interp(
+                np.stack([X_e.ravel(), YY_e.ravel()], axis=-1)
+            ).reshape(nx, y1e - y0e)
+            h = h * M_seg
+        elif het_m is not None:
+            h = h * het_m[y0e:y1e][None, :]
         macro_part = macro_interp(
             np.stack(np.meshgrid(x, Y_e, indexing="ij"), axis=-1).reshape(-1, 2)
         ).reshape(nx, y1e - y0e)
@@ -981,14 +1249,20 @@ def add_micro_texture(
     hurst: float,
     octaves: int = 0,
     seed: int | None = None,
+    *,
+    grid_convention: str = "consistent",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Add spatially correlated self-affine macro-texture to a point set.
 
-    通过 FFT 谱合成生成自仿射纹理场（二维 fBm 型表面，功率谱
-    :math:`\\Phi(\\Omega) \\propto \\Omega^{-(2H+2)}`，Mandelbrot & Van Ness
-    1968; Saupe 1988），在包围盒网格上合成后按点位双线性采样，
-    沿法向位移。位移场是空间相关的：粗糙度结构由谱斜率
-    （即 Hurst 指数 H）控制，``amplitude`` 严格等于位移 RMS。
+    通过 FFT **随机相位谱合成**生成自仿射纹理场（二维 fBm 型表面，功率谱
+    :math:`\\Phi(\\Omega) \\propto \\Omega^{-(2H+2)}`）——fBm 概念来源
+    Mandelbrot & Van Ness 1968，随机相位谱合成方法见 Saupe 1988。在包围盒
+    网格上合成后按点位双线性采样，沿法向位移。粗糙度结构由谱斜率（即
+    Hurst 指数 H）控制。
+
+    ``amplitude`` 是**合成网格**上的位移 RMS：点密度不低于网格密度时稀疏
+    采样误差可忽略，位移 RMS 等于 ``amplitude``；稀疏点云上 RMS 衰减
+    （N=4 的极端例实测比值 0.16-0.69）——不再声明"严格等于"。
 
     主生成管线已把纹理段合并进 ``generate_road_surface`` 的分段径向
     谱（那里法向从最终高度场统一重算）；本函数保留给散点输入的
@@ -1002,12 +1276,20 @@ def add_micro_texture(
         hurst: Hurst 指数 H ∈ (0, 1)，谱斜率 -(2H+2)。
         octaves: 已弃用，仅为向后兼容保留，不再使用。
         seed: 随机种子。
+        grid_convention: 频率网格口径。'consistent'（默认）——fftfreq 间距
+            与实空间插值网格 ``linspace(x_min, x_max, gx)`` 的间距
+            ``extent/(gx-1)`` 一致，消除历史 ``fftfreq(d=extent/gx)`` 的
+            ~1/gx 频率口径偏差；'legacy' —— 恢复历史 d=extent/gx。
 
     Returns:
         points_modified:  修改后点云 (N, 3)。
         normals_copy: 输入法向量的副本（未更新，见上）。
     """
     del octaves  # legacy parameter of the removed i.i.d.-noise implementation
+    if grid_convention not in ("consistent", "legacy"):
+        raise ValueError(
+            f"grid_convention must be 'consistent' or 'legacy', got {grid_convention!r}"
+        )
     rng = np.random.default_rng(seed)
 
     pts = points.copy()
@@ -1025,8 +1307,15 @@ def add_micro_texture(
     gx = int(np.clip(round(extent_x / approx_spacing), 16, 2048))
     gy = int(np.clip(round(extent_y / approx_spacing), 16, 2048))
 
-    fx = np.fft.fftfreq(gx, d=extent_x / gx)
-    fy = np.fft.fftfreq(gy, d=extent_y / gy)
+    # 频率口径与实空间插值网格一致：linspace(x_min,x_max,gx) 间距 = extent/(gx-1)。
+    if grid_convention == "legacy":
+        dx = extent_x / gx
+        dy = extent_y / gy
+    else:
+        dx = extent_x / max(gx - 1, 1)
+        dy = extent_y / max(gy - 1, 1)
+    fx = np.fft.fftfreq(gx, d=dx)
+    fy = np.fft.fftfreq(gy, d=dy)
     FX, FY = np.meshgrid(fx, fy, indexing="ij")
     omega = np.sqrt(FX**2 + FY**2)
     beta = 2.0 * hurst + 2.0
@@ -1093,6 +1382,87 @@ def _generate_alligator_seeds(
     return np.array(seeds) if seeds else np.array([[x_min, y_min]])
 
 
+def _voronoi_median_edge(
+    seeds: np.ndarray, x_min: float, x_max: float, y_min: float, y_max: float
+) -> float:
+    """Voronoi 单元等效边长（sqrt(单元面积)）的中位数。
+
+    measure-then-label 用：在 patch 边界内均匀采样，按最近种子归属统计各
+    单元面积，取等效边长的中位数对照 JTG 块度阈值。种子数 < 2 或区域退化
+    时返回 ``inf``（视为最粗块度）。
+    """
+    if seeds.shape[0] < 2:
+        return float("inf")
+    w = x_max - x_min
+    h = y_max - y_min
+    if w <= 0.0 or h <= 0.0:
+        return float("inf")
+    n = int(np.clip(np.ceil(np.sqrt(seeds.shape[0] * 16.0)), 16, 256))
+    gx = np.linspace(x_min, x_max, n)
+    gy = np.linspace(y_min, y_max, n)
+    GX, GY = np.meshgrid(gx, gy, indexing="ij")
+    query = np.stack([GX.ravel(), GY.ravel()], axis=1)
+    tree = spatial.KDTree(seeds)
+    _, idx = tree.query(query)
+    counts = np.bincount(idx, minlength=seeds.shape[0])
+    cell_area = (w * h) / float(query.shape[0])
+    areas = counts * cell_area
+    areas = areas[areas > 0.0]
+    if areas.size == 0:
+        return float("inf")
+    return float(np.median(np.sqrt(areas)))
+
+
+def _sample_width_profile(
+    rng: np.random.Generator,
+    width_mean: float,
+    width_std: float,
+    n: int,
+    severity: str,
+    mode: str,
+) -> np.ndarray:
+    """线状裂缝缝宽沿曲线的对数正态剖面 + 3 mm 判据侧截断。
+
+    ``mode='clip'``（legacy）钳制到判据边界——分布原子（~2-3% 样本钉在
+    2.9/3.2 mm）；``'resample'``（默认）越界拒绝重采，得到平滑截断分布。
+    """
+    if severity == "light":
+        lo, hi = 0.0, JTG_CRACK_WIDTH_THRESHOLD_M - 1e-4
+    else:
+        lo, hi = JTG_CRACK_WIDTH_THRESHOLD_M + 2e-4, np.inf
+    sample = rng.lognormal(mean=np.log(width_mean), sigma=width_std, size=n)
+    if mode == "clip":
+        return np.clip(sample, lo, hi)
+    for _ in range(1000):
+        bad = (sample < lo) | (sample > hi)
+        if not np.any(bad):
+            break
+        sample[bad] = rng.lognormal(
+            mean=np.log(width_mean), sigma=width_std, size=int(bad.sum())
+        )
+    return sample
+
+
+def _sample_truncated_width(
+    rng: np.random.Generator, w_mean: float, w_std: float, severity: str
+) -> float:
+    """对数正态缝宽的单实例采样 + 3 mm 判据侧拒绝重采（无实测依据）。
+
+    与线状裂缝同参数族（对数正态形式与 σ 暂无沥青裂缝实测引用），
+    标『待量测直方图拟合替换』。
+    """
+    if severity == "light":
+        lo, hi = 0.0, JTG_CRACK_WIDTH_THRESHOLD_M - 1e-4
+    else:
+        lo, hi = JTG_CRACK_WIDTH_THRESHOLD_M + 2e-4, np.inf
+    value = float(rng.lognormal(mean=np.log(w_mean), sigma=w_std))
+    for _ in range(1000):
+        if lo <= value <= hi:
+            return value
+        value = float(rng.lognormal(mean=np.log(w_mean), sigma=w_std))
+    return float(np.clip(value, lo, hi))
+
+
 def add_crack(
     points: np.ndarray,
     labels: np.ndarray,
@@ -1107,19 +1477,30 @@ def add_crack(
 
     **纵向/横向裂缝 (Longitudinal/Transverse)**：
     - 骨架路径由三次 Bézier 曲线定义
-    - 叠加分形扰动 (Perlin 噪声调制)
+    - 叠加分形扰动（多倍频程 **value noise**，非 Perlin 梯度噪声；
+      ``perturb_mode`` 控制是否周期化）
     - 开口宽度 :math:`w \\sim \\text{Lognormal}(\\mu, \\sigma)`
-    - 深度剖面 (V 形槽)：
+      （线性尺度**中位数**：轻默认 0.0018 m、重默认 0.006 m；对数正态
+      形式与 σ=0.25/0.3 暂无沥青裂缝实测引用——岩石/混凝土裂隙文献惯例，
+      待量测直方图拟合替换），判据侧截断见 ``width_truncation``）
+    - 深度剖面（**高斯槽**，p=2）：
 
     .. math::
-        d(t) = d_{\\max} \\exp\\left(-(t/\\lambda)^p\\right)
+        d(t) = d_{\\max} \\exp\\left(-(t/\\lambda)^p\\right),
+        \\quad \\lambda = w/4
 
     **龟裂 (Alligator Cracks)**：
     - 空间泊松点过程 → Voronoi 图 → 多边形边界裂缝
-    - 轻：块度 > 0.5m；重：< 0.2m
+    - 轻：块度 > 0.5m；重：< 0.2m（JTG 官网检索片段口径，原文需人工核对）
 
     **块状裂缝 (Block Cracks)**：
     - 类似龟裂但块度 > 1m，密度更低
+
+    **面状裂缝（龟裂/块裂）** 的槽形 λ 与标签口径由 ``area_lambda_mode``
+    与 ``area_label_mode`` 控制：默认 λ=w/4（缝缘深度 e⁻⁴≈1.8%·d_max，
+    与线状裂缝同一边缘连续原则）并按 Voronoi 单元等效边长中位数
+    measure-then-label（标签由几何决定，覆盖全部 8 个裂缝标签）；legacy
+    恢复 λ=w/2 槽形、固定标量缝宽与直接采信 severity 字符串。
 
     标签体系：
     - 龟裂: 轻=1, 重=2
@@ -1135,10 +1516,14 @@ def add_crack(
         severity: 严重程度 'light' | 'severe'。
         params: 参数字典，支持：
             - 'd_max': 最大深度 (m)，默认轻=0.01, 重=0.03
-            - 'width_mean': 宽度对数均值 (m)，默认 0.005
-            - 'width_std': 宽度对数标准差，默认 0.3
+            - 'width_mean': 宽度对数均值 (m)
+            - 'width_std': 宽度对数标准差
             - 'bezier_control_points': Bézier 控制点 (4,2) 可选
             - 'num_seeds': Voronoi 种子点数 (龟裂/块状)
+            - 'perturb_mode': 'nonperiodic'（默认）| 'legacy'
+            - 'width_truncation': 'resample'（默认）| 'clip'
+            - 'area_lambda_mode': 'quarter'（默认）| 'half'
+            - 'area_label_mode': 'measure'（默认）| 'legacy'
         seed: 随机种子。
 
     Returns:
@@ -1178,6 +1563,10 @@ def add_crack(
         width_mean = params.get("width_mean", 0.006)
         width_std = params.get("width_std", 0.3)
     label_width_floor = params.get("label_width_floor", 0.0)
+    perturb_mode = params.get("perturb_mode", "nonperiodic")
+    width_truncation = params.get("width_truncation", "resample")
+    area_lambda_mode = params.get("area_lambda_mode", "quarter")
+    area_label_mode = params.get("area_label_mode", "measure")
 
     if crack_type in ("longitudinal", "transverse"):
         x_min, x_max = float(np.min(xy[:, 0])), float(np.max(xy[:, 0]))
@@ -1223,10 +1612,14 @@ def add_crack(
         pert_seed = rng.integers(0, 2**31)
         x_curve = curve_pts[:, 0]
         y_curve = curve_pts[:, 1]
+        # perturb_mode='legacy' 恢复 (x·f)%1 周期化环绕（每 0.5 m 精确重复）。
+        periodic = perturb_mode == "legacy"
         pert_x = _fractal_perturbation(x_curve, y_curve, octaves=3,
-                                       persistence=0.3, scale=0.5, seed=pert_seed)
+                                       persistence=0.3, scale=0.5, seed=pert_seed,
+                                       periodic=periodic)
         pert_y = _fractal_perturbation(x_curve, y_curve, octaves=3,
-                                       persistence=0.3, scale=0.5, seed=pert_seed + 1)
+                                       persistence=0.3, scale=0.5, seed=pert_seed + 1,
+                                       periodic=periodic)
         curve_pts[:, 0] += pert_x * 0.02
         curve_pts[:, 1] += pert_y * 0.02
 
@@ -1272,12 +1665,10 @@ def add_crack(
         if "width_profile" in params:
             lognorm_sample = np.asarray(params["width_profile"], dtype=np.float64)
         else:
-            lognorm_sample = rng.lognormal(mean=np.log(width_mean), sigma=width_std,
-                                           size=num_curve_samples)
-            if severity == "light":
-                lognorm_sample = np.minimum(lognorm_sample, JTG_CRACK_WIDTH_THRESHOLD_M - 1e-4)
-            else:
-                lognorm_sample = np.maximum(lognorm_sample, JTG_CRACK_WIDTH_THRESHOLD_M + 2e-4)
+            lognorm_sample = _sample_width_profile(
+                rng, width_mean, width_std, num_curve_samples, severity,
+                width_truncation,
+            )
 
         # measure-then-label：标签严重度由实现几何的代表缝宽（中位数）
         # 对照 3 mm 阈值决定，而不是信任输入的 severity 字符串——
@@ -1320,14 +1711,32 @@ def add_crack(
     elif crack_type in ("alligator", "block"):
         if crack_type == "alligator":
             block_size = 0.2 if severity == "severe" else 0.5
-            width_crack = params.get(
-                "width_mean", 0.0015 if severity == "light" else 0.005
-            )
+            w_mean_def = 0.0018 if severity == "light" else 0.006
+            w_std_def = 0.25 if severity == "light" else 0.3
+            legacy_w = 0.0015 if severity == "light" else 0.005
+            # JTG 5210-2018 块度：龟裂 轻 0.2-0.5m / 重 <0.2m（官网检索
+            # 片段口径，原文需人工核对）⇒ 分级中点 0.35 m。
+            block_split = 0.35
         else:
             block_size = 1.0 if severity == "light" else 0.6
-            width_crack = params.get(
-                "width_mean", 0.002 if severity == "light" else 0.005
-            )
+            w_mean_def = 0.0018 if severity == "light" else 0.006
+            w_std_def = 0.25 if severity == "light" else 0.3
+            legacy_w = 0.002 if severity == "light" else 0.005
+            # 代码内轻/重名义块度 1.0/0.6 的中点（JTG 块裂 >1.0m 口径需
+            # 人工核对）。
+            block_split = 0.80
+        if area_label_mode == "legacy":
+            # legacy：固定标量缝宽（历史口径）。
+            width_crack = params.get("width_mean", legacy_w)
+        else:
+            # measure：对数正态采样 + 判据侧截断的单实例缝宽。
+            if "width_mean" in params:
+                width_crack = float(params["width_mean"])
+            else:
+                width_crack = _sample_truncated_width(
+                    rng, w_mean_def, float(params.get("width_std", w_std_def)),
+                    severity,
+                )
         # 分段体制：params["region_bounds"] 由计划阶段按全局条带 bbox
         # 裁剪后传入（patch 最终边界），保证跨段 Voronoi 全链一致；
         # 不传时回退为从传入云 bbox 推导（单块路径历史行为逐位不变）。
@@ -1420,10 +1829,26 @@ def add_crack(
             & (xy[:, 1] >= y_min - 0.1) & (xy[:, 1] <= y_max + 0.1)
         )
         half_width_crack = width_crack / 2.0
+
+        # measure-then-label：标签由实现几何决定（覆盖标签 1-4）——用
+        # Voronoi 单元等效边长中位数对照 JTG 块度阈值，而不是信任输入的
+        # severity 字符串（与线状裂缝的 measure-then-label 同型）。
+        if area_label_mode != "legacy":
+            edge_med = _voronoi_median_edge(seeds, x_min, x_max, y_min, y_max)
+            realized_light = edge_med >= block_split
+            if crack_type == "alligator":
+                label_val = 1 if realized_light else 2
+            else:
+                label_val = 3 if realized_light else 4
+
         physical_mask = (min_dist_ridge <= half_width_crack) & in_region
 
         if np.any(physical_mask):
-            t = min_dist_ridge[physical_mask] / max(half_width_crack, 1e-12)
+            # area_lambda_mode='quarter'（默认）：λ=w/4，缝缘深度
+            # d_max·e⁻⁴≈1.8%·d_max（与线状裂缝的边缘连续原则一致）；
+            # 'half' 为历史 λ=w/2（缝缘 0.368·d_max 台阶）。
+            t_scale = half_width_crack * (0.5 if area_lambda_mode != "half" else 1.0)
+            t = min_dist_ridge[physical_mask] / max(t_scale, 1e-12)
             depth = d_max * np.exp(-(t ** 2.0))
             pts[physical_mask, 2] -= depth
 
@@ -1459,14 +1884,16 @@ def add_pothole(
         \\right]^{1/\\beta}, \\quad 0 \\le r \\le R
 
     其中 :math:`r = \\sqrt{(x-c_x)^2 + (y-c_y)^2}` 为到中心的径向距离，
-    :math:`\\beta` 为超椭圆指数：
-
-    - :math:`\\beta = 2`: 椭球凹陷 (轻)
-    - :math:`\\beta > 2`: 平底坑 (重)
+    :math:`\\beta` 为超椭圆指数。轻/重两级**共用** :math:`\\beta \\sim
+    U(2,5)`（重叠支撑集）——仅凭剖面形状不再可判定轻/重（历史实现轻度恒
+    :math:`\\beta=2`、重度 :math:`U(3,5)`，构成几何域标签泄漏，已消除；
+    :math:`\\beta` 区间本身为工程假设，无标准/文献依据）。
 
     边缘剥落模拟：对边界点随机侵蚀，并用 Poisson 采样添加微坑。
 
-    标签：轻=9 (d_max ≤ 25mm), 重=10 (d_max > 25mm)
+    标签由**实现深度**推导（9 if depth ≤ 25mm else 10），不信任输入的
+    severity 字符串（防调用方 severity/depth 不一致导致的静默错标；
+    25mm 判据本身待 JTG 原文核对）。
 
     分段体制（``params["deterministic_seed"]`` + ``params["pit_seed"]``）：
     边缘剥落改为坐标哈希的逐点确定性决策，微坑参数改由专用 ``pit_seed``
@@ -1474,7 +1901,7 @@ def add_pothole(
     变化，会污染其后所有抽取（含 Poisson 微坑），使坑缘剥落/微坑在缝两侧
     不一致（半径大、锚点近缝时扩展域截断剥落环）。坐标哈希 + 专用微坑流
     使任一物理点在任何段里得到相同结果，无需归属段规则（归属段反而会把
-    跨缝坑槽在邻段拥有行上截断）。不传 params 时走历史路径，逐位不变。
+    跨缝坑槽在邻段拥有行上截断）。
 
     Args:
         points:  点云 (N, 3)。
@@ -1483,12 +1910,20 @@ def add_pothole(
         radius:  坑槽半径 R (m)。
         depth:   最大深度 d_max (m)。
         edge_quality: 边缘质量因子 [0,1]，1 为完整，0 为严重剥落。
-        severity: 严重程度 'light' | 'severe'。
+        severity: 严重程度 'light' | 'severe'（``beta_mode='legacy'`` 时
+            仍决定 β 字面量分级；标签一律由 depth 推导）。
         seed: 随机种子（历史路径）。
-        beta_range: 重度坑槽的 β 采样区间 (lo, hi)；轻度恒为 2（椭球）。
-            None 时重度取 [3, 5]（默认口径，与 PotholeConfig.beta_range 一致）。
-        params: 可选覆盖：``'deterministic_seed'``（剥落坐标哈希盐）、
-            ``'pit_seed'``（微坑专用随机流种子）。
+        beta_range: β 采样区间 (lo, hi)。默认两级共用。
+        params: 可选覆盖：
+            - ``'deterministic_seed'``（剥落坐标哈希盐）
+            - ``'pit_seed'``（微坑专用随机流种子）
+            - ``'beta_mode'``：'overlap'（默认，两级共用 beta_range）|
+              'legacy'（轻=2.0 字面量、重~U(beta_range)）
+            - ``'micropit_mode'``：'area'（默认，λ = micropit_rate·(R/0.30)²
+              随破损面积增长、始终生成）| 'legacy'（钳制计数
+              Poisson(max(1,int(R·5))) 且仅在 edge_quality<1 时生成）
+            - ``'micropit_rate'``：微坑泊松强度基准（默认 4.0）
+            - ``'spall_band'``：剥落环半径带 (r_lo·R, r_hi·R)（默认 (0.8,1.0)）
 
     Returns:
         points_modified:  修改后点云 (N, 3)。
@@ -1498,22 +1933,38 @@ def add_pothole(
     pts = points.copy()
     lbl = labels.copy()
 
-    label_val = 9 if severity == "light" else 10
+    # 标签由实现深度推导（JTG 坑槽轻/重 25mm 判据；阈值需人工核对原文），
+    # 消除 severity='light'+depth>25mm 之类调用方的静默错标。
+    label_val = 9 if depth <= 0.025 else 10
+
+    beta_mode = "overlap" if params is None else params.get("beta_mode", "overlap")
+    micropit_mode = "area" if params is None else params.get("micropit_mode", "area")
+    micropit_rate = 4.0 if params is None else float(params.get("micropit_rate", 4.0))
+    spall_band = (
+        (0.8, 1.0) if params is None else tuple(params.get("spall_band", (0.8, 1.0)))
+    )
 
     cx, cy = center
     xy = pts[:, :2]
     r = np.sqrt((xy[:, 0] - cx) ** 2 + (xy[:, 1] - cy) ** 2)
 
-    # 超椭圆指数 β：轻度恒为 2（椭球）；重度按 beta_range 采样（平底）。
+    # 超椭圆指数 β：'overlap'（默认）两级共用 beta_range；'legacy' 恢复
+    # 轻度恒 2.0（椭球）、重度按 beta_range（平底）。
     if beta_range is not None and not 0.0 < beta_range[0] <= beta_range[1]:
         raise ValueError(f"beta_range must satisfy 0 < lo <= hi, got {beta_range}")
-    if severity == "light":
-        beta = 2.0
+    if beta_mode == "legacy":
+        if severity == "light":
+            beta = 2.0
+        elif beta_range is not None:
+            lo, hi = beta_range
+            beta = float(rng.uniform(lo, hi))
+        else:
+            beta = 3.0 + rng.random() * 2.0  # β ∈ [3, 5] 平底
     elif beta_range is not None:
         lo, hi = beta_range
         beta = float(rng.uniform(lo, hi))
     else:
-        beta = 3.0 + rng.random() * 2.0  # β ∈ [3, 5] 平底
+        beta = float(rng.uniform(2.0, 5.0))
 
     # 坑槽主凹陷
     in_pothole = r <= radius
@@ -1530,7 +1981,8 @@ def add_pothole(
 
     # 边缘剥落 (edge spalling)
     if edge_quality < 1.0:
-        edge_mask = (r >= 0.8 * radius) & (r <= 1.2 * radius)
+        band_lo, band_hi = spall_band
+        edge_mask = (r >= band_lo * radius) & (r <= band_hi * radius)
         if np.any(edge_mask):
             edge_idx = np.where(edge_mask)[0]
             if det_seed is not None:
@@ -1556,23 +2008,30 @@ def add_pothole(
                     pts[spall_idx, 2] -= spall_depth
                     lbl[spall_idx] = label_val
 
-        # Poisson 微坑 (小尺度次生坑)
-        num_pits = pit_rng.poisson(max(1, int(radius * 5)))
-        for _ in range(num_pits):
-            pit_angle = pit_rng.uniform(0, 2 * np.pi)
-            pit_radius = radius * pit_rng.uniform(0.8, 1.3)
-            pit_cx = cx + pit_radius * np.cos(pit_angle)
-            pit_cy = cy + pit_radius * np.sin(pit_angle)
-            pit_r = 0.02 + pit_rng.random() * 0.04  # 微坑半径 2-6cm
-            pit_d = pit_rng.uniform(0.001, 0.005)  # 深度 1-5mm
+    # Poisson 微坑（小尺度次生坑）。'area'（默认）：λ 与破损面积成比例、
+    # 独立于 edge_quality（次生坑物理上不依赖坑缘完整度）；'legacy'：
+    # 钳制到 1 的计数且仅在 edge_quality<1 时生成。
+    if micropit_mode == "legacy":
+        num_pits = (
+            pit_rng.poisson(max(1, int(radius * 5))) if edge_quality < 1.0 else 0
+        )
+    else:
+        num_pits = pit_rng.poisson(micropit_rate * (radius / 0.30) ** 2)
+    for _ in range(num_pits):
+        pit_angle = pit_rng.uniform(0, 2 * np.pi)
+        pit_radius = radius * pit_rng.uniform(0.8, 1.3)
+        pit_cx = cx + pit_radius * np.cos(pit_angle)
+        pit_cy = cy + pit_radius * np.sin(pit_angle)
+        pit_r = 0.02 + pit_rng.random() * 0.04  # 微坑半径 2-6cm
+        pit_d = pit_rng.uniform(0.001, 0.005)  # 深度 1-5mm
 
-            r_pit = np.sqrt((xy[:, 0] - pit_cx) ** 2 + (xy[:, 1] - pit_cy) ** 2)
-            in_pit = r_pit <= pit_r
-            if np.any(in_pit):
-                r_norm_pit = r_pit[in_pit] / pit_r
-                z_pit = -pit_d * (1.0 - r_norm_pit ** 2.0) ** 0.5
-                pts[in_pit, 2] += z_pit
-                lbl[in_pit] = label_val
+        r_pit = np.sqrt((xy[:, 0] - pit_cx) ** 2 + (xy[:, 1] - pit_cy) ** 2)
+        in_pit = r_pit <= pit_r
+        if np.any(in_pit):
+            r_norm_pit = r_pit[in_pit] / pit_r
+            z_pit = -pit_d * (1.0 - r_norm_pit ** 2.0) ** 0.5
+            pts[in_pit, 2] += z_pit
+            lbl[in_pit] = label_val
 
     return pts, lbl
 
@@ -1663,10 +2122,12 @@ def add_raveling(
 
     模拟细集料脱落：
     1. 在区域内随机移除一定比例的点 (用 ``np.nan`` 标记，调用方过滤)
-    2. 对剩余点，高度降低 (高斯噪声模拟表面侵蚀)
+    2. 对剩余点，高度降低（i.i.d. 高斯**侵蚀**，非点蚀坑洞）
 
-    轻 (标签 11)：移除比例 ~5%，深度 ~1-2mm
-    重 (标签 12)：移除比例 ~20%，深度 ~3-5mm 点蚀
+    轻 (标签 11)：移除比例 ~5%，侵蚀 ~N(0.5d, 0.3d) 截断 [0, 1.5d]，d=2mm
+    重 (标签 12)：移除比例 ~20%，侵蚀 ~N(0.5d, 0.3d) 截断 [0, 1.5d]，d=5mm
+    （实测重度侵蚀均值 ≈2.5mm；d 与移除比例由
+    ``RavelingConfig`` 经 params 覆盖键下发，默认值 = 历史硬编码）
 
     可改进点#1: 增加 ``remove_nan`` 参数，为 True 时在返回前自动过滤 NaN
     点并同步裁剪标签数组，减少调用方负担。
@@ -1685,7 +2146,9 @@ def add_raveling(
         severity: 严重程度 'light' | 'severe'。
         seed: 随机种子（历史路径；deterministic 模式下不使用）。
         remove_nan: 是否在返回前自动过滤 NaN 点 (可改进点#1)。
-        params: 可选覆盖：``'deterministic_seed'``（int）→ 坐标哈希决策。
+        params: 可选覆盖：``'deterministic_seed'``（int）→ 坐标哈希决策；
+            ``'removal_ratio'``（点移除比例）；``'erosion_depth'``（侵蚀深度
+            基准 d 的 (轻, 重) 二元组，米）。
 
     Returns:
         points_modified:  修改后点云 (N, 3) 或 (N', 3) (若 remove_nan=True)。
@@ -1704,12 +2167,15 @@ def add_raveling(
             return pts[valid], lbl[valid]
         return pts, lbl
 
-    if severity == "light":
-        removal_ratio = 0.05
-        pitting_depth = 0.002  # 2mm
+    if params is not None and "removal_ratio" in params:
+        removal_ratio = float(params["removal_ratio"])
     else:
-        removal_ratio = 0.20
-        pitting_depth = 0.005  # 5mm
+        removal_ratio = 0.05 if severity == "light" else 0.20
+    if params is not None and "erosion_depth" in params:
+        d_light, d_severe = params["erosion_depth"]
+        erosion_scale = float(d_light) if severity == "light" else float(d_severe)
+    else:
+        erosion_scale = 0.002 if severity == "light" else 0.005
 
     det_seed = None if params is None else params.get("deterministic_seed")
 
@@ -1734,9 +2200,9 @@ def add_raveling(
                 np.clip(u_erosion, 1e-12, 1.0 - 1e-12)
             )
             erosion = np.clip(
-                pitting_depth * 0.5 + pitting_depth * 0.3 * z_erosion,
+                erosion_scale * 0.5 + erosion_scale * 0.3 * z_erosion,
                 0.0,
-                pitting_depth * 1.5,
+                erosion_scale * 1.5,
             )
             pts[remaining_idx, 2] -= erosion
             lbl[remaining_idx] = label_val
@@ -1751,9 +2217,9 @@ def add_raveling(
         remaining_idx = np.setdiff1d(region_idx, remove_idx)
         if len(remaining_idx) > 0:
             # 高斯噪声随机深度
-            erosion = rng.normal(loc=pitting_depth * 0.5, scale=pitting_depth * 0.3,
+            erosion = rng.normal(loc=erosion_scale * 0.5, scale=erosion_scale * 0.3,
                                  size=len(remaining_idx))
-            erosion = np.clip(erosion, 0.0, pitting_depth * 1.5)
+            erosion = np.clip(erosion, 0.0, erosion_scale * 1.5)
             pts[remaining_idx, 2] -= erosion
             lbl[remaining_idx] = label_val
 
@@ -1775,6 +2241,7 @@ def add_depression(
     depth: float,
     severity: str,
     seed: int | None = None,
+    params: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Add depression (沉陷) — large-area low-frequency subsidence.
 
@@ -1789,22 +2256,36 @@ def add_depression(
     轻 (标签 13)：深度 10-25mm
     重 (标签 14)：深度 > 25mm
 
+    标签半径口径（``params['label_radius_mode']``）：``'R'``（默认）——
+    标签盘半径 = 影响半径 R（边界信号 depth·e⁻⁴·⁵≈1.1%·depth，0.1-0.8mm，
+    远低于 σ_r=10mm，逐点不可分辨、依靠区域聚合可恢复）；``'legacy-1pct'``
+    ——历史 ``|depression| > depth·1%`` 隐式外扩（等价 1.0116R）。
+
     Args:
         points:  点云 (N, 3)。
         labels:  标签 (N,)。
         center:  沉陷中心 (cx, cy)。
         radius:  影响半径 (m)。
         depth:  最大深度 (m)。
-        severity: 'light' | 'severe'。
+        severity: 'light' | 'severe'（其它值报错）。
         seed: 随机种子 (未使用，为接口一致性保留)。
+        params: 可选覆盖：``'label_radius_mode'``（'R' | 'legacy-1pct'）。
 
     Returns:
         points_modified:  修改后点云 (N, 3)。
         labels_modified: 修改后标签 (N,)。
     """
+    if severity not in ("light", "severe"):
+        raise ValueError(
+            f"severity must be 'light' or 'severe', got {severity!r}"
+        )
     _ = seed  # 未使用但为接口一致性保留
     pts = points.copy()
     lbl = labels.copy()
+
+    label_radius_mode = (
+        "R" if params is None else params.get("label_radius_mode", "R")
+    )
 
     label_val = 13 if severity == "light" else 14
     cx, cy = center
@@ -1817,8 +2298,12 @@ def add_depression(
 
     pts[:, 2] += depression
 
-    # 标注受影响区域 (深度超过 1% 最大深度的点)
-    affected = np.abs(depression) > depth * 0.01
+    if label_radius_mode == "legacy-1pct":
+        # 历史隐式外扩：|depression| > depth·1% 等价 r < 1.0116·R。
+        affected = np.abs(depression) > depth * 0.01
+    else:
+        # 默认：标签盘半径 = 影响半径 R。
+        affected = r2 <= radius ** 2
     lbl[affected] = label_val
 
     return pts, lbl
@@ -1856,8 +2341,12 @@ def add_rutting(
     重 (标签 16)：深度 > 15mm
 
     分段体制：``params["modulation_wavelength"]`` 由计划阶段按**全局**
-    条带长度固定（Λ = 全局 y 幅 × 0.5）传入；不传时回退为从传入云的
-    y 范围推导（单块路径历史行为逐位不变）。
+    条带长度固定（Λ = 全局 y 幅 × ``modulation_wavelength_ratio``）传入；
+    ``params["modulation_epsilon"]`` 传入纵向调制幅度 ε。不传时回退为从
+    传入云的 y 范围推导波长、ε=0.2（与历史默认一致）。
+
+    深度口径：名义深度 ``depth`` 由调用方按 ``d' = d/(1+ε)`` 归一，使
+    实现峰值 ``d'·(1+ε)·(track≤1) ≤ d``（不再越过 JTG 10/15mm 档位分界）。
 
     Args:
         points:  点云 (N, 3)。
@@ -1868,7 +2357,8 @@ def add_rutting(
         width: 单条轮迹宽度 (m)。
         severity: 严重程度 'light' | 'severe'。
         seed: 随机种子（当前实现为确定性计算，保留接口）。
-        params: 可选覆盖：'modulation_wavelength' 纵向调制波长 (m)。
+        params: 可选覆盖：``'modulation_wavelength'`` 纵向调制波长 (m)、
+            ``'modulation_epsilon'`` 纵向调制幅度 ε（默认 0.2）。
 
     Returns:
         points_modified:  修改后点云 (N, 3)。
@@ -1893,7 +2383,7 @@ def add_rutting(
     else:
         y_range = np.max(y) - np.min(y)
         modulation_wavelength = y_range * 0.5
-    epsilon = 0.2
+    epsilon = 0.2 if params is None else float(params.get("modulation_epsilon", 0.2))
     modulation = 1.0 + epsilon * np.sin(2.0 * np.pi * y / modulation_wavelength)
 
     track_left = np.exp(-0.5 * ((x - x_left) / sigma) ** 2)
@@ -1903,9 +2393,9 @@ def add_rutting(
 
     pts[:, 2] -= rut_depth
 
-    # 标签边界必须几何可观测：绝对阈值 ≥2mm（旧的 5% 相对阈值在
-    # 标注边界处形变仅 ~0.6mm，低于传感器噪声，标签不可学习且把
-    # 标注带宽拉到 1m/轮迹，远超 0.6m 物理轮迹宽）。
+    # 标签边界必须几何可观测：绝对阈值 ≥2mm（5% 相对阈值在浅车辙处会低于
+    # 传感器噪声）。40mm 上限处 max(2mm, 5%·d)=2mm=5%·d —— 与旧相对阈值
+    # 在该点等价；标注带宽随深度变化是物理事实（浅车辙标注带更宽）。
     affected = rut_depth > max(0.002, depth * 0.05)
     lbl[affected] = label_val
 
@@ -1941,10 +2431,11 @@ def add_corrugation(
     重 (标签 18)：振幅 > 25mm
 
     波浪拥包是**局部**病害（数米范围的搓板/推挤），不是全路段周期
-    起伏：正弦调制乘以高斯空间包络（σ_e ~ 1-3 m），标签只覆盖包络
-    支撑域内波幅可观测的点——旧实现无包络时约 94% 的场景点被标注，
-    类先验被极端扭曲。注意 amplitude 指单侧波高；若 JTG 分级量按
-    峰谷差解读则为 2A，正式实验前需对照标准原文口径（文档声明）。
+    起伏：正弦调制乘以高斯空间包络（σ_e ~ U(0.7, 1.3) m，标注直径
+    ≈2.5-4.7 m），标签只覆盖包络支撑域内波幅可观测的点——旧实现无包络
+    时约 94% 的场景点被标注，类先验被极端扭曲。注意 amplitude 指单侧
+    波高；若 JTG 分级量按峰谷差解读则为 2A，正式实验前需对照标准原文
+    口径（文档声明）。
 
     分段体制：``params["envelope_center"]``/``params["envelope_sigma"]``
     由计划阶段按**全局**条带 bbox 抽定后传入（不传时回退为从传入云
@@ -2106,6 +2597,89 @@ def add_patching(
     return pts, lbl
 
 
+def _clip_segment_to_box(
+    p1: np.ndarray, p2: np.ndarray,
+    x0: float, x1: float, y0: float, y1: float,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Liang-Barsky 线段裁剪到轴对齐盒；完全在盒外返回 None。"""
+    p1 = np.asarray(p1, dtype=np.float64)
+    p2 = np.asarray(p2, dtype=np.float64)
+    d = p2 - p1
+    t0, t1 = 0.0, 1.0
+    for pp, qq in (
+        (-d[0], p1[0] - x0), (d[0], x1 - p1[0]),
+        (-d[1], p1[1] - y0), (d[1], y1 - p1[1]),
+    ):
+        if abs(pp) < 1e-15:
+            if qq < 0.0:
+                return None
+        else:
+            r = qq / pp
+            if pp < 0.0:
+                if r > t1:
+                    return None
+                if r > t0:
+                    t0 = r
+            else:
+                if r < t0:
+                    return None
+                if r < t1:
+                    t1 = r
+    if t0 > t1:
+        return None
+    return (p1 + t0 * d, p1 + t1 * d)
+
+
+def _clip_ray_to_box(
+    origin: np.ndarray, direction: np.ndarray,
+    x0: float, x1: float, y0: float, y1: float,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """裁剪从 origin 沿 direction 的射线到轴对齐盒；返回线段或 None。"""
+    d = np.asarray(direction, dtype=np.float64)
+    norm = float(np.linalg.norm(d))
+    if norm < 1e-15:
+        return None
+    diag = abs(x1 - x0) + abs(y1 - y0) + 1.0
+    far = origin + (d / norm) * (4.0 * diag)
+    return _clip_segment_to_box(origin, far, x0, x1, y0, y1)
+
+
+def _slab_ridge_segments(
+    vor, seeds: np.ndarray,
+    x0: float, x1: float, y0: float, y1: float,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Voronoi 脊线（含无限脊线）裁剪到板 bbox，返回有限线段列表。
+
+    无限脊线（``ridge_dict`` 顶点含 ``-1``）沿两生成种子的垂直平分线从
+    有限顶点向外延伸——方向取 von 顶点相对种子中点的外向侧，再裁剪到板
+    bbox。历史实现只刻有限脊线，实测 36% 胞界因此无槽。
+    """
+    segments: list[tuple[np.ndarray, np.ndarray]] = []
+    try:
+        ridge_items = list(vor.ridge_dict.items())
+    except AttributeError:
+        ridge_items = []
+    for (i, j), verts in ridge_items:
+        finite = [int(v) for v in verts if int(v) >= 0]
+        if len(finite) == 2:
+            clipped = _clip_segment_to_box(
+                vor.vertices[finite[0]], vor.vertices[finite[1]], x0, x1, y0, y1
+            )
+        elif len(finite) == 1:
+            v = vor.vertices[finite[0]]
+            delta = seeds[j] - seeds[i]
+            d = np.array([-delta[1], delta[0]], dtype=np.float64)
+            mid = 0.5 * (seeds[i] + seeds[j])
+            if float(np.dot(d, v - mid)) < 0.0:
+                d = -d
+            clipped = _clip_ray_to_box(v, d, x0, x1, y0, y1)
+        else:
+            clipped = None
+        if clipped is not None:
+            segments.append(clipped)
+    return segments
+
+
 def add_concrete_damage(
     points: np.ndarray,
     labels: np.ndarray,
@@ -2127,7 +2701,9 @@ def add_concrete_damage(
     slab_shatter   (破碎板)             21 / 22      板体碎块 + 垂直错台
     slab_crack    (裂缝)                23 / 24      贯穿板体的尖锐裂缝
     corner_break  (板角断裂)            25 / 26      板角斜向裂缝 + 沉降
-    faulting      (错台)                27 / 28      接缝处高度差 3-10mm/>10mm
+    faulting      (错台)                27 / 28      接缝处高度差 5mm/15mm
+                                                     （代码默认 d_max=0.005/0.015，
+                                                     待 JTG 原文核对，见 rejected R2）
     pumping       (唧泥)                29           接缝湿泥 (强度下降)
     edge_spall    (边角剥落)            30 / 31      板边缘破损
     joint_damage  (接缝料损坏)          32 / 33      接缝填充物缺失
@@ -2158,6 +2734,13 @@ def add_concrete_damage(
               板块的倾斜场跨段一致）
             - 'joint_y': 计划固定的错台接缝 y 坐标（faulting）
             - 'pit_center': (cx, cy) 计划固定的坑洞中心（pitting）
+            - 'crack_in_slab': 板裂缝是否限制在单一板块内（默认 True；
+              False = 历史过全云中心的无限长直线）
+            - 'fault_scope': 错台影响域 'adjacent-slabs'（默认）| 'legacy-strip'
+            - 'edge_spall_mode': 边角剥落口径 'patch-truncated'（默认）|
+              'legacy'（无界指数深度）
+            - 'shatter_mode': 破碎板刻槽口径 'clipped-max'（默认）|
+              'legacy'（仅有限脊线、逐条累加）
         seed: 随机种子。
 
     Returns:
@@ -2178,6 +2761,11 @@ def add_concrete_damage(
     # P1-4 修复：支持板块偏移参数
     x_offset = params.get("x_offset", 0.0)
     y_offset = params.get("y_offset", 0.0)
+    # 本轮几何口径（默认 = 修正后行为；legacy 回退见各分段注释）
+    crack_in_slab = params.get("crack_in_slab", True)
+    fault_scope = params.get("fault_scope", "adjacent-slabs")
+    edge_spall_mode = params.get("edge_spall_mode", "patch-truncated")
+    shatter_mode = params.get("shatter_mode", "clipped-max")
 
     # 获取标签
     # 对无程度区分的类型，直接用固定标签
@@ -2274,44 +2862,127 @@ def add_concrete_damage(
                 pts[slab_idx[frag_mask], 2] += fragment_disp[fi]
 
             # 裂缝沿 Voronoi 脊线
-            for ridge in vor.ridge_vertices:
-                if ridge[0] >= 0 and ridge[1] >= 0:
-                    p1 = vor.vertices[ridge[0]]
-                    p2 = vor.vertices[ridge[1]]
-                    # 检查脊线在板内
-                    dists = _point_to_segment_distance(xy[slab_idx], p1, p2)
-                    crack_near = dists < joint_w * 2
-                    if np.any(crack_near):
-                        d_max_crack = params.get("d_max", 0.02)
-                        t = dists[crack_near] / (joint_w * 2)
-                        pts[slab_idx[crack_near], 2] -= d_max_crack * np.exp(-(t ** 2))
-                        lbl[slab_idx[crack_near]] = label_val
+            if shatter_mode == "legacy":
+                # legacy：仅有限脊线（含 -1 的无限脊线不刻槽，实测 36% 胞界
+                # 因此无槽）、逐条累加（三线交汇可达 3×d_max）。
+                for ridge in vor.ridge_vertices:
+                    if ridge[0] >= 0 and ridge[1] >= 0:
+                        p1 = vor.vertices[ridge[0]]
+                        p2 = vor.vertices[ridge[1]]
+                        dists = _point_to_segment_distance(xy[slab_idx], p1, p2)
+                        crack_near = dists < joint_w * 2
+                        if np.any(crack_near):
+                            d_max_crack = params.get("d_max", 0.02)
+                            t = dists[crack_near] / (joint_w * 2)
+                            pts[slab_idx[crack_near], 2] -= d_max_crack * np.exp(-(t ** 2))
+                            lbl[slab_idx[crack_near]] = label_val
+            else:
+                # clipped-max（默认）：无限脊线按板 bbox 裁剪后一并刻槽；
+                # 多脊线命中取**最大深度**（先算最小距离场再取一次剖面），
+                # 保证单点 |Δz| ≤ d_max_crack。
+                d_max_crack = params.get("d_max", 0.01 if severity == "light" else 0.02)
+                ridge_list = _slab_ridge_segments(
+                    vor, seeds, x_s_min, x_s_max, y_s_min, y_s_max
+                )
+                if ridge_list:
+                    slab_xy = xy[slab_idx]
+                    min_d = np.full(slab_idx.shape[0], np.inf)
+                    for p1, p2 in ridge_list:
+                        min_d = np.minimum(
+                            min_d, _point_to_segment_distance(slab_xy, p1, p2)
+                        )
+                    near = min_d < joint_w * 2
+                    if np.any(near):
+                        t = min_d[near] / (joint_w * 2)
+                        pts[slab_idx[near], 2] -= d_max_crack * np.exp(-(t ** 2))
+                        lbl[slab_idx[near]] = label_val
 
             lbl[slab_idx] = label_val
 
     # 2) 水泥裂缝 (Concrete Crack)
     elif damage_type == "slab_crack":
-        # 通过板体的直线裂缝，边缘更尖锐
-        angle = rng.uniform(0, np.pi)
-        x_center = (x_min + x_max) * 0.5
-        y_center = (y_min + y_max) * 0.5
-        normal_x, normal_y = np.cos(angle), np.sin(angle)
-        dist_to_line = np.abs(normal_x * (x - x_center) + normal_y * (y - y_center))
+        if crack_in_slab:
+            # 限制在单一板块内：在板内采样走向（横/纵/斜）与位置，并裁剪到
+            # 板边（历史实现为过全云 bbox 中心的无限长直线，可跨 2-3 块板并
+            # 穿越接缝——任何病害定义口径下『单条板裂缝跨越多板』均不成立）。
+            ix, iy = slab_indices(x, y)
+            if "target_slab" in params:
+                target_slab = np.asarray(params["target_slab"], dtype=int)
+            elif "domain_bounds" in params:
+                # 分段体制：在全局板块列表上抽定目标板（同 seed 各段一致）。
+                ix_hi = int(math.floor(x_max / slab_wid))
+                iy_hi = int(math.floor(y_max / slab_len))
+                slabs = np.array(
+                    [(a, b) for a in range(0, ix_hi + 1) for b in range(0, iy_hi + 1)],
+                    dtype=int,
+                )
+                target_slab = slabs[rng.integers(len(slabs))]
+            else:
+                unique_slabs = np.unique(np.stack([ix, iy], axis=1), axis=0)
+                target_slab = unique_slabs[rng.integers(len(unique_slabs))]
 
-        crack_width_joint = joint_w * 2
-        physical_mask = dist_to_line < crack_width_joint
+            slab_mask = (ix == target_slab[0]) & (iy == target_slab[1])
+            slab_idx = np.where(slab_mask)[0]
 
-        if np.any(physical_mask):
-            d_max_crack = params.get("d_max", 0.015 if severity == "light" else 0.040)
-            t = dist_to_line[physical_mask] / crack_width_joint
-            # 更尖锐的剖面 (p=1 近似 V 形)
-            depth_crack = d_max_crack * np.exp(-(t ** 1.0))
-            pts[physical_mask, 2] -= depth_crack
+            if "slab_bounds" in params:
+                x_s_min, x_s_max, y_s_min, y_s_max = (
+                    float(v) for v in params["slab_bounds"]
+                )
+            else:
+                slab_xs = x[slab_idx] if slab_idx.size else np.array([x_min, x_max])
+                slab_ys = y[slab_idx] if slab_idx.size else np.array([y_min, y_max])
+                x_s_min, x_s_max = float(np.min(slab_xs)), float(np.max(slab_xs))
+                y_s_min, y_s_max = float(np.min(slab_ys)), float(np.max(slab_ys))
 
-        label_width_floor = params.get("label_width_floor", 0.0)
-        label_mask = dist_to_line < max(crack_width_joint, label_width_floor * 0.5)
-        if np.any(label_mask):
-            lbl[label_mask] = label_val
+            angle = rng.uniform(0.0, np.pi)
+            # 过板内一点、沿 angle 的直线，裁剪到板 bbox 得到有限线段。
+            cx_s = float(rng.uniform(x_s_min, x_s_max))
+            cy_s = float(rng.uniform(y_s_min, y_s_max))
+            direction = np.array([np.cos(angle), np.sin(angle)])
+            clipped = _clip_ray_to_box(
+                np.array([cx_s, cy_s]), direction,
+                x_s_min, x_s_max, y_s_min, y_s_max,
+            )
+            if clipped is None or len(slab_idx) == 0:
+                return pts, lbl
+            seg_a, seg_b = clipped
+            dist_to_line = _point_to_segment_distance(xy[slab_idx], seg_a, seg_b)
+            crack_width_joint = joint_w * 2
+            physical = dist_to_line < crack_width_joint
+            if np.any(physical):
+                d_max_crack = params.get(
+                    "d_max", 0.015 if severity == "light" else 0.040
+                )
+                t = dist_to_line[physical] / crack_width_joint
+                # 更尖锐的剖面 (p=1 近似 V 形)
+                depth_crack = d_max_crack * np.exp(-(t ** 1.0))
+                pts[slab_idx[physical], 2] -= depth_crack
+            label_width_floor = params.get("label_width_floor", 0.0)
+            label_sel = dist_to_line < max(crack_width_joint, label_width_floor * 0.5)
+            if np.any(label_sel):
+                lbl[slab_idx[label_sel]] = label_val
+        else:
+            # legacy：过全云 bbox 中心的无限长直线（可跨多板、穿越接缝）。
+            angle = rng.uniform(0, np.pi)
+            x_center = (x_min + x_max) * 0.5
+            y_center = (y_min + y_max) * 0.5
+            normal_x, normal_y = np.cos(angle), np.sin(angle)
+            dist_to_line = np.abs(normal_x * (x - x_center) + normal_y * (y - y_center))
+
+            crack_width_joint = joint_w * 2
+            physical_mask = dist_to_line < crack_width_joint
+
+            if np.any(physical_mask):
+                d_max_crack = params.get("d_max", 0.015 if severity == "light" else 0.040)
+                t = dist_to_line[physical_mask] / crack_width_joint
+                # 更尖锐的剖面 (p=1 近似 V 形)
+                depth_crack = d_max_crack * np.exp(-(t ** 1.0))
+                pts[physical_mask, 2] -= depth_crack
+
+            label_width_floor = params.get("label_width_floor", 0.0)
+            label_mask = dist_to_line < max(crack_width_joint, label_width_floor * 0.5)
+            if np.any(label_mask):
+                lbl[label_mask] = label_val
 
     # 3) 板角断裂 (Corner Break)
     elif damage_type == "corner_break":
@@ -2414,12 +3085,22 @@ def add_concrete_damage(
 
         fault_offset = params.get("d_max", 0.005 if severity == "light" else 0.015)
 
-        # 错台是接缝两侧**整板**的相对竖向位移（基层唧泥/塌陷），
-        # z 场为逐板分片常量、在接缝处一次跳变——旧实现只位移接缝
-        # 两侧 ±40mm 窄条带，制造出两个物理上不存在的反向台阶。
-        # （恰在接缝线上的点归属单侧，避免出现第三个中间高程级。）
-        side = np.where(y >= joint_y, 1.0, -1.0)
-        pts[:, 2] += side * fault_offset * 0.5
+        # 错台是接缝两侧**相邻两块板**的相对竖向位移（基层唧泥/塌陷），
+        # z 场为逐板分片常量、在接缝处一次跳变。'adjacent-slabs'（默认）
+        # 仅位移接缝两侧两块板，远处板块保持原高程；'legacy-strip' 为历史
+        # 全条带 ±d_max/2 位移（100% 点被移动，测得的近远端点均位移）。
+        # 恰在接缝线上的点归属上侧板，避免第三个中间高程级。
+        if fault_scope == "legacy-strip":
+            side = np.where(y >= joint_y, 1.0, -1.0)
+            pts[:, 2] += side * fault_offset * 0.5
+        else:
+            ix_all, iy_all = slab_indices(x, y)
+            j_hi = int(math.floor(joint_y / slab_len))
+            shift = np.where(
+                iy_all == j_hi, fault_offset * 0.5,
+                np.where(iy_all == j_hi - 1, -fault_offset * 0.5, 0.0),
+            )
+            pts[:, 2] += shift
         # JTG 在接缝处量测错台，标签仍限于接缝邻域条带。
         near_joint = np.abs(y - joint_y) < joint_w * 5
         if np.any(near_joint):
@@ -2447,19 +3128,42 @@ def add_concrete_damage(
 
     # 6) 边角剥落 (Edge Spall)
     elif damage_type == "edge_spall":
-        # 板块边缘破损
-        near_joint = joint_dist < joint_w * 10
-
-        # 随机选择一些接缝附近区域
-        if np.any(near_joint):
-            joint_idx = np.where(near_joint)[0]
-            n_spall = max(1, int(len(joint_idx) * (0.3 if severity == "light" else 0.6)))
-            spall_idx = rng.choice(joint_idx, size=n_spall, replace=False)
-
-            d_max_spall = params.get("d_max", 0.010 if severity == "light" else 0.030)
-            spall_depth = rng.exponential(d_max_spall * 0.5, size=n_spall)
-            pts[spall_idx, 2] -= spall_depth
-            lbl[spall_idx] = label_val
+        d_max_spall = params.get("d_max", 0.010 if severity == "light" else 0.030)
+        if edge_spall_mode == "legacy":
+            # legacy：接缝带内逐点无界指数深度（单点可达 ~108mm 尖刺）、
+            # 标注覆盖整条接缝带。
+            near_joint = joint_dist < joint_w * 10
+            if np.any(near_joint):
+                joint_idx = np.where(near_joint)[0]
+                n_spall = max(1, int(len(joint_idx) * (0.3 if severity == "light" else 0.6)))
+                spall_idx = rng.choice(joint_idx, size=n_spall, replace=False)
+                spall_depth = rng.exponential(d_max_spall * 0.5, size=n_spall)
+                pts[spall_idx, 2] -= spall_depth
+                lbl[spall_idx] = label_val
+        else:
+            # patch-truncated（默认）：在少量局部斑块（板边/板角邻域）内生成
+            # 空间相关的连续剥落面，深度用截断分布（≤ d_max）。
+            n_patch = max(1, int(rng.poisson(3.0 if severity == "light" else 6.0)))
+            for _ in range(n_patch):
+                px = float(rng.uniform(x_min, x_max))
+                py = float(rng.uniform(y_min, y_max))
+                # 吸附到最近接缝（板边/板角邻域）。
+                jx = float(long_joints[np.argmin(np.abs(px - long_joints))])
+                jy = float(trans_joints[np.argmin(np.abs(py - trans_joints))])
+                if abs(px - jx) <= abs(py - jy):
+                    px = jx
+                else:
+                    py = jy
+                patch_r = float(rng.uniform(0.05, 0.15))
+                patch_depth = float(rng.uniform(0.3, 1.0)) * d_max_spall
+                r_patch = np.sqrt((x - px) ** 2 + (y - py) ** 2)
+                in_patch = r_patch <= patch_r
+                if np.any(in_patch):
+                    depth = patch_depth * np.exp(
+                        -(r_patch[in_patch] / patch_r) ** 2
+                    )
+                    pts[in_patch, 2] -= depth
+                    lbl[in_patch] = label_val
 
     # 7) 接缝料损坏 (Joint Damage)
     elif damage_type == "joint_damage":
@@ -2543,7 +3247,9 @@ def add_concrete_damage(
 
     # 10) 露骨 (Exposed Aggregate)
     elif damage_type == "exposed_aggregate":
-        # 表面纹理缺失 → 增加粗糙度 + 降低强度
+        # 表面纹理缺失 → 增加表面粗糙度（几何）；强度**增亮** ×1.20 由辐射
+        # 模型按标签 36 处理（generator._compute_intensity 的标签乘子），
+        # 本函数不改强度。
         region_idx = np.where(
             (x > x_min + 0.1 * (x_max - x_min)) &
             (x < x_max - 0.1 * (x_max - x_min)) &
@@ -2793,7 +3499,7 @@ if __name__ == "__main__":
     try:
         pts, nrm = generate_road_surface(
             width=test_width, length=test_length, grid_res=test_grid_res,
-            pavement_type="asphalt", roughness_class="A", seed=seed,
+            roughness_class="A", seed=seed,
         )
         N_actual = pts.shape[0]
         assert pts.shape == (N_actual, 3), f"points shape: {pts.shape}"
@@ -3007,7 +3713,7 @@ if __name__ == "__main__":
     print("\n[10/11] add_concrete_damage ...", end=" ")
     try:
         pts, nrm = generate_road_surface(test_width, test_length, test_grid_res,
-                                         pavement_type="concrete", seed=seed)
+                                         seed=seed)
         lbl = np.zeros(pts.shape[0], dtype=np.int64)
 
         concrete_types = [
