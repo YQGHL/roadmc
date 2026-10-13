@@ -436,7 +436,8 @@ def generate_road_surface(
     texture_h_macro: float = 0.34,
     texture_h_micro: float = 0.75,
     texture_break_wavelength_m: float = 0.010,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_layers: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, dict[str, object]]:
     """Generate a road surface via a piecewise isotropic radial PSD.
 
     高度场由三部分构成：确定性设计几何 + ISO 8608 宏观粗糙度 + 自仿射
@@ -532,6 +533,10 @@ def generate_road_surface(
     Returns:
         points:  点云 (N, 3) = [x, y, z]。
         normals: 单位法向量 (N, 3)，含坡度与纹理贡献。
+        With ``return_layers=True``, a third mapping is returned with x-major
+        ``design``, ``roughness``, ``texture`` arrays in metres and a ``seeds``
+        provenance mapping. The layered opt-in uses independent macro/texture
+        random streams and is not pointwise equal to the legacy merged FFT.
     """
     if macro_spectrum_mode not in ("iso-marginal", "legacy", "two-segment"):
         raise ValueError(
@@ -703,9 +708,76 @@ def generate_road_surface(
 
     normals_grid = _compute_normals(h_field, grid_res, grid_res)
 
+    layers: dict[str, np.ndarray] | None = None
+    if return_layers:
+        # Preserve the legacy merged-spectrum path above exactly.  The opt-in
+        # layered path uses independent named streams so that the components
+        # are realizations of their own PSDs, not an invalid algebraic split of
+        # sqrt(PSD_iso + PSD_texture).
+        root_ss = np.random.SeedSequence(seed)
+        macro_ss, texture_ss = root_ss.spawn(2)
+        macro_seed = int(macro_ss.generate_state(1, dtype=np.uint32)[0])
+        texture_seed = int(texture_ss.generate_state(1, dtype=np.uint32)[0])
+        macro_rng = np.random.default_rng(macro_seed)
+        texture_rng = np.random.default_rng(texture_seed)
+
+        def realize_component(psd_component: np.ndarray, component_rng) -> np.ndarray:
+            white = component_rng.normal(0.0, 1.0, (nx, ny))
+            scale = 1.0 if macro_spectrum_mode == "legacy" else 1.0 / grid_res
+            component = np.real(
+                np.fft.ifft2(np.sqrt(psd_component) * scale * np.fft.fft2(white))
+            )
+            component -= np.mean(component)
+            return component
+
+        h_iso_layer = realize_component(psd_iso, macro_rng)
+        h_texture_layer = realize_component(psd_tex, texture_rng)
+        if macro_spectrum_mode == "legacy":
+            for component, target in (
+                (h_iso_layer, math.sqrt(max(var_iso, 0.0))),
+                (h_texture_layer, texture_rms),
+            ):
+                current = float(np.std(component))
+                if current > 1e-15 and target > 0.0:
+                    component *= target / current
+        if texture_het_sigma_ln > 0.0:
+            if het_field == "2d":
+                e = texture_rng.normal(0.0, 1.0, (nx, ny))
+                g = ndimage.gaussian_filter(
+                    e, sigma=texture_het_corr_len_m / grid_res, mode="reflect"
+                )
+            else:
+                e = texture_rng.normal(0.0, 1.0, ny)
+                g = ndimage.gaussian_filter1d(
+                    e, sigma=texture_het_corr_len_m / grid_res, mode="reflect"
+                )
+            z = (g - g.mean()) / max(float(g.std()), 1e-15)
+            modulation = np.exp(texture_het_sigma_ln * z)
+            modulation /= np.sqrt(np.mean(modulation**2))
+            h_texture_layer *= modulation if het_field == "2d" else modulation[None, :]
+
+        design = np.zeros_like(X)
+        if crossfall != 0.0:
+            design -= crossfall * (
+                np.abs(X - width / 2.0) if crossfall_shape == "crowned" else X
+            )
+        if longitudinal_grade != 0.0:
+            design += longitudinal_grade * Y
+        h_field = design + h_iso_layer + h_texture_layer
+        layers = {
+            "design": design,
+            "roughness": h_iso_layer,
+            "texture": h_texture_layer,
+            "seeds": {"surface_seed": int(root_ss.entropy),
+                      "macro_seed": macro_seed, "texture_seed": texture_seed},
+        }
+        normals_grid = _compute_normals(h_field, grid_res, grid_res)
+
     points = np.stack([X.ravel(), Y.ravel(), h_field.ravel()], axis=1)  # (N, 3)
     normals = normals_grid.reshape(-1, 3)  # (N, 3)
 
+    if layers is not None:
+        return points, normals, layers
     return points, normals
 
 
@@ -905,6 +977,9 @@ def generate_strip_surface(
     texture_h_macro: float = 0.34,
     texture_h_micro: float = 0.75,
     texture_break_wavelength_m: float = 0.010,
+    return_layers: bool = False,
+    macro_seed: int | None = None,
+    texture_seed: int | None = None,
 ):
     """Segmented strip surface synthesis (yields one extended segment at a
     time to keep the working set bounded).
@@ -954,10 +1029,26 @@ def generate_strip_surface(
     Yields:
         ``(seg_index, y0_ext, y1_ext, y0_owned, y1_owned, x_grid,
         y_ext_values, z_ext (nx, ext_rows), normals_ext (nx, ext_rows, 3))``
+        and, with ``return_layers=True``, an additional mapping of x-major
+        design, ISO macro roughness, and blended texture height layers.
     """
 
-    rng_surface = np.random.default_rng(seed)
-    rng_tex = np.random.default_rng(int(rng_surface.integers(0, 2**31)))
+    if return_layers:
+        root_seed_sequence = np.random.SeedSequence(seed)
+        macro_child, texture_child = root_seed_sequence.spawn(2)
+        macro_seed = (
+            int(macro_child.generate_state(1, dtype=np.uint32)[0])
+            if macro_seed is None else int(macro_seed)
+        )
+        texture_seed = (
+            int(texture_child.generate_state(1, dtype=np.uint32)[0])
+            if texture_seed is None else int(texture_seed)
+        )
+        rng_surface = np.random.default_rng(macro_seed)
+        rng_tex = np.random.default_rng(texture_seed)
+    else:
+        rng_surface = np.random.default_rng(seed)
+        rng_tex = np.random.default_rng(int(rng_surface.integers(0, 2**31)))
 
     x = np.arange(0.0, width, grid_res)
     y = np.arange(0.0, length, grid_res)
@@ -970,6 +1061,7 @@ def generate_strip_surface(
         taper = (f_iso_max / math.sqrt(2.0), f_iso_max * math.sqrt(2.0))
     f_tex_lo = taper[0] if taper is not None else f_iso_max
 
+    macro_band_provided = macro_band is not None
     if macro_band is None:
         macro_band = synthesize_strip_macro_band(
             width, length, grid_res, roughness_class, rng_surface,
@@ -1109,7 +1201,29 @@ def generate_strip_surface(
         if longitudinal_grade != 0.0:
             h_field = h_field + longitudinal_grade * Y_e[None, :]
         normals_grid = _compute_normals(h_field, grid_res, grid_res)
-        return (seg_k, y0e, y1e, y0o, y1o, x, Y_e, h_field, normals_grid)
+        result = (seg_k, y0e, y1e, y0o, y1o, x, Y_e, h_field, normals_grid)
+        if not return_layers:
+            return result
+        design = np.zeros_like(macro_part)
+        X_e = np.meshgrid(x, Y_e, indexing="ij")[0]
+        if crossfall != 0.0:
+            design -= crossfall * (
+                np.abs(X_e - width / 2.0) if crossfall_shape == "crowned" else X_e
+            )
+        if longitudinal_grade != 0.0:
+            design += longitudinal_grade * Y_e[None, :]
+        layer_map = {
+            "design": design,
+            "roughness": macro_part,
+            "texture": h,
+            "seeds": {
+                "surface_seed": int(root_seed_sequence.entropy),
+                "macro_seed": macro_seed,
+                "texture_seed": texture_seed,
+                "macro_source": "provided_macro_band" if macro_band_provided else "generated_here",
+            },
+        }
+        return (*result, layer_map)
 
     for k, bounds in enumerate(segment_bounds):
         cur = _synth_texture(bounds[2], bounds[3])

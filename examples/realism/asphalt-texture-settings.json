@@ -1,0 +1,10 @@
+{
+  "rms_m": 0.0004,
+  "hurst": 0.8,
+  "anisotropy_ratio": 1.0,
+  "orientation_deg": 0.0,
+  "band_lo_cycles_m": 0.0,
+  "band_hi_cycles_m": 30.0,
+  "distribution": "gaussian",
+  "material_id": "asphalt"
+}

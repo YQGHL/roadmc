@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "road_id": "readme-concrete-demo",
+  "provenance": {
+    "source": "README-generated SurfaceTile; synthetic only",
+    "calibration": "none"
+  },
+  "hypothesis": {
+    "status": "engineering hypothesis; uncalibrated",
+    "material_model": "procedural exposed texture; no copied real patches"
+  },
+  "material": "concrete",
+  "events": [
+    {
+      "instance_id": "slab-crack-a",
+      "type": "crack",
+      "seed": 419,
+      "label": 23,
+      "parameters": {
+        "center_x_m": 0.9,
+        "center_y_m": 0.5,
+        "start_x_m": 0.9,
+        "start_y_m": 0.18,
+        "end_x_m": 0.9,
+        "end_y_m": 0.82,
+        "width_m": 0.006,
+        "depth_m": 0.015,
+        "exposed_rms_m": 0.0002,
+        "severity": "light"
+      }
+    },
+    {
+      "instance_id": "pitting-b",
+      "type": "pothole",
+      "seed": 523,
+      "label": 34,
+      "parameters": {
+        "center_x_m": 1.3,
+        "center_y_m": 0.55,
+        "radius_m": 0.12,
+        "depth_m": 0.008,
+        "exposed_rms_m": 0.0004
+      }
+    },
+    {
+      "instance_id": "patch-c",
+      "type": "patch",
+      "seed": 631,
+      "label": 37,
+      "parameters": {
+        "center_x_m": 0.9,
+        "center_y_m": 0.5,
+        "radius_x_m": 0.13,
+        "radius_y_m": 0.11,
+        "thickness_m": 0.001,
+        "exposed_rms_m": 0.00015
+      }
+    }
+  ]
+}

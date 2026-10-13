@@ -1482,6 +1482,9 @@ class GeneratorConfig:
     am_envelope: AmEnvelopeConfig = field(default_factory=AmEnvelopeConfig)
     """AM 慢变包络配置：默认关闭，默认输出逐位不变。"""
 
+    surface_layers: bool = False
+    """是否启用可选的 design/roughness/texture 三层表面；默认关闭以保留旧行为。"""
+
     base_condition: BaseConditionConfig = field(default_factory=BaseConditionConfig)
     """基层条件与病害因果链配置：默认关闭（旧行为逐位不变）。"""
 

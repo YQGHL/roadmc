@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "road_id": "readme-asphalt-demo",
+  "provenance": {
+    "source": "README-generated SurfaceTile; synthetic only",
+    "calibration": "none"
+  },
+  "hypothesis": {
+    "status": "engineering hypothesis; uncalibrated",
+    "material_model": "procedural exposed texture; no copied real patches"
+  },
+  "material": "asphalt",
+  "events": [
+    {
+      "instance_id": "crack-a",
+      "type": "crack",
+      "seed": 173,
+      "label": 6,
+      "parameters": {
+        "center_x_m": 0.8,
+        "center_y_m": 0.45,
+        "start_x_m": 0.55,
+        "start_y_m": 0.25,
+        "end_x_m": 1.2,
+        "end_y_m": 0.78,
+        "width_m": 0.008,
+        "depth_m": 0.004,
+        "exposed_rms_m": 0.0002,
+        "severity": "severe"
+      }
+    },
+    {
+      "instance_id": "ravel-b",
+      "type": "raveling",
+      "seed": 239,
+      "label": 11,
+      "parameters": {
+        "center_x_m": 1.25,
+        "center_y_m": 0.62,
+        "radius_x_m": 0.28,
+        "radius_y_m": 0.2,
+        "corrlen_m": 0.025,
+        "depth_m": 0.002,
+        "threshold": 0.3,
+        "exposed_rms_m": 0.0003
+      }
+    },
+    {
+      "instance_id": "patch-c",
+      "type": "patch",
+      "seed": 307,
+      "label": 20,
+      "parameters": {
+        "center_x_m": 0.8,
+        "center_y_m": 0.45,
+        "radius_x_m": 0.15,
+        "radius_y_m": 0.12,
+        "thickness_m": 0.001,
+        "exposed_rms_m": 0.00015
+      }
+    }
+  ]
+}
