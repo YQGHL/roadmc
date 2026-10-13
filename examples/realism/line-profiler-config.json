@@ -1,0 +1,11 @@
+{
+  "lateral_res_m": 0.001,
+  "step_m": 0.005,
+  "sensor_height_m": 0.35,
+  "laser_incidence_deg": 30.0,
+  "sigma_z0_m": 0.00025,
+  "speckle_shape": 3.0,
+  "flyer_prob": 0.001,
+  "flyer_sigma_mult": 8.0,
+  "brightness_dropout_ref": 0.05
+}

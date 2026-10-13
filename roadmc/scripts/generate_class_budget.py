@@ -422,9 +422,13 @@ def _add_realism_flags(parser: argparse.ArgumentParser) -> None:
     g = parser.add_argument_group("生成器行为修正回退（2026-10）")
     g.add_argument(
         "--macro-spectrum",
-        choices=["iso-marginal", "legacy"],
-        default="iso-marginal",
-        help="宏观谱权重口径：iso-marginal（默认，ISO 一维边际重构）| legacy（历史点采样权重 + std 重定标）",
+        choices=["iso-marginal", "legacy", "two-segment"],
+        default="two-segment",
+        help=(
+            "宏观谱权重口径：two-segment（默认，ISO 段 + VT 2015 两区间幂律"
+            "纹理段，H 数值导入而非自校准）| iso-marginal（单段纹理谱 ISO "
+            "边际重构，回退档）| legacy（历史点采样权重 + std 重定标）"
+        ),
     )
     g.add_argument(
         "--disease-sampling",
@@ -533,6 +537,157 @@ def _add_realism_flags(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="纹理 het 调制恢复沿里程 y 一维广播（历史口径；默认二维调制场）",
     )
+    g.add_argument(
+        "--het-corr-len-m",
+        type=float,
+        default=None,
+        help=(
+            "纹理 het 调制场高斯相关长度 (m)。默认 0.01（不传时用库内"
+            "默认）；历史口径传 2.0。与 --texture-het-corr 为同一字段"
+            "的别名（类预算脚本既有名），显式传任一者即覆盖"
+        ),
+    )
+
+    g = parser.add_argument_group("two-segment 谱形（2026-10 结构批）")
+    g.add_argument(
+        "--texture-h-macro",
+        type=float,
+        default=0.34,
+        help="two-segment 宏观纹理段 Hurst 指数（导入而非自校准，需人工核对 VT 原页）",
+    )
+    g.add_argument(
+        "--texture-h-micro",
+        type=float,
+        default=0.75,
+        help="two-segment 微观纹理段 Hurst 指数（导入而非自校准，需人工核对 VT 原页）",
+    )
+    g.add_argument(
+        "--texture-break-wavelength",
+        type=float,
+        default=0.010,
+        help="two-segment 断裂波长 λ_b (m)；VT 2015 Table 4-2 实测 0.50–2.30 cm（导入）",
+    )
+    g.add_argument(
+        "--mpd-rms-ratio",
+        type=float,
+        default=0.81,
+        help=(
+            "MPD/纹理带 RMS 比值标定（默认 0.81 = two-segment 谱形下"
+            "的重新标定值；历史单段谱形口径传 0.52）"
+        ),
+    )
+
+    g = parser.add_argument_group("AM 慢变包络（默认关闭）")
+    g.add_argument(
+        "--am-envelope",
+        choices=["on", "off"],
+        default="off",
+        help="AM 慢变包络开关（默认 off = 旧行为逐位不变）",
+    )
+    g.add_argument(
+        "--am-wcut",
+        type=float,
+        default=2.83,
+        help="AM 快/慢波分界频率 (cycle/m)，默认 2.83 = ISO 带边界",
+    )
+    g.add_argument(
+        "--am-target-skew",
+        type=float,
+        default=0.0,
+        help="AM CDF 变换目标偏度（导入而非自校准）",
+    )
+    g.add_argument(
+        "--am-target-kurt",
+        type=float,
+        default=4.5,
+        help="AM CDF 变换目标峰度（导入而非自校准）",
+    )
+
+    g = parser.add_argument_group("过渡带剖面（默认值 = 旧行为）")
+    g.add_argument(
+        "--crack-profile-exponent",
+        type=float,
+        default=2.0,
+        help="缝深剖面指数 p（2.0 = 现行高斯槽；p→1 近线性 V 形）",
+    )
+    g.add_argument(
+        "--crack-edge-band-width",
+        type=float,
+        default=0.0,
+        help="缝缘崩碎过渡带宽度 (m)，0 = 关闭（现行行为）；工程假设",
+    )
+    g.add_argument(
+        "--pothole-spall-profile",
+        choices=["uniform", "linear-decay"],
+        default="uniform",
+        help="坑缘剥落深度剖面：uniform（默认，现行行为）| linear-decay（工程假设）",
+    )
+    g.add_argument(
+        "--patch-edge-profile",
+        choices=["smoothstep", "step-fillet"],
+        default="smoothstep",
+        help="修补边缘剖面：smoothstep（默认，现行行为）| step-fillet（错台实测口径，导入）",
+    )
+    g.add_argument(
+        "--fault-fillet-m",
+        type=float,
+        default=0.0,
+        help="水泥错台阶跃平滑宽度 (m)，0 = 现行纯阶跃",
+    )
+
+    g = parser.add_argument_group("基层条件 / 病害因果链（默认关闭）")
+    g.add_argument(
+        "--causality",
+        choices=["on", "off"],
+        default="off",
+        help=(
+            "病害因果链开关（SNP/龄期/YE4 抽取 + ICA 硬规则 + TPM 调制）；"
+            "off（默认）= 旧行为。受控场景（本脚本全部场景）绕过因果约束"
+            "——受控场景是显式物理配方"
+        ),
+    )
+    g.add_argument(
+        "--snp-range",
+        nargs=2,
+        type=float,
+        default=(3.0, 5.5),
+        metavar=("LO", "HI"),
+        help="平均结构数 SNP 抽样区间（--causality on 时生效）",
+    )
+    g.add_argument(
+        "--age-range",
+        nargs=2,
+        type=float,
+        default=(0.0, 15.0),
+        metavar=("LO", "HI"),
+        help="场景龄期 (年) 抽样区间（--causality on 时生效）",
+    )
+    g.add_argument(
+        "--tpm-path",
+        type=str,
+        default=None,
+        help="Markov 状态转移概率矩阵 JSON 路径（可选；enable 时 disease_probs 被 π 调制）",
+    )
+
+
+def _resolve_het_corr_len_m(args: argparse.Namespace) -> float | None:
+    """归并 --het-corr-len-m 与 --texture-het-corr（同一字段的别名）.
+
+    两者都为 None → 返回 None（用库内默认 0.01，不做覆盖）；只传其
+    一 → 用传入值；都传且值不同 → ValueError（避免静默丢一个 flag
+    的值——历史版本里类预算脚本的 --texture-het-corr 会被
+    --het-corr-len-m 的默认值无声覆盖）。
+    """
+    a, b = args.het_corr_len_m, args.texture_het_corr
+    if a is None and b is None:
+        return None
+    if a is not None and b is not None and not np.isclose(a, b):
+        raise ValueError(
+            f"--het-corr-len-m ({a:g}) and --texture-het-corr ({b:g}) set "
+            "the same field (micro_texture.het_corr_len_m) to different "
+            "values; pass only one of them."
+        )
+    return a if a is not None else b
 
 
 def _apply_realism_overrides(
@@ -557,6 +712,7 @@ def _apply_realism_overrides(
                 if args.pothole_spall_band is not None
                 else config.pothole.spall_band
             ),
+            spall_profile=args.pothole_spall_profile,
         ),
         rutting=replace(
             config.rutting,
@@ -577,6 +733,8 @@ def _apply_realism_overrides(
             area_label_mode=(
                 "legacy" if args.areacrack_label_legacy else config.crack.area_label_mode
             ),
+            profile_exponent=args.crack_profile_exponent,
+            edge_band_width_m=args.crack_edge_band_width,
         ),
         concrete_damage=(
             replace(
@@ -587,7 +745,14 @@ def _apply_realism_overrides(
                 shatter_mode="legacy",
             )
             if args.concrete_legacy
-            else config.concrete_damage
+            else replace(
+                config.concrete_damage,
+                fault_fillet_m=args.fault_fillet_m,
+            )
+        ),
+        patching=replace(
+            config.patching,
+            edge_profile=args.patch_edge_profile,
         ),
         depression=replace(
             config.depression,
@@ -620,6 +785,29 @@ def _apply_realism_overrides(
                 else config.micro_texture.grid_convention
             ),
             het_field="1d" if args.het_field_1d else config.micro_texture.het_field,
+            het_corr_len_m=(
+                _resolve_het_corr_len_m(args)
+                if _resolve_het_corr_len_m(args) is not None
+                else config.micro_texture.het_corr_len_m
+            ),
+            h_macro=args.texture_h_macro,
+            h_micro=args.texture_h_micro,
+            break_wavelength_m=args.texture_break_wavelength,
+            mpd_rms_ratio=args.mpd_rms_ratio,
+        ),
+        am_envelope=replace(
+            config.am_envelope,
+            enable=args.am_envelope == "on",
+            wcut_cycles_per_m=args.am_wcut,
+            target_skew=args.am_target_skew,
+            target_kurt=args.am_target_kurt,
+        ),
+        base_condition=replace(
+            config.base_condition,
+            enable=args.causality == "on",
+            snp_range=tuple(args.snp_range),
+            age_years_range=tuple(args.age_range),
+            tpm_path=args.tpm_path,
         ),
     )
 
@@ -669,14 +857,16 @@ def main() -> None:
     parser.add_argument("--length", type=float, default=5.0, help="路面长度（里程向）(米)，默认 5.0")
     parser.add_argument(
         "--observation-model",
-        choices=["on", "off"],
+        choices=["on", "off", "line-profiler"],
         default="off",
         help=(
             "观测模型体制：off（默认，新体制）直出全部表面点并跳过扫描/噪声/"
             "丢点/输出采样（num_points 被忽略并记录在元数据 "
             "ignored_under_observation_off，类预算按全表面点计量）；on 保留"
             "完整传感器管线与 num_points 固定采样，与历史版本逐位一致"
-            "（legacy 回归口径）。与 generate_synthetic.py 默认一致。"
+            "（legacy 回归口径）；line-profiler 为线激光剖面仪观测模型"
+            "（仅单块路径，传感器模块未就绪前报'未安装'类清晰错误）。"
+            "与 generate_synthetic.py 默认一致。"
         ),
     )
     parser.add_argument("--num-points", type=int, default=8192)
@@ -709,8 +899,13 @@ def main() -> None:
     parser.add_argument(
         "--texture-het-corr",
         type=float,
-        default=2.0,
-        help="纹理沿程调制的里程向高斯相关长度 (m)，仅 het-sigma > 0 时生效",
+        default=None,
+        help=(
+            "纹理 het 调制场高斯相关长度 (m)——--het-corr-len-m 的别名"
+            "（同一字段 micro_texture.het_corr_len_m；历史默认 2.0，现"
+            "不传时用库内默认 0.01；两者都显式传且值不同时报错）。仅 "
+            "het-sigma > 0 时生效"
+        ),
     )
     parser.add_argument(
         "--curb-width",
@@ -758,7 +953,9 @@ def main() -> None:
         raise ValueError("--texture-rms must be >= 0")
     if args.texture_het_sigma < 0:
         raise ValueError("--texture-het-sigma must be >= 0")
-    if args.texture_het_sigma > 0 and args.texture_het_corr <= 0:
+    if args.texture_het_sigma > 0 and (
+        args.texture_het_corr is not None and args.texture_het_corr <= 0
+    ):
         raise ValueError("--texture-het-corr must be > 0 when --texture-het-sigma > 0")
     if args.curb_width < 0:
         raise ValueError("--curb-width must be >= 0")
@@ -797,7 +994,15 @@ def main() -> None:
         micro_texture=MicroTextureConfig(
             amplitude=args.texture_rms,
             het_sigma_ln=args.texture_het_sigma,
-            het_corr_len_m=args.texture_het_corr,
+            # het 相关长度经 _resolve_het_corr_len_m 归并（None = 库内
+            # 默认 0.01；--texture-het-corr 与 --het-corr-len-m 为同一
+            # 字段的别名，历史版本此处会被 --het-corr-len-m 的默认值
+            # 无声覆盖）。
+            het_corr_len_m=(
+                _resolve_het_corr_len_m(args)
+                if _resolve_het_corr_len_m(args) is not None
+                else 0.01
+            ),
         ),
         curb=CurbConfig(width_m=args.curb_width, height_m=args.curb_height),
         radiometric=RadiometricConfig(
@@ -830,18 +1035,38 @@ def main() -> None:
                 f"~{peak:.0f} MiB per worker)"
             )
     config.validate_parallel_budget(workers, args.max_parallel_memory_mib)
-    # 分段条带计划在 on 体制下不可执行（观测管线未分段），必须前置硬
-    # 报错而不是逐场景静默失败；off 体制支持分段，放行。条件与
-    # generate_synthetic.py 的 _validate_request 保持一致。
-    if estimate.segmented and config.observation_model == "on":
+    # 谱形前置检查：two-segment 需要 primitives 侧两段谱批次（本树未
+    # 合入时构造合法但逐场景运行会失败——受控场景同样被拦）。入口
+    # 清晰报错并提示回退。与 generate_synthetic.py 保持一致。
+    if config.road.macro_spectrum_mode == "two-segment":
+        from roadmc.data.synthetic.generator import _primitive_supports_mode_value
+        from roadmc.data.synthetic.primitives import generate_road_surface
+
+        if not _primitive_supports_mode_value(
+            generate_road_surface, "macro_spectrum_mode", "two-segment"
+        ):
+            raise SystemExit(
+                "--macro-spectrum two-segment requires the primitives-side "
+                "two-segment PSD batch, which is not merged into "
+                "primitives.py in this build yet. Re-run with "
+                "--macro-spectrum iso-marginal or legacy."
+            )
+    # 分段条带计划在 on 体制下不可执行（观测管线未分段），line-profiler
+    # 亦仅单块路径，必须前置硬报错而不是逐场景静默失败；off 体制支持
+    # 分段，放行。条件与 generate_synthetic.py 的 _validate_request 保持
+    # 一致。
+    if estimate.segmented and config.observation_model != "off":
         raise SystemExit(
             f"Strip of {estimate.point_count:,} points requires the segmented "
             f"regime ({estimate.segment_count} segments × "
-            f"{estimate.segment_length_m:.3f} m), which does not support the "
-            "observation pipeline (observation_model='on') in this build. "
-            "Re-run with --observation-model off, or raise the surface budget "
-            "(GeneratorConfig.max_surface_points / max_surface_memory_mib) to "
-            "hold the whole strip in one block, or use a coarser --grid-res."
+            f"{estimate.segment_length_m:.3f} m), which does not support "
+            "observation_model="
+            f"{config.observation_model!r} in this build (the observation "
+            "pipeline is not segmented, and line-profiler is single-block "
+            "only). Re-run with --observation-model off, or raise the surface "
+            "budget (GeneratorConfig.max_surface_points / "
+            "max_surface_memory_mib) to hold the whole strip in one block, or "
+            "use a coarser --grid-res."
         )
     if not 0.0 < args.test_ratio < 1.0:
         raise ValueError("--test-ratio must be in (0, 1)")

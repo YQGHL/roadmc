@@ -1,0 +1,11 @@
+{
+  "samples": [
+    {
+      "path": "../../output/readme-demo/replay/asphalt/replay.npz",
+      "domain": "synthetic",
+      "role": "candidate",
+      "road_segment_id": "readme-asphalt-demo",
+      "material_id": "asphalt"
+    }
+  ]
+}

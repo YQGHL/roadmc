@@ -433,7 +433,11 @@ def generate_road_surface(
     macro_spectrum_mode: str = "iso-marginal",
     grid_convention: str = "consistent",
     het_field: str = "2d",
-) -> tuple[np.ndarray, np.ndarray]:
+    texture_h_macro: float = 0.34,
+    texture_h_micro: float = 0.75,
+    texture_break_wavelength_m: float = 0.010,
+    return_layers: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, dict[str, object]]:
     """Generate a road surface via a piecewise isotropic radial PSD.
 
     高度场由三部分构成：确定性设计几何 + ISO 8608 宏观粗糙度 + 自仿射
@@ -467,6 +471,17 @@ def generate_road_surface(
     :math:`\\Phi = G_d0 n_0^2/4\\,\\Omega^{-3}`、带边硬切换、以及把每次
     实现精确缩放到目标 RMS 的实现级重定标（宏观 σ 约为 ISO 边际口径的
     2 倍；CLI ``--macro-spectrum legacy``，仅供回归对照）。
+
+    ``macro_spectrum_mode='two-segment'``（配置/CLI 层新默认；本基元签名
+    默认仍为 'iso-marginal' 以保护直接调用方与既有测试）：ISO 段构造与
+    'iso-marginal' 逐字一致；纹理段按 VT 2015 两区间幂律拆为宏观纹理段
+    (f_tex_lo, f_b]（Φ ∝ Ω^{-(2·H_macro+2)}）与微观纹理段 (f_b, f_nyq]
+    （Φ = A·f_b^{2(H2-H1)}·Ω^{-(2·H_micro+2)}，在断裂频率 f_b =
+    1/texture_break_wavelength_m 处解析连续；两尺度律 PSD 式 3-55/3-56，
+    VT thesis 2015）。f_b ≥ 网格 Nyquist 时微观段能量为 0（元数据记
+    micro_band_empty=true）。H_macro/H_micro 数值为**导入而非自校准**
+    （VT 2015 原页需人工核对）。Parseval 闭式校准口径与单段相同
+    （raw_var 比例缩放，无实现级 std 重定标）。
 
     **纹理段** — 自仿射 (fBm 型) 表面谱
     :math:`\\Phi_{\\mathrm{tex}}(\\Omega) \\propto \\Omega^{-(2H+2)}`
@@ -509,16 +524,40 @@ def generate_road_surface(
             散点路径 :func:`add_micro_texture`）；本形参为装配层一致性
             保留。
         het_field: 纹理沿程不均匀调制场维度 '2d'（默认）| '1d'。
+        texture_h_macro: two-segment 宏观纹理段 Hurst 指数（仅
+            macro_spectrum_mode='two-segment' 生效）。
+        texture_h_micro: two-segment 微观纹理段 Hurst 指数（同上）。
+        texture_break_wavelength_m: two-segment 宏观/微观纹理段断裂波长
+            λ_b (米)，f_b = 1/λ_b（同上）。
 
     Returns:
         points:  点云 (N, 3) = [x, y, z]。
         normals: 单位法向量 (N, 3)，含坡度与纹理贡献。
+        With ``return_layers=True``, a third mapping is returned with x-major
+        ``design``, ``roughness``, ``texture`` arrays in metres and a ``seeds``
+        provenance mapping. The layered opt-in uses independent macro/texture
+        random streams and is not pointwise equal to the legacy merged FFT.
     """
-    if macro_spectrum_mode not in ("iso-marginal", "legacy"):
+    if macro_spectrum_mode not in ("iso-marginal", "legacy", "two-segment"):
         raise ValueError(
-            f"macro_spectrum_mode must be 'iso-marginal' or 'legacy', got "
-            f"{macro_spectrum_mode!r}"
+            "macro_spectrum_mode must be 'iso-marginal', 'legacy' or "
+            f"'two-segment', got {macro_spectrum_mode!r}"
         )
+    if macro_spectrum_mode == "two-segment":
+        for _hname, _hval in (
+            ("texture_h_macro", texture_h_macro),
+            ("texture_h_micro", texture_h_micro),
+        ):
+            if not math.isfinite(_hval) or _hval <= 0.0:
+                raise ValueError(f"{_hname} must be finite and > 0, got {_hval}")
+        if (
+            not math.isfinite(texture_break_wavelength_m)
+            or texture_break_wavelength_m <= 0.0
+        ):
+            raise ValueError(
+                "texture_break_wavelength_m must be finite and > 0, got "
+                f"{texture_break_wavelength_m}"
+            )
     if grid_convention not in ("consistent", "legacy"):
         raise ValueError(
             f"grid_convention must be 'consistent' or 'legacy', got {grid_convention!r}"
@@ -547,7 +586,7 @@ def generate_road_surface(
     f_iso_max = min(ISO8608_BAND_MAX_CYCLES_PER_M, nyquist)
     # 带边半个倍频程余弦 taper（tuning#1）；legacy 为硬切换。
     taper = None
-    if macro_spectrum_mode == "iso-marginal" and nyquist > f_iso_max:
+    if macro_spectrum_mode in ("iso-marginal", "two-segment") and nyquist > f_iso_max:
         taper = (f_iso_max / math.sqrt(2.0), f_iso_max * math.sqrt(2.0))
 
     if macro_spectrum_mode == "legacy":
@@ -573,6 +612,29 @@ def generate_road_surface(
                     omega > f_iso_max,
                     np.where(omega > 0.0, omega, 1.0) ** (-beta),
                     0.0,
+                )
+        elif macro_spectrum_mode == "two-segment":
+            # VT 2015 两区间幂律：宏观段 Ω^{-(2H1+2)}（f_tex_lo, f_b] +
+            # 微观段 f_b^{β2-β1}·Ω^{-(2H2+2)}（f_b, f_nyq]，f_b 处解析
+            # 连续。f_b ≥ Nyquist 时微观段为空（micro_band_empty）。
+            f_b = 1.0 / texture_break_wavelength_m
+            beta_macro = 2.0 * texture_h_macro + 2.0
+            beta_micro = 2.0 * texture_h_micro + 2.0
+            f_tex_lo = taper[0] if taper is not None else f_iso_max
+            with np.errstate(divide="ignore", invalid="ignore"):
+                om = np.where(omega > 0.0, omega, 1.0)
+                seg_macro = np.where(
+                    (omega > f_tex_lo) & (omega <= f_b),
+                    om ** (-beta_macro),
+                    0.0,
+                )
+                seg_micro = np.where(
+                    omega > f_b,
+                    (f_b ** (beta_micro - beta_macro)) * om ** (-beta_micro),
+                    0.0,
+                )
+                raw = (seg_macro + seg_micro) * (
+                    1.0 - _iso_taper_weight(omega, taper)
                 )
         else:
             f_tex_lo = taper[0] if taper is not None else f_iso_max
@@ -646,9 +708,76 @@ def generate_road_surface(
 
     normals_grid = _compute_normals(h_field, grid_res, grid_res)
 
+    layers: dict[str, np.ndarray] | None = None
+    if return_layers:
+        # Preserve the legacy merged-spectrum path above exactly.  The opt-in
+        # layered path uses independent named streams so that the components
+        # are realizations of their own PSDs, not an invalid algebraic split of
+        # sqrt(PSD_iso + PSD_texture).
+        root_ss = np.random.SeedSequence(seed)
+        macro_ss, texture_ss = root_ss.spawn(2)
+        macro_seed = int(macro_ss.generate_state(1, dtype=np.uint32)[0])
+        texture_seed = int(texture_ss.generate_state(1, dtype=np.uint32)[0])
+        macro_rng = np.random.default_rng(macro_seed)
+        texture_rng = np.random.default_rng(texture_seed)
+
+        def realize_component(psd_component: np.ndarray, component_rng) -> np.ndarray:
+            white = component_rng.normal(0.0, 1.0, (nx, ny))
+            scale = 1.0 if macro_spectrum_mode == "legacy" else 1.0 / grid_res
+            component = np.real(
+                np.fft.ifft2(np.sqrt(psd_component) * scale * np.fft.fft2(white))
+            )
+            component -= np.mean(component)
+            return component
+
+        h_iso_layer = realize_component(psd_iso, macro_rng)
+        h_texture_layer = realize_component(psd_tex, texture_rng)
+        if macro_spectrum_mode == "legacy":
+            for component, target in (
+                (h_iso_layer, math.sqrt(max(var_iso, 0.0))),
+                (h_texture_layer, texture_rms),
+            ):
+                current = float(np.std(component))
+                if current > 1e-15 and target > 0.0:
+                    component *= target / current
+        if texture_het_sigma_ln > 0.0:
+            if het_field == "2d":
+                e = texture_rng.normal(0.0, 1.0, (nx, ny))
+                g = ndimage.gaussian_filter(
+                    e, sigma=texture_het_corr_len_m / grid_res, mode="reflect"
+                )
+            else:
+                e = texture_rng.normal(0.0, 1.0, ny)
+                g = ndimage.gaussian_filter1d(
+                    e, sigma=texture_het_corr_len_m / grid_res, mode="reflect"
+                )
+            z = (g - g.mean()) / max(float(g.std()), 1e-15)
+            modulation = np.exp(texture_het_sigma_ln * z)
+            modulation /= np.sqrt(np.mean(modulation**2))
+            h_texture_layer *= modulation if het_field == "2d" else modulation[None, :]
+
+        design = np.zeros_like(X)
+        if crossfall != 0.0:
+            design -= crossfall * (
+                np.abs(X - width / 2.0) if crossfall_shape == "crowned" else X
+            )
+        if longitudinal_grade != 0.0:
+            design += longitudinal_grade * Y
+        h_field = design + h_iso_layer + h_texture_layer
+        layers = {
+            "design": design,
+            "roughness": h_iso_layer,
+            "texture": h_texture_layer,
+            "seeds": {"surface_seed": int(root_ss.entropy),
+                      "macro_seed": macro_seed, "texture_seed": texture_seed},
+        }
+        normals_grid = _compute_normals(h_field, grid_res, grid_res)
+
     points = np.stack([X.ravel(), Y.ravel(), h_field.ravel()], axis=1)  # (N, 3)
     normals = normals_grid.reshape(-1, 3)  # (N, 3)
 
+    if layers is not None:
+        return points, normals, layers
     return points, normals
 
 
@@ -679,7 +808,8 @@ def _iso_band_variance_fine(
         width, length: 条带几何 (m)。
         grid_res: 细网格分辨率 (m)，用于 f_iso_max。
         Gd0: ISO 8608 功率谱密度常数 (m³/cycle)，= 等级×1e-6。
-        macro_spectrum_mode: 'iso-marginal' | 'legacy'。
+        macro_spectrum_mode: 'iso-marginal' | 'legacy' | 'two-segment'
+            （two-segment 的 ISO 段取 iso-marginal 口径）。
 
     Returns:
         细网格 ISO 带方差 (m²)。
@@ -761,9 +891,18 @@ def synthesize_strip_macro_band(
         macro_grid_factor: 粗网格过采样倍数。
         macro_spectrum_mode: 宏观谱口径 'iso-marginal'（默认）| 'legacy'。
 
+    ``'two-segment'`` 的 ISO 宏观段与 'iso-marginal' 逐字一致（两段
+    幂律只作用于纹理段，宏观带不变），本函数按 iso-marginal 口径处理。
+
     Returns:
         dict(x=..., y=..., field=(nx_c, ny_c) float64, spacing_m=h_macro)
     """
+
+    if macro_spectrum_mode not in ("iso-marginal", "legacy", "two-segment"):
+        raise ValueError(
+            "macro_spectrum_mode must be 'iso-marginal', 'legacy' or "
+            f"'two-segment', got {macro_spectrum_mode!r}"
+        )
 
     n0 = 0.1
     Gd0 = ISO_ROUGHNESS[roughness_class] * 1e-6
@@ -835,6 +974,12 @@ def generate_strip_surface(
     macro_spectrum_mode: str = "iso-marginal",
     grid_convention: str = "consistent",
     het_field: str = "2d",
+    texture_h_macro: float = 0.34,
+    texture_h_micro: float = 0.75,
+    texture_break_wavelength_m: float = 0.010,
+    return_layers: bool = False,
+    macro_seed: int | None = None,
+    texture_seed: int | None = None,
 ):
     """Segmented strip surface synthesis (yields one extended segment at a
     time to keep the working set bounded).
@@ -872,7 +1017,11 @@ def generate_strip_surface(
         blend_band_rows: 缝两侧混合带半宽（行数，= halo 行数 m_rows）。
         macro_band: 预先合成好的宏观粗网格（:func:`synthesize_strip_macro_band`
             的返回值）；None 时内部按相同流程合成（独立调用/测试用）。
-        macro_spectrum_mode: 宏观谱口径 'iso-marginal'（默认）| 'legacy'。
+        macro_spectrum_mode: 宏观谱口径 'iso-marginal'（默认）| 'legacy' |
+            'two-segment'（ISO 段与 iso-marginal 逐字一致；纹理段按
+            VT 2015 两区间幂律拆为宏观/微观两段，断裂波长
+            ``texture_break_wavelength_m``，谱指数 H_macro/H_micro 为
+            **导入而非自校准**）。
         grid_convention: 纹理频率网格口径（本路径采样网格与 fftfreq 本已
             一致，两取值相同；为装配层一致性保留）。
         het_field: 纹理沿程不均匀调制场维度 '2d'（默认）| '1d'。
@@ -880,10 +1029,26 @@ def generate_strip_surface(
     Yields:
         ``(seg_index, y0_ext, y1_ext, y0_owned, y1_owned, x_grid,
         y_ext_values, z_ext (nx, ext_rows), normals_ext (nx, ext_rows, 3))``
+        and, with ``return_layers=True``, an additional mapping of x-major
+        design, ISO macro roughness, and blended texture height layers.
     """
 
-    rng_surface = np.random.default_rng(seed)
-    rng_tex = np.random.default_rng(int(rng_surface.integers(0, 2**31)))
+    if return_layers:
+        root_seed_sequence = np.random.SeedSequence(seed)
+        macro_child, texture_child = root_seed_sequence.spawn(2)
+        macro_seed = (
+            int(macro_child.generate_state(1, dtype=np.uint32)[0])
+            if macro_seed is None else int(macro_seed)
+        )
+        texture_seed = (
+            int(texture_child.generate_state(1, dtype=np.uint32)[0])
+            if texture_seed is None else int(texture_seed)
+        )
+        rng_surface = np.random.default_rng(macro_seed)
+        rng_tex = np.random.default_rng(texture_seed)
+    else:
+        rng_surface = np.random.default_rng(seed)
+        rng_tex = np.random.default_rng(int(rng_surface.integers(0, 2**31)))
 
     x = np.arange(0.0, width, grid_res)
     y = np.arange(0.0, length, grid_res)
@@ -896,6 +1061,7 @@ def generate_strip_surface(
         taper = (f_iso_max / math.sqrt(2.0), f_iso_max * math.sqrt(2.0))
     f_tex_lo = taper[0] if taper is not None else f_iso_max
 
+    macro_band_provided = macro_band is not None
     if macro_band is None:
         macro_band = synthesize_strip_macro_band(
             width, length, grid_res, roughness_class, rng_surface,
@@ -958,11 +1124,31 @@ def generate_strip_surface(
                 1.0 - _iso_taper_weight(omega, taper) if taper is not None else 1.0
             )
             with np.errstate(divide="ignore", invalid="ignore"):
-                raw = np.where(
-                    omega > f_tex_lo,
-                    np.where(omega > 0.0, omega, 1.0) ** (-beta),
-                    0.0,
-                ) * w_tex
+                if macro_spectrum_mode == "two-segment":
+                    # 与 generate_road_surface 同定义的两段幂律（f_b 处连续）。
+                    f_b = 1.0 / texture_break_wavelength_m
+                    beta_macro = 2.0 * texture_h_macro + 2.0
+                    beta_micro = 2.0 * texture_h_micro + 2.0
+                    om = np.where(omega > 0.0, omega, 1.0)
+                    raw = (
+                        np.where(
+                            (omega > f_tex_lo) & (omega <= f_b),
+                            om ** (-beta_macro),
+                            0.0,
+                        )
+                        + np.where(
+                            omega > f_b,
+                            (f_b ** (beta_micro - beta_macro))
+                            * om ** (-beta_micro),
+                            0.0,
+                        )
+                    ) * w_tex
+                else:
+                    raw = np.where(
+                        omega > f_tex_lo,
+                        np.where(omega > 0.0, omega, 1.0) ** (-beta),
+                        0.0,
+                    ) * w_tex
             raw_var = float(np.sum(raw) * dfx * dfy)
             if raw_var <= 0.0:
                 h = np.zeros((nx, ext_rows))
@@ -1015,7 +1201,29 @@ def generate_strip_surface(
         if longitudinal_grade != 0.0:
             h_field = h_field + longitudinal_grade * Y_e[None, :]
         normals_grid = _compute_normals(h_field, grid_res, grid_res)
-        return (seg_k, y0e, y1e, y0o, y1o, x, Y_e, h_field, normals_grid)
+        result = (seg_k, y0e, y1e, y0o, y1o, x, Y_e, h_field, normals_grid)
+        if not return_layers:
+            return result
+        design = np.zeros_like(macro_part)
+        X_e = np.meshgrid(x, Y_e, indexing="ij")[0]
+        if crossfall != 0.0:
+            design -= crossfall * (
+                np.abs(X_e - width / 2.0) if crossfall_shape == "crowned" else X_e
+            )
+        if longitudinal_grade != 0.0:
+            design += longitudinal_grade * Y_e[None, :]
+        layer_map = {
+            "design": design,
+            "roughness": macro_part,
+            "texture": h,
+            "seeds": {
+                "surface_seed": int(root_seed_sequence.entropy),
+                "macro_seed": macro_seed,
+                "texture_seed": texture_seed,
+                "macro_source": "provided_macro_band" if macro_band_provided else "generated_here",
+            },
+        }
+        return (*result, layer_map)
 
     for k, bounds in enumerate(segment_bounds):
         cur = _synth_texture(bounds[2], bounds[3])
@@ -1483,11 +1691,18 @@ def add_crack(
       （线性尺度**中位数**：轻默认 0.0018 m、重默认 0.006 m；对数正态
       形式与 σ=0.25/0.3 暂无沥青裂缝实测引用——岩石/混凝土裂隙文献惯例，
       待量测直方图拟合替换），判据侧截断见 ``width_truncation``）
-    - 深度剖面（**高斯槽**，p=2）：
+    - 深度剖面（**高斯槽**，p=2；``params['profile_exponent']`` 可改）：
 
     .. math::
         d(t) = d_{\\max} \\exp\\left(-(t/\\lambda)^p\\right),
         \\quad \\lambda = w/4
+
+    缝缘崩碎/松散过渡带（``params['edge_band_width_m'] > 0``，默认 0.0 =
+    关闭）：沿缝缘向外线性衰减的附加深度
+    :math:`d_{\\max}\\cdot\\text{ratio}\\cdot(1-u)`（
+    :math:`u=(r-w/2)/W`），**标签掩码同步外扩同宽度 W**（标签边界与
+    几何边界由同一带宽参数推导，逐点一致）。带宽与深度比例为**工程假设/
+    导入而非自校准**（文献仅对缝缘破损做定性分级，无宽度实测）。
 
     **龟裂 (Alligator Cracks)**：
     - 空间泊松点过程 → Voronoi 图 → 多边形边界裂缝
@@ -1524,6 +1739,12 @@ def add_crack(
             - 'width_truncation': 'resample'（默认）| 'clip'
             - 'area_lambda_mode': 'quarter'（默认）| 'half'
             - 'area_label_mode': 'measure'（默认）| 'legacy'
+            - 'profile_exponent': 缝深剖面指数 p（默认 2.0 = 高斯槽；
+              p→1 为近线性 V 形侧壁；仅线状裂缝生效）
+            - 'edge_band_width_m': 缝缘过渡带宽度 W（米，默认 0.0 =
+              关闭；标签掩码同步外扩同宽度）
+            - 'edge_band_depth_ratio': 过渡带深度比例（默认 0.15，
+              相对 d_max；仅 W > 0 时生效）
         seed: 随机种子。
 
     Returns:
@@ -1567,6 +1788,28 @@ def add_crack(
     width_truncation = params.get("width_truncation", "resample")
     area_lambda_mode = params.get("area_lambda_mode", "quarter")
     area_label_mode = params.get("area_label_mode", "measure")
+    # 过渡带口径（设计稿 transition_design）：profile_exponent 默认 2.0
+    # = 现行高斯槽（逐位不变）；edge_band_width_m 默认 0.0 = 关闭。缝缘
+    # 崩碎/松散过渡带宽度与深度比例均为**工程假设/导入而非自校准**（文献
+    # 仅对缝缘破损做定性分级，DOI 10.3390/coatings15070836，无宽度实测）。
+    profile_exponent = float(params.get("profile_exponent", 2.0))
+    edge_band_width_m = float(params.get("edge_band_width_m", 0.0))
+    edge_band_depth_ratio = float(params.get("edge_band_depth_ratio", 0.15))
+    if not math.isfinite(profile_exponent) or profile_exponent <= 0.0:
+        raise ValueError(
+            f"profile_exponent must be finite and > 0, got {profile_exponent}"
+        )
+    if not math.isfinite(edge_band_width_m) or edge_band_width_m < 0.0:
+        raise ValueError(
+            f"edge_band_width_m must be finite and >= 0, got {edge_band_width_m}"
+        )
+    if not math.isfinite(edge_band_depth_ratio) or not (
+        0.0 < edge_band_depth_ratio <= 1.0
+    ):
+        raise ValueError(
+            "edge_band_depth_ratio must be in (0, 1], got "
+            f"{edge_band_depth_ratio}"
+        )
 
     if crack_type in ("longitudinal", "transverse"):
         x_min, x_max = float(np.min(xy[:, 0])), float(np.max(xy[:, 0]))
@@ -1692,8 +1935,11 @@ def add_crack(
         # d(depth_ratio) = d_max * exp(-(depth_ratio)^p)
         # λ = half_width/2 = w/4（w 为插值缝宽）：高斯槽在物理带边缘
         # (r=w/2) 处深度 = d_max·e⁻⁴ ≈ 0.018·d_max，比 λ=w/2 的表述窄得多。
+        # profile_exponent p 默认 2.0（高斯槽）；p→1 为近线性 V 形侧壁
+        # （3D 激光剖面实测裂缝呈深 V 形、缝深 1–5mm，DOI
+        # 10.1109/ACCESS.2019.2956758；p 数值导入而非自校准）。
         lambda_param = half_width / 2.0  # λ = w/4
-        p_param = 2.0  # 高斯槽 (p=2)
+        p_param = profile_exponent  # 缝深剖面指数（默认 2.0 = 高斯槽）
 
         # 裂缝区域掩码
         physical_mask = min_dist <= half_width
@@ -1702,7 +1948,29 @@ def add_crack(
             depth = d_max * np.exp(-(depth_ratio ** p_param))
             pts[physical_mask, 2] -= depth
 
-        label_half_width = np.maximum(half_width, label_width_floor * 0.5)
+        # 缝缘崩碎/松散过渡带（edge_band_width_m > 0；默认 0.0 = 关闭，
+        # 与历史逐位一致）：沿缝缘向外线性衰减，深度 = d_max·
+        # edge_band_depth_ratio·(1-u)，u=(r-half_width)/edge_band_width_m。
+        # 标签掩码同步外扩同宽度（label_half_width 由同一带宽参数推导），
+        # 故标签边界与几何边界逐点一致。
+        if edge_band_width_m > 0.0:
+            band_mask = (min_dist > half_width) & (
+                min_dist <= half_width + edge_band_width_m
+            )
+            if np.any(band_mask):
+                u_band = (
+                    min_dist[band_mask] - half_width[band_mask]
+                ) / edge_band_width_m
+                band_depth = (
+                    d_max
+                    * edge_band_depth_ratio
+                    * np.clip(1.0 - u_band, 0.0, 1.0)
+                )
+                pts[band_mask, 2] -= band_depth
+
+        label_half_width = np.maximum(
+            half_width + edge_band_width_m, label_width_floor * 0.5
+        )
         label_mask = min_dist <= label_half_width
         if np.any(label_mask):
             lbl[label_mask] = label_val
@@ -1852,7 +2120,28 @@ def add_crack(
             depth = d_max * np.exp(-(t ** 2.0))
             pts[physical_mask, 2] -= depth
 
-        label_half_width = max(half_width_crack, label_width_floor * 0.5)
+        # 缝缘崩碎/松散过渡带（与线状裂缝同口径，edge_band_width_m>0 时
+        # 生效；默认 0.0 = 关闭，逐位不变）。
+        if edge_band_width_m > 0.0:
+            band_mask = (
+                (min_dist_ridge > half_width_crack)
+                & (min_dist_ridge <= half_width_crack + edge_band_width_m)
+                & in_region
+            )
+            if np.any(band_mask):
+                u_band = (
+                    min_dist_ridge[band_mask] - half_width_crack
+                ) / edge_band_width_m
+                band_depth = (
+                    d_max
+                    * edge_band_depth_ratio
+                    * np.clip(1.0 - u_band, 0.0, 1.0)
+                )
+                pts[band_mask, 2] -= band_depth
+
+        label_half_width = max(
+            half_width_crack + edge_band_width_m, label_width_floor * 0.5
+        )
         label_mask = (min_dist_ridge <= label_half_width) & in_region
         if np.any(label_mask):
             lbl[label_mask] = label_val
@@ -1924,6 +2213,9 @@ def add_pothole(
               Poisson(max(1,int(R·5))) 且仅在 edge_quality<1 时生成）
             - ``'micropit_rate'``：微坑泊松强度基准（默认 4.0）
             - ``'spall_band'``：剥落环半径带 (r_lo·R, r_hi·R)（默认 (0.8,1.0)）
+            - ``'spall_profile'``：坑缘剥落深度剖面 'uniform'（默认，
+              现行均匀带）| 'linear-decay'（深度自剥落带内缘向外缘
+              线性衰减）。坑缘崩碎梯度无可及文献实测，两档均**工程假设**。
 
     Returns:
         points_modified:  修改后点云 (N, 3)。
@@ -1943,6 +2235,17 @@ def add_pothole(
     spall_band = (
         (0.8, 1.0) if params is None else tuple(params.get("spall_band", (0.8, 1.0)))
     )
+    # 坑缘剥落深度剖面（设计稿 transition_design）：'uniform'（默认，现行
+    # 行为——剥落带内均匀深度）；'linear-decay'——深度从剥落带内缘到外缘
+    # 线性衰减。坑缘崩碎梯度无可及文献实测，两档均标**工程假设**。
+    spall_profile = (
+        "uniform" if params is None else params.get("spall_profile", "uniform")
+    )
+    if spall_profile not in ("uniform", "linear-decay"):
+        raise ValueError(
+            f"spall_profile must be 'uniform' or 'linear-decay', "
+            f"got {spall_profile!r}"
+        )
 
     cx, cy = center
     xy = pts[:, :2]
@@ -1985,18 +2288,31 @@ def add_pothole(
         edge_mask = (r >= band_lo * radius) & (r <= band_hi * radius)
         if np.any(edge_mask):
             edge_idx = np.where(edge_mask)[0]
+            # 'linear-decay'：剥落深度随半径从内缘 (band_lo·R) 到外缘
+            # (band_hi·R) 线性衰减（1→0）；'uniform' 无衰减因子（默认，
+            # 逐位不变）。
+            if spall_profile == "linear-decay":
+                span = max((band_hi - band_lo) * radius, 1e-12)
+                decay_edge = np.clip(
+                    (band_hi * radius - r[edge_idx]) / span, 0.0, 1.0
+                )
+            else:
+                decay_edge = None
             if det_seed is not None:
                 # 云无关：每个边缘点按坐标哈希以 edge_quality 概率保留。
                 u_keep = _coord_hash01(
                     pts[edge_idx, 0], pts[edge_idx, 1], int(det_seed)
                 )
-                spall_idx = edge_idx[u_keep >= edge_quality]
+                keep = u_keep >= edge_quality
+                spall_idx = edge_idx[keep]
                 if len(spall_idx) > 0:
                     u_depth = _coord_hash01(
                         pts[spall_idx, 0], pts[spall_idx, 1],
                         int(det_seed) ^ 0x27D4EB2F165667C5,
                     )
                     spall_depth = u_depth * (depth * 0.3)
+                    if decay_edge is not None:
+                        spall_depth = spall_depth * decay_edge[keep]
                     pts[spall_idx, 2] -= spall_depth
                     lbl[spall_idx] = label_val
             else:
@@ -2005,6 +2321,10 @@ def add_pothole(
                     spall_idx = rng.choice(edge_idx, size=len(edge_idx) - num_spall,
                                            replace=False)
                     spall_depth = rng.uniform(0.0, depth * 0.3, size=len(spall_idx))
+                    if decay_edge is not None:
+                        # edge_idx 由 np.where 产生（有序），searchsorted 映射。
+                        pos = np.searchsorted(edge_idx, spall_idx)
+                        spall_depth = spall_depth * decay_edge[pos]
                     pts[spall_idx, 2] -= spall_depth
                     lbl[spall_idx] = label_val
 
@@ -2559,6 +2879,30 @@ def add_patching(
     if edge_width <= 0.0:
         raise ValueError("patch edge_width must be positive")
 
+    # 修补边缘过渡剖面（设计稿 transition_design）：
+    # 'smoothstep'（默认，现行行为——edge_width 内三次 smoothstep 混合）；
+    # 'step-fillet'——尖锐阶跃 + 小圆角（transition width = edge_fillet_m），
+    # 贴近实测接缝错台 1–5.1mm 局部阶跃口径（DOI 10.3390/s18010044、
+    # DOI 10.1061/9780784413586.048，导入而非自校准）。
+    edge_profile = (
+        "smoothstep" if params is None else params.get("edge_profile", "smoothstep")
+    )
+    edge_fillet_m = (
+        0.01 if params is None else float(params.get("edge_fillet_m", 0.01))
+    )
+    if edge_profile not in ("smoothstep", "step-fillet"):
+        raise ValueError(
+            f"edge_profile must be 'smoothstep' or 'step-fillet', "
+            f"got {edge_profile!r}"
+        )
+    if edge_profile == "step-fillet" and (
+        not math.isfinite(edge_fillet_m) or edge_fillet_m <= 0.0
+    ):
+        raise ValueError(
+            "edge_fillet_m must be finite and > 0 when "
+            f"edge_profile='step-fillet', got {edge_fillet_m}"
+        )
+
     pts = points.copy()
     lbl = labels.copy()
     x = pts[:, 0]
@@ -2590,8 +2934,19 @@ def add_patching(
         plane, *_ = np.linalg.lstsq(design, pts[:, 2], rcond=None)
     target_height = design @ plane + elevation
 
-    t = np.clip(1.0 - np.maximum(signed_distance, 0.0) / edge_width, 0.0, 1.0)
-    blend = t * t * (3.0 - 2.0 * t)
+    if edge_profile == "step-fillet":
+        # 尖锐阶跃 + 小圆角：过渡宽度 = edge_fillet_m，剖面为四分之一圆弧
+        # （外侧与路面相切，内侧在阶跃顶竖直相切）——比 smoothstep 更贴近
+        # 实测局部错台阶跃。
+        trans_width = edge_fillet_m
+        support = signed_distance <= trans_width
+        t = np.clip(
+            1.0 - np.maximum(signed_distance, 0.0) / trans_width, 0.0, 1.0
+        )
+        blend = np.sqrt(np.clip(1.0 - (1.0 - t) ** 2, 0.0, 1.0))
+    else:
+        t = np.clip(1.0 - np.maximum(signed_distance, 0.0) / edge_width, 0.0, 1.0)
+        blend = t * t * (3.0 - 2.0 * t)
     pts[support, 2] += blend[support] * (target_height[support] - pts[support, 2])
     lbl[core] = label
     return pts, lbl
@@ -2741,6 +3096,8 @@ def add_concrete_damage(
               'legacy'（无界指数深度）
             - 'shatter_mode': 破碎板刻槽口径 'clipped-max'（默认）|
               'legacy'（仅有限脊线、逐条累加）
+            - 'fault_fillet_m': 错台阶跃平滑宽度 (m)，默认 0.0 = 现行
+              纯阶跃；> 0 时在接缝邻域以 smoothstep 过渡
         seed: 随机种子。
 
     Returns:
@@ -3084,6 +3441,15 @@ def add_concrete_damage(
                 joint_y = (y_min + y_max) * 0.5
 
         fault_offset = params.get("d_max", 0.005 if severity == "light" else 0.015)
+        # 错台阶跃平滑宽度（设计稿 transition_design）：0.0（默认）= 现行
+        # 纯阶跃（逐位不变）；> 0 时在接缝邻域 [joint_y-w/2, joint_y+w/2]
+        # 内以 smoothstep 在 -d/2 与 +d/2 间过渡（实测口径为局部阶跃，
+        # 默认保持阶跃；DOI 10.3390/s18010044）。
+        fault_fillet_m = float(params.get("fault_fillet_m", 0.0))
+        if not math.isfinite(fault_fillet_m) or fault_fillet_m < 0.0:
+            raise ValueError(
+                f"fault_fillet_m must be finite and >= 0, got {fault_fillet_m}"
+            )
 
         # 错台是接缝两侧**相邻两块板**的相对竖向位移（基层唧泥/塌陷），
         # z 场为逐板分片常量、在接缝处一次跳变。'adjacent-slabs'（默认）
@@ -3092,7 +3458,7 @@ def add_concrete_damage(
         # 恰在接缝线上的点归属上侧板，避免第三个中间高程级。
         if fault_scope == "legacy-strip":
             side = np.where(y >= joint_y, 1.0, -1.0)
-            pts[:, 2] += side * fault_offset * 0.5
+            shift = side * fault_offset * 0.5
         else:
             ix_all, iy_all = slab_indices(x, y)
             j_hi = int(math.floor(joint_y / slab_len))
@@ -3100,7 +3466,18 @@ def add_concrete_damage(
                 iy_all == j_hi, fault_offset * 0.5,
                 np.where(iy_all == j_hi - 1, -fault_offset * 0.5, 0.0),
             )
-            pts[:, 2] += shift
+        if fault_fillet_m > 0.0:
+            half_w = fault_fillet_m * 0.5
+            u = np.clip((y - (joint_y - half_w)) / fault_fillet_m, 0.0, 1.0)
+            frac = u * u * (3.0 - 2.0 * u)
+            ramp = -fault_offset * 0.5 + fault_offset * frac
+            if fault_scope == "legacy-strip":
+                shift = ramp
+            else:
+                shift = np.where(
+                    (iy_all == j_hi) | (iy_all == j_hi - 1), ramp, 0.0
+                )
+        pts[:, 2] += shift
         # JTG 在接缝处量测错台，标签仍限于接缝邻域条带。
         near_joint = np.abs(y - joint_y) < joint_w * 5
         if np.any(near_joint):

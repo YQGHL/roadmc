@@ -1,589 +1,156 @@
-<div align="center">
-
 # RoadMC
 
-**物理约束的路面点云生成与病害分割**
+[English](README.en.md) | 简体中文
 
-合成点云 · 可观测特征 · Swin3D / 门控 EMA · 通道混合 · Muon / AdamW
+RoadMC 是一个用于道路表面点云研究的实验性代码库，重点是程序化生成带逐点标签的道路表面、检查合成场景的几何与材料变化，并为点云分割模型提供训练入口。项目也包含固定真实域评估协议的工具。合成场景可用于受控实验和实现诊断；它们不能代替真实道路数据，也不能证明模型在真实道路上的效果。
 
-[English](README.en.md)
+## 能力与实验边界
 
-</div>
+- 基于 NumPy/SciPy 的道路表面与病害场景生成，支持沥青、水泥、网格采样及可选观测模型。
+- 可选的设计面、粗糙度、纹理三层表面表示，以及显式参数驱动的程序化纹理。
+- 基于冻结 `SurfaceTile` 和显式 JSON 计划的确定性重放，提供裂缝、坑槽、松散和修补的受控原型。
+- PyTorch 训练入口，以及读取真实点云、按道路划分、从真实标定样本拟合并冻结评估协议的工具。
 
-> RoadMC 是一个研究型原型，建立从物理启发的路面点云生成、逐点病害分割到真实域差距诊断的可复现技术路线。当前公开的性能证据只覆盖合成数据上的二分类任务，真实域尚无带标签的分割结果。
-
-## 项目定位
-
-RoadMC 包含两个同等重要的模块：
-
-1. **点云生成**：根据路面粗糙度、微纹理、病害几何和 LiDAR 观测过程生成带标签的路面点云。
-2. **模型训练**：将点坐标和传感器可观测特征输入点云分割网络，预测每个点的病害类别。
-
-合成数据不是预处理结果，而是方法的一部分。它决定几何形态、类别覆盖、稀有病害的支持度和训练分布的物理合理性。因此生成器的每一项配置都随场景落盘，可以与性能数字一起被追溯。
-
-## 方法总览
-
-### 物理点云生成
-
-<p align="center">
-  <img src="readmeimage/synthesis_pipeline.png" alt="RoadMC physics-based point-cloud synthesis pipeline" width="92%" />
-</p>
-
-生成管线从左到右为路面先验、表面实现、病害形变、LiDAR 观测和场景导出。病害标签在几何形变阶段生成，并随观测重采样传播；受控场景的目标类别按自然 prevalence 采样，仅保证最低存活点数，每次干预都写入审计字段。可观测特征只从最终点云和强度计算。
-
-### 模型训练与评估
-
-<p align="center">
-  <img src="readmeimage/training_pipeline.png" alt="RoadMC point-wise segmentation and evaluation pipeline" width="92%" />
-</p>
-
-训练管线从左到右为场景加载、按数据划分执行的抽样、输入嵌入、骨干编码、通道混合与解码、损失和指标聚合。整体路线为：
-
-```text
-路面形貌 + 病害形变 + LiDAR 观测
-        -> 带标签的场景文件 (.npz)
-        -> 可观测输入特征
-        -> Swin3D / 门控 EMA + 通道混合
-        -> 逐点 logits 与全局评估报告
-```
-
-## 当前状态
-
-| 项目 | 当前状态 |
-| --- | --- |
-| 训练任务 | 二分类：背景 `0` / 病害 `1`。38 类只有标签体系与课程接口，**没有任何多分类性能数字** |
-| 当前结果（30 轮） | ✅ 测试集病害 IoU `0.5483` [0.5126, 0.5820]，固定阈值 0.370，ECE 0.0069 |
-| 对照结果（15 轮） | 测试集病害 IoU `0.4781` [0.4435, 0.5105]，固定阈值 0.320，ECE 0.0028 |
-| 历史基线 | `0.7235` 产自已移除的固定 10% 配额生成器，同时存在强度标签泄漏，**证据效力已失效** |
-| 模型 | `Swin3D + DSCM + Muon/AdamW`，约 7.3M 参数 |
-| 架构对比 | ✅ 5 个主流点云分割架构按同一协议跑满 30 轮（见"架构对比"） |
-| 通道混合消融 | ✅ 4 个变体 × 3 个种子全部完成，变体间平均差小于组内波动，**不作机制性结论** |
-| 生成器真实性选项 | ✅ 粗糙度混合、纹理沿程不均匀、缘石条带、辐射标定四项已入码，全部默认关闭，不改变 v2 行为 |
-| 生成器行为修正 | ✅ 2026-10 修正批已入码：宏观谱 ISO 边际重构、病害伯努利采样、固定 AGC 标定、坑槽/车辙/沉陷/裂缝/水泥病害几何修正等，**改变默认输出**；旧口径全部保留为显式回退 flag（见"生成器行为修正与回退"），新旧行为对比数字**待补正** |
-| 域差距诊断 | v2 联合 MMD `0.136`（41 帧），441 帧扩展复核 `0.1368`；真实性配置的对比数字**待补正**（实现曾丢失，2026-10 已按规格重写并通过功能验收，待真实数据复验后回填） |
-| 真实域性能 | 无真实语义 mIoU。可用的 M2S-RoAD 样本不带标签，只用于域差距诊断 |
-
-## 实验结果
-
-以下结果全部在合成数据、二分类、单种子（除注明外）条件下取得，不外推到真实道路或 38 类任务。
-
-### 基线 v2 与训练长度的影响
-
-数据为 `credibility_v2`（4160 / 855 / 855 场景，每场景 2048 点），自然 prevalence 采样、无标签泄漏、独立三分、阈值只在验证集前缀场景选定后固定：
-
-| 指标 | 15 轮 | 30 轮 |
-| --- | --- | --- |
-| 验证集 IoU | 0.4608 | 0.5219 [0.4811, 0.5604] |
-| **测试集病害 IoU** | **0.4781** [0.4435, 0.5105] | **0.5483** [0.5126, 0.5820] |
-| 固定二分类阈值 | 0.320 | 0.370 |
-| Precision / Recall（前景） | 0.7092 / 0.5947 | 0.8091 / 0.6298 |
-| ECE / Brier / NLL | 0.0028 / 0.1061 / 0.1927 | 0.0069 / 0.0912 / 0.1713 |
-| 背景 IoU | 0.9251 | — |
-| 评估点数 / 病害支持点 | 1,751,040 / 189,075 | 同左 |
-
-两批除训练轮数（以及随之拉伸的余弦周期 `T_max = max_epochs`）外超参一致，可直接比较。30 轮相对 15 轮提升 `+0.070` 绝对（`+14.7%`），说明 15 轮结果在训练结束时仍未收敛。**报告任何 IoU 都必须同时给出训练轮数**，否则两个数字会被当成同一实验。
-
-旧 `0.7235` 因固定患病率与强度标签泄漏双重失效，仅作历史记录，不进入任何对比。
-
-### 架构对比
-
-5 个主流点云分割架构与本文模型在同一份 v2 数据、同一训练与评估协议下各跑 30 轮。检查点按两种规则选择：规则 A 为验证集 `argmax@0.5` IoU 最优，规则 B 为验证集前缀 170 场景的标定 IoU 最优。
-
-| 模型 | 参数量 | 测试 IoU（规则 B，95% CI） | 测试 IoU（规则 A） | 规则 B ECE | 备注 |
-| --- | --- | --- | --- | --- | --- |
-| PointNet | 1.67M | 0.0998 [0.0873, 0.1123] | 0.1118 | 0.2029 | 规则 A 选中的检查点来自第 1 轮（规则 A ECE 0.3164） |
-| PointNet++ | 0.36M | 0.2772 [0.2490, 0.3067] | 0.2695 | 0.0799 | — |
-| DGCNN | 0.32M | 0.3831 [0.3603, 0.4052] | 0.3830 | 0.0218 | — |
-| PointMLP | 4.22M | 0.1805 [0.1644, 0.1963] | 0.1746 | 0.1474 | — |
-| Point Transformer v1 | 1.46M | 0.5291 [0.4910, 0.5661] | 0.5458 | 0.0097 | — |
-| 本文模型（Swin3D + DSCM） | 7.3M | 0.5483 [0.5126, 0.5820] | 0.5483 | 0.0069 | 两种规则选中同一检查点 |
-
-两点结论与一点保留：
-
-- 层级窗口注意力骨干优于纯点式与图卷积网络：PointNet、PointNet++、DGCNN、PointMLP 四者的规则 B 区间上界（最高 0.4052）都低于本文模型区间下界 0.5126。
-- Point Transformer v1 是唯一接近的基线：规则 B 0.5291 [0.4910, 0.5661] 对 0.5483 [0.5126, 0.5820]、规则 A 0.5458 对 0.5483，**区间重叠，现有证据不足以支持"本文模型显著领先"**。
-- 规则 A 与规则 B 在弱模型上会给出不同答案（PointNet 的规则 A 检查点退化到第 1 轮），因此两种规则都报告；只报一种会掩盖检查点选择规则本身的问题。
-
-### 通道混合消融
-
-`--mixing` 的四个取值各跑 3 个种子（20 轮协议，测试集 IoU）：
-
-| 变体 | seed 42 | seed 43 | seed 44 | 均值 ± 标准差 |
-| --- | --- | --- | --- | --- |
-| `none`（关闭混合） | 0.4883 | 0.5040 | 0.5077 | 0.5000 ± 0.0103 |
-| `hc2`（2 流） | 0.5139 | 0.5203 | 0.4959 | 0.5100 ± 0.0126 |
-| `dscm` | 0.4817 | 0.5003 | 0.5214 | 0.5011 ± 0.0199 |
-| `hc4`（4 流） | 0.5040 | 0.5184 | 0.5173 | 0.5132 ± 0.0080 |
-
-四个变体的均值落在 0.5000–0.5132，带宽 0.013，而组内标准差最大 0.0199；seed 42 上 `hc2` 领先 `none` 0.026，在 seed 44 上反转为落后 0.012。**结论是通道混合模块的增益未达显著**，性能主要来自层级窗口注意力骨干。单种子消融在这里会直接给出错误的排序，本项目因此把"多种子"作为机制性结论的门槛。
-
-### 与真实路面的差距
-
-真实数据为 M2S-RoAD 的无标签 PCD 帧（OS1-128）。差距用 6 个只依赖点云本身、合成与真实两侧同法计算的描述子衡量：点密度、归一化强度、法向倾角、PCA 曲率、局部高度残差、按邻域半径归一的高度残差。
-
-| 对比 | 场景数 | 联合 RBF-MMD |
-| --- | --- | --- |
-| v2 合成 vs 真实（修正前） | 855 × 41 | 0.458 |
-| v2 合成 vs 真实（修正后） | 855 × 41 | **0.136** |
-| v2 合成 vs 真实（扩展复核） | 855 × 441 | 0.1368 |
-| 真实性配置数据集 vs 真实 | — | **待补正** |
-
-上表统一使用 `0.15 m` 的主导平面阈值；阈值收紧到 `0.02 m` 时 v2 读数为 `0.1410`。
-
-前三行的差异全部来自诊断方法本身的三类缺陷（法向来源不一致、强度归一化按错误量程、采样窗口不匹配），修正后剩余差距集中在点密度、强度分布和法向倾角，都属于传感器观测层。末行"真实性配置"的对比数字待补正：该实现曾丢失，2026-10 已按下文规格重写并通过功能验收（默认关闭时输出与 v2 逐位一致），与真实侧的对比将在复验后回填。
-
-数据侧发现（影响所有使用 M2S-RoAD 的工作）：部分会话把无回波写成 `range == 0`，且这些点在多数帧里**不落在原点**，因此不会被"剔除原点附近无效回波"的常规过滤捕获，会同时污染 RANSAC 平面拟合与 k 近邻密度估计。本仓库的报数在计算描述子之前先按 `range` 字段剔除这些点；加载器侧的统一过滤尚未合入，因为它会让已有的 41 帧读数整体变化。
-
-### 已作废的 v3 高分辨率记录
-
-下表产自 2026-08 的"5 mm 网格 / 8192 点"路线（有效批次修复后训练稳定），协议与 v2 不同（网格 5 mm 对 2 cm、点数 8192 对 2048、批次 4 对 8），**不可与 `0.4781` 或 `0.5483` 比较**。对应的数据集目录已改名留存为 `credibility_v3_legacy_16384pt`，当前 `credibility_v3` 指向另一套配置，两者无关。
-
-| 变体 | disease IoU | 95% CI | ECE |
-| --- | --- | --- | --- |
-| `none` | 0.2738 | [0.2342, 0.3134] | 0.0624 |
-| `hc2` | 0.2662 | [0.2202, 0.3121] | 0.0639 |
-| `dscm` | 0.2625 | [0.2186, 0.3044] | 0.0628 |
-
-保留的理由是该批次暴露的三个问题仍未解决，且在新配置下重跑前需要一并处理：ECE 0.06 远高于 2048 点批次的 0.005（有效批次差异）、类别权重被 effective-number 公式在超大样本下中和到约 1.0、混合作用在批次对齐后消失。
+标签定义见 [`labels.py`](roadmc/data/synthetic/labels.py)，共 38 类（含背景），不等于所有病害类别都已有完整、经验证的物理生成模型。冻结重放当前仅支持：沥青线裂缝 5–8、坑槽 9–10、松散 11–12、修补 20；水泥板裂缝 23–24、点状坑洞 34、修补 37。它不模拟沥青龟裂/块裂，也不覆盖 taxonomy 中所有病害。新纹理和重放参数仍是工程假设，尚未由达到毫米精度的真实表面数据标定。当前没有可用于真实域标定或独立验收的合格真实样本，因此项目没有可报告的真实域差距或“极小域差距”结论。
 
 ## 安装
 
-项目要求 Python `3.11+`。在项目根目录执行：
+项目要求 Python 3.11 或更高版本。完整项目依赖（包括训练用 PyTorch）见 [`pyproject.toml`](pyproject.toml)。只运行 NumPy/SciPy 合成和表面工具时，可在 Windows PowerShell 中从仓库根创建轻量环境；仓库根目录可直接导入 `roadmc`，不需要安装整个项目：
 
 ```powershell
-pip install -e .
+py -3.11 -m venv .venv
+.venv\Scripts\python.exe -m pip install numpy scipy matplotlib
+$env:PATH = "$PWD\.venv\Scripts;$env:PATH"
+$env:ROADMC_GENERATOR_NO_TORCH = '1'
+.venv\Scripts\python.exe -m roadmc.scripts.generate_synthetic --help
 ```
 
-读取真实点云需要可选依赖：
+`ROADMC_GENERATOR_NO_TORCH=1` 避免生成器导入 PyTorch；它不提供训练能力。完整训练安装可用 `uv sync`（`pyproject.toml` 中的 PyTorch 索引配置由 uv 使用）；若使用 pip，请按目标平台配置 PyTorch wheel 来源，再安装项目依赖。LAS/LAZ 与 PLY 的可选依赖见 `real` extra，Open3D 相关功能见 `pcd` extra。
+
+## 快速开始：生成合成数据
+
+以下 PowerShell 示例在仓库根目录生成少量沥青场景，关闭观测模拟以保持生成简单。网格间距参数以米指定，但通用生成 CLI 默认 `normalize=True`，因此场景 NPZ 中的点坐标默认归一化到单位球，不应直接当作米制坐标。文件包含 `coordinates_normalized` 等元数据以说明变换；用于度量评估前需按记录的变换还原坐标。专项 `capture_surface_geometry` 流程固定 `normalize=False`，其 `SurfaceTile` 与捕获坐标保持米制。场景文件为压缩 NPZ，数据集根目录另有 `metadata.json`。
 
 ```powershell
-pip install -e ".[real]"   # laspy / plyfile，用于 .las/.laz/.ply
-pip install -e ".[pcd]"     # open3d，用于 .pcd
+$env:ROADMC_GENERATOR_NO_TORCH = '1'
+python -m roadmc.scripts.generate_synthetic `
+  --train-count 4 --val-count 2 `
+  --output-dir output/readme-demo/synthetic `
+  --seed 73 --surface-grid-spacing 0.02 `
+  --sensor-output-points 2048 --width 3 --length 4 `
+  --pavement asphalt --observation-model off
 ```
 
-如果使用 `uv`：
+场景 NPZ 包含 `points`、`labels`、`feats`、`normals` 及坐标变换、采样分辨率等字段；具体字段以生成器版本和配置为准。`labels.py` 中的 0 表示背景，1–20 为沥青 taxonomy，21–37 为水泥 taxonomy。taxonomy 编号本身不保证某个场景包含该类，也不代表其合成形态已通过真实数据验证。
+
+## 可选表面流程
+
+以下命令捕获一块纯合成的三层表面，生成 `SurfaceTile`，再以显式设置替换纹理层并运行双材料冻结重放 demo。数值仅用于演示接口，不是实测范围或推荐标定值。所有产物写入 `output/readme-demo/`，不会读取或复制真实纹理 patch。
 
 ```powershell
-uv sync
+$env:ROADMC_GENERATOR_NO_TORCH = '1'
+python -m roadmc.scripts.capture_surface_geometry `
+  --output-dir output/readme-demo/base --label 6 --seed 73 `
+  --width 2 --length 1 --spacing 0.01 --surface-layers
 ```
-
-GPU 训练需要与本机 CUDA 驱动匹配的 PyTorch。当前实验使用 RTX 5060 Laptop GPU、8 GB 显存。`open3d` 只发布到 Python 3.12 的轮子，需要它的脚本不要建在 3.13+ 环境里。
-
-## 点云生成
-
-### 生成模型
-
-RoadMC 将路面场景表示为连续表面与离散观测的组合：
-
-$$
-z(x,y) = z_{\text{rough}}(x,y) + z_{\text{texture}}(x,y) + \Delta z_{\text{damage}}(x,y).
-$$
-
-| 层次 | 含义 | 实现位置 |
-| --- | --- | --- |
-| `z_rough` | 由 ISO 8608 功率谱密度控制的道路粗糙度 | `roadmc/data/synthetic/config.py` |
-| `z_texture` | fBm 微纹理、局部曲率和法向变化 | `roadmc/data/synthetic/generator.py` |
-| `damage` | 裂缝、坑槽、车辙、松散、修补、接缝等 9 类病害形变 | `roadmc/data/synthetic/primitives.py` |
-| 观测层 | 扫描线重采样、距离噪声、角度扰动、辐射强度、按自然 prevalence 的输出采样 | `roadmc/data/synthetic/generator.py` |
-| 标签层 | 逐点 JTG 风格标签，支持二分类和课程迁移 | `roadmc/data/synthetic/labels.py` |
-
-生成过程不是向规则网格添加随机噪声，而是先构造表面与病害，再模拟传感器采样。生成器显式区分三层分辨率：物理表面网格间距（`generate_synthetic.py` 用 `--surface-grid-spacing`，类别预算脚本用 `--grid-res`，v2 取 `0.02 m`）、传感器输出点数（`--num-points`）、下游模型输入点数。毫米级表面网格不会自动保留到最终点云，每场景的三层分辨率与保护采样记录都写入 `resolution_metadata_json`。
-
-边界声明：两类路面**共享同一几何宏观谱与纹理谱，不建模材料纹理分化**——`pavement_type` 只决定病害集合与强度材料先验（基线反照率），水泥拉毛/刻槽纹理、接缝周期谱分量等均为未实现的后续项；基层/路基/垫层相关机理（沉陷-软弱点耦合、反射裂缝、错台-唧泥成因链）同样不在建模范围内。
-
-### 生成数据集
 
 ```powershell
-python roadmc/scripts/generate_synthetic.py `
-  --train-count 2000 `
-  --val-count 500 `
-  --output-dir ./data/synthetic_output `
-  --pavement mixed `
-  --roughness B `
-  --num-points 2048 `
-  --workers 16
+python -m roadmc.scripts.generate_texture_surface `
+  --base output/readme-demo/base/surface_tile.npz `
+  --settings examples/realism/asphalt-texture-settings.json `
+  --seed 73 --output output/readme-demo/asphalt-texture/surface_tile.npz
+
+python -m roadmc.scripts.generate_texture_surface `
+  --base output/readme-demo/base/surface_tile.npz `
+  --settings examples/realism/concrete-texture-settings.json `
+  --seed 73 --output output/readme-demo/concrete-texture/surface_tile.npz
+
+python -m roadmc.scripts.replay_surface `
+  --base output/readme-demo/asphalt-texture/surface_tile.npz `
+  --plan examples/realism/asphalt-plan.json `
+  --output output/readme-demo/replay/asphalt/replay.npz
+
+python -m roadmc.scripts.replay_surface `
+  --base output/readme-demo/concrete-texture/surface_tile.npz `
+  --plan examples/realism/concrete-plan.json `
+  --output output/readme-demo/replay/concrete/replay.npz
 ```
 
-默认表面网格下每 worker 峰值内存约数百 MiB；脚本启动前打印三层分辨率与并行内存估算，超出 `--max-parallel-memory-mib` 预算会在生成前报错。
+两个计划和两份纹理设置样例位于 [`examples/realism/`](examples/realism/)，计划使用各自合法的材料标签。沥青与水泥的纹理设置目前只改变 provenance 中的 `material_id`；其数值相同，不代表已建模或测得两种材料的外观差异。两个流程复用同一设计面和粗糙度层，是为了隔离受控变量的共基底假设。计划需显式声明材料、道路 ID、事件、seed、参数、标签、来源与假设；每个事件都必须包含 `label`，未知标签写成 `null`，输出值为 `-1`，不会当作背景。基底未知标签也保持 `-1`。计划参数和暴露纹理均为未标定假设。
 
-### 观测模型体制与条带几何
+每个 replay NPZ 保存 `points`、`labels`、`normals`、`coordinates_normalized=False`、`metadata`、`plan_hash`、计划 JSON、米制最终高度、材料权重/纹理、事件 footprint 和基底分层；当前冻结重放不输出强度通道。快速生成器的数据集布局为 `train/scene_*.npz`、`val/scene_*.npz` 和根目录 `metadata.json`；表面例子布局为 `base/`、`asphalt-texture/`、`concrete-texture/`、`replay/<material>/`。
 
-`generate_synthetic.py` 提供三个控制生成体制的选项：
+这个快速 demo 使用 10 mm 网格，而沥青裂缝事件宽度为 8 mm；该采样不能解析毫米级裂缝形态，也不构成毫米真值或精度验证。
 
-| 选项 | 默认 | 作用 |
-| --- | --- | --- |
-| `--width` | `7.0` | 路面横向宽度（米）。硬下限 `1.0 m`：病害中心在 `[0.5, width-0.5]` 上抽样，更窄会在入口直接报错。`width ≤ 3.5` 且路拱形状为默认的 `crowned` 时给警告（中央路拱是 7 m 双车道口径，窄路通常应取单向坡）；`width < 2.4`（轮迹带横向占位 `wheel_separation + rut_width`）时警告车辙沟槽会溢出路缘 |
-| `--length` | `5.0` | 路面里程向长度（米） |
-| `--observation-model` | `off` | 观测模型体制开关，取值 `on` / `off` |
-
-观测模型体制的语义：
-
-- `off`（CLI 默认）：**直接输出全部表面点**。跳过扫描线重采样、曲率、几何遮挡、LiDAR 噪声、最近邻标签传递与输出采样；路面谱合成、全部病害、松散及 NaN 过滤（表面几何属性，不是观测效应）、强度、归一化、特征全部保留。`--num-points` / `--target-density` 被忽略，但请求值连同 `ignored_under_observation_off` 标记、跳过的步骤列表（`pipeline_steps_skipped`）、遮挡策略（`occlusion_policy`）与观测模式一起写入场景的 `resolution_metadata_json`；`.npz` 顶层同时新增 `observation_model`、`segment_count`、`segment_length_m`、`segment_overlap_m` 四个标量。若同时开启 LiDAR 扫描开关，脚本发警告并跳过扫描（元数据记录 override），不报硬错。
-- `on`：完整传感器观测管线，几何/标签/特征输出与本选项引入之前逐位一致；仅元数据按 v2 分辨率契约（`roadmc-resolution-v2`）新增记录字段，v1 字段全部保留。注意 `GeneratorConfig.observation_model` 的**库内默认是 `"on"`，只有 CLI 默认 `"off"`**——训练侧冒烟配置与生成器自检依赖库内默认行为，不得无声改变。
-
-条带几何以 `(W × L)` 计入每场景点数：CLI 启动时按 `表面={spacing}mm ({W}m×{L}m, {N} 点)` 打印分辨率契约并追加观测模式，同时给出每场景落盘数组体量估算（大规模 `--train-count` 前先确认磁盘预算）。
-
-**条带分段**：当整条带总点数超过 per-worker 预算（`--max-surface-points` 或 `--max-surface-memory-mib` 换算的点数）时，生成前的预算校验改按分段计划执行——自动推导段长、段间重叠与段数（确定性推导，全部写入 `surface_grid.segmentation` 元数据，可用 `GeneratorConfig.strip` 的显式字段覆盖），重叠带开销占比过高的不可行计划（如 1 mm 网格在默认预算下）会在入口报错并提示提高预算。行预算是把点预算按每行点占位整除：路缘石开启时按 `nx + 2·nx_curb`（而非设计稿仅 `nx`）整除——设计稿的 `nx` 公式在 curb 下会使 `segment_point_count_ext ≤ max_surface_points` 恒不可满足；该改动方向保守（更早分段、段更小）。此前会被 `max_surface_points` 直接拒绝的大条带现在自动分段生成。分段运行时（observation_model='off'）已接入：宏观长波整条带全局一次合成（接缝精确连续）、短波纹理逐段 FFT + 段间 root-raised-cosine 混合、病害计划/施加云无关化（缝两侧逐位一致）、强度整条带 p99 AGC 两遍扫、特征按段+halo 分块重算；坐标契约（归一化、可逆变换、米制边界）与单块路径同语义。上述接缝验收准则为：缝区相邻 bin 剖面阶跃不高于远离缝处的自然波动，且纹理带阶跃低于 0.5 mm 设计容差；跨段病害施加逐位一致。观测管线（扫描重采样、遮挡、噪声、最近邻传递、输出采样）尚未分段化，因此 `--observation-model on` 与分段计划组合会在入口硬报错（库内构造同样拒绝）——分段体制的主 regime 是默认的 `off`。新体制数据集与既有各版本数据集的对比数字：待补正。
-
-### 受控类别预算
-
-正式实验应同时约束每类的强制场景数和有效病害点数，而不能只看场景总数：
+line-profiler 是可选观测层：仅支持规则且横纵间距相等的单块网格。小型配置样例在 [`examples/realism/line-profiler-config.json`](examples/realism/line-profiler-config.json)，调用时显式指定 seed 和配置：
 
 ```powershell
-python roadmc/scripts/generate_class_budget.py `
-  --output-dir ./data/credibility_v2 `
-  --split both `
-  --target-scenes-per-class 112 `
-  --min-points-per-class 4000 `
-  --num-points 2048 `
-  --workers 16 `
-  --pavement mixed `
-  --roughness B
+python -m roadmc.scripts.replay_surface `
+  --base output/readme-demo/asphalt-texture/surface_tile.npz `
+  --plan examples/realism/asphalt-plan.json `
+  --output output/readme-demo/replay/asphalt/line-profiler.npz `
+  --observation line-profiler --observation-seed 11 `
+  --observation-config examples/realism/line-profiler-config.json
 ```
 
-类别预算脚本可断点续跑，只有在类别配额、点数配额和特征校验都满足后才报告完成。三个与统计效度相关的行为：
+当前没有分段采样及跨段 profile 去重实现。`off` 模式保留米制网格坐标，不限制横纵间距相等。
 
-- 受控场景不固定目标类别点数比例；每场景最低存活点数由 `ceil(min-points / target-scenes)` 推导，可用 `--target-label-min-output-points` 覆盖，每次保护干预写入场景审计字段。
-- 拒绝向缺少分辨率记录（旧配额时代）场景的目录续跑，防止两种采样体制混入同一数据集；`--ignore-legacy-scenes` 可显式排除旧场景。**注意续跑只核对配额、不核对生成配置**：同一目录下若已存在另一套配置产出的场景，配额会被判为满足。跨配置重建时应换输出目录，或先确认旧目录已改名。
-- 多 worker 生成前执行聚合内存预算校验。
+## 固定真实域评估
 
-脚本同样接 `--width` / `--length` / `--observation-model`（默认 7.0 / 5.0 / `off`），体制语义与 `generate_synthetic.py` 完全一致：`off` 时直接输出全部表面点（`--num-points` 被忽略并记入元数据），条带超出 per-worker 预算时自动按分段计划生成；`on` 时恢复完整观测管线，与分段计划组合会在入口硬报错。`.npz` 顶层标量键与 `generate_synthetic.py` 保持一致。
+评估入口为 `roadmc.scripts.diagnose_domain_protocol`。协议先按 `road_segment_id` 划分道路，再仅用真实 calibration 样本拟合并保存标准化和核带宽，最后用冻结协议评估候选合成数据与独立真实道路。评估样本清单是 JSON 对象，顶层包含 `samples` 数组；每项提供文件 `path`、`domain`、`role`、`road_segment_id` 和 `material_id`。真实输入还必须有可核验的坐标单位、质量、采样间距、测量精度和来源等元数据。不得将同一路段拆到不同组。
 
-### 贴近真实路面的配置项
-
-下面四组选项用于缩小合成侧与真实侧的观测差距，全部默认关闭；关闭时几何与强度采样与 v2 相同（新增的 `roughness_class` 等记录字段除外，它总是写入）：
-
-| 选项 | CLI | 作用 |
-| --- | --- | --- |
-| 粗糙度混合 | `--roughness-mix "D:0.5,E:0.5"` | 每场景按权重抽样 ISO 8608 等级，并把实际等级写入场景字段 `roughness_class`，避免整批数据只用一个等级 |
-| 纹理沿程不均匀 | `--texture-het-sigma 0.6 --texture-het-corr 2.0` | 对已按 Parseval 定标的短波分量做对数正态幅值调制（先做高低通分解，不改变总方差），使纹理强弱沿里程起伏 |
-| 缘石条带 | `--curb-width 0.30 --curb-height 0.13` | 在行车道外加一条抬高带，让非路面点进入密度与法向统计 |
-| 辐射标定 | `--albedo-sigma-ln 0.9 --speckle-m 6.0` | 强度改为 `反照率场 × 入射角 × 1/R²` 后做对数正态与 Gamma 标定，强度分布不再整体偏亮 |
-
-一条开启全部四项真实性选项的完整重建命令：
+对上面的合成输出，可先做候选输入覆盖诊断。这里的诊断只检查合成输入与可用描述量，不拟合真实基准，也不做验收：
 
 ```powershell
-python roadmc/scripts/generate_class_budget.py `
-  --output-dir ./data/credibility_v3 `
-  --split all --labels all `
-  --target-scenes-per-class 112 --min-points-per-class 4000 `
-  --val-ratio 0.2 --test-ratio 0.2 --wave-size 4 `
-  --grid-res 0.02 --num-points 4096 --pavement mixed `
-  --roughness D --roughness-mix "D:0.5,E:0.5" `
-  --texture-rms 0.0008 --texture-het-sigma 0.6 --texture-het-corr 2.0 `
-  --curb-width 0.30 --curb-height 0.13 `
-  --albedo-sigma-ln 0.9 --speckle-m 6.0 `
-  --max-diseases 2 `
-  --workers 16 --seed 42
+python -m roadmc.scripts.diagnose_domain_protocol inspect `
+  --manifest examples/realism/synthetic-candidate-manifest.json `
+  --output output/readme-demo/candidate-diagnostics.json
 ```
 
-这套配置对联合 MMD 的影响**待补正**：将用真实数据按上表同一规则复验后回填。
+该清单中的路径相对于清单文件解析，指向上面生成的沥青重放 NPZ。它不包含真实质量核验信息，也不能用于真实标定。
 
-### 生成器行为修正与回退（2026-10）
-
-2026-10 的一批审计修正**改变了若干默认生成行为**。新默认口径：
-
-- 宏观谱：ISO 带按 ISO 一维边际谱逐行重构权重，消除离散边际与 ISO 定义之间的系统性方差偏差，并取消实现级 std 重定标；
-- 病害选择：`disease_probs` 恢复文档声明的『出现概率』语义——逐病害独立伯努利抽样后按 `--max-diseases` 封顶，期望每场景病害数 ≈ Σp，**允许出现 0 病害的背景场景**（旧口径把概率归一化为权重、每场景恒定抽满，出现率远高于名义值）；
-- 强度 AGC：从逐场景 p99 归一改为固定绝对标定（`radiometric.agc_reference_power`，工程标定值）——沥青/水泥的材料基底签名在强度通道保留，不再随场景构成漂移；
-- 坑槽：轻/重两级共用 β~U(2,5)（仅凭剖面形状不再可 100% 判定轻/重，消除几何域标签泄漏），半径与深度加有界纵横比先验，微坑强度随破损面积增长，剥落标注不超出主凹陷足迹；
-- 沉陷：中心内缩量不小于当次采样半径（完整碗形恒在路面足迹内），标签盘半径显式化为影响半径 R；
-- 车辙：名义深度按 1/(1+ε) 归一（实现峰值不再越过 JTG 10/15mm 分界），中心走轮迹带先验（与裂缝/坑槽一致）；
-- 裂缝：走向扰动去周期化，缝宽判据侧截断改拒绝重采，面状裂缝槽形与线状裂缝的边缘连续原则对齐，并补 measure-then-label 标签机制；
-- 水泥病害：板裂缝限制在单一板块内、错台阶跃限于接缝两侧相邻两块板、边角剥落深度截断到档位上限、破碎板 Voronoi 脊线刻槽按板裁剪并取最大深度；
-- 泛油：从恒定 40% 面积、贯穿全路长的硬边界条带改为轮迹带上的随机斑块（面积占比 U(5%,25%)，logistic 平滑边界）；
-- 朗伯项：cosθ 不再取绝对值（背向面强度趋 0），反照率截断上限 0.95 → 0.98。
-
-每一项都保留显式回退通道（旧口径仅作回归对照保留，不是推荐配置）。两个生成脚本接受同一组 flag：
-
-| 回退 flag | 恢复的旧行为 |
-| --- | --- |
-| `--macro-spectrum legacy` | 历史点采样谱权重 + std 重定标 |
-| `--disease-sampling legacy` | 概率归一化加权恒定计数（`--no-stratified` 保留为其 bernoulli 旧别名，已弃用） |
-| `--pothole-beta-legacy` / `--pothole-micropits-legacy` / `--pothole-aspect-legacy` | 坑槽 β 字面量分级 / 钳制微坑计数 / 取消纵横比先验 |
-| `--pothole-spall-band 0.8 1.2` | 坑缘剥落环外扩到 1.2R |
-| `--agc-mode scene-p99` | 逐场景 p99 AGC |
-| `--rutting-modulation-legacy` / `--rutting-center-legacy` | 取消深度归一 / 车辙中心恒在中线 |
-| `--crack-perturb-legacy` / `--crack-width-trunc clip` / `--areacrack-lambda-legacy` / `--areacrack-label-legacy` | 裂缝走向周期化环绕 / 缝宽钳制 / λ=w/2 槽形 / 面状标签直接采信 severity |
-| `--concrete-legacy` | 水泥四项旧行为（板缝跨板、错台全条带、剥落无界指数、脊线逐条累加） |
-| `--depression-center-legacy` / `--depression-label-legacy` | 沉陷固定内缩 0.5 m / depth·1% 隐式标签外扩 |
-| `--bleeding-geometry-legacy` | 泛油恒定 40% 面积条带 |
-| `--lambert-abs-legacy` / `--albedo-clip-hi 0.95` | cosθ 取绝对值 / 反照率上限 0.95 |
-| `--micro-texture-grid-legacy` / `--het-field-1d` | 纹理谱频率网格历史口径 / het 一维调制场 |
-
-同一命令把全部口径恢复到 2026-10 之前（供回归门使用）：
+真实数据准备好并通过准入检查后，按以下顺序创建道路级划分、拟合冻结协议、评估清单。`real-manifest.json`、生成的 `split.json` 和 `evaluation-manifest.json` 均须列出真实文件及正确角色；不能用合成样本冒充真实 calibration、validation 或 holdout。道路划分需要至少 25 条独立真实道路，才能为 calibration、real validation、real holdout 各提供至少 5 条道路。
 
 ```powershell
-python roadmc/scripts/generate_synthetic.py `
-  --macro-spectrum legacy --disease-sampling legacy `
-  --pothole-beta-legacy --pothole-micropits-legacy --pothole-aspect-legacy `
-  --pothole-spall-band 0.8 1.2 --agc-mode scene-p99 `
-  --rutting-modulation-legacy --rutting-center-legacy `
-  --crack-perturb-legacy --crack-width-trunc clip `
-  --areacrack-lambda-legacy --areacrack-label-legacy --concrete-legacy `
-  --depression-center-legacy --depression-label-legacy `
-  --bleeding-geometry-legacy --lambert-abs-legacy --albedo-clip-hi 0.95 `
-  --micro-texture-grid-legacy
+python -m roadmc.scripts.diagnose_domain_protocol split `
+  --manifest real-manifest.json --output split.json
+python -m roadmc.scripts.diagnose_domain_protocol calibrate `
+  --manifest split.json --output-protocol fixed-protocol.json
+python -m roadmc.scripts.diagnose_domain_protocol evaluate `
+  --manifest evaluation-manifest.json --protocol fixed-protocol.json `
+  --output evaluation-report.json
 ```
 
-配置 schema 同步变更（构造时传旧关键字会报 `TypeError`）：`PotholeConfig` 删除 `max_radius_light` / `edge_spall_prob`；`DepressionConfig.max_radius` 改为 `radius_range=(0.5, 2.0)`；`RavelingConfig.pitting_depth` 改为 `erosion_depth=(0.002, 0.005)`；`BleedingConfig.intensity_boost`（实测对输出零影响的死参数）改为 `intensity_multiplier=0.55`；`MicroTextureConfig.octaves` 删除（谱合成路径早已不使用）；`CrackConfig.severity_ratio` 改为 `None`（= 使用 `disease.severity_ratio`）并接线为裂缝专属覆盖。这些字段此前从未被读取或从未被正确读取（名实不符），详见 config.py 内注释。
-
-合入顺序说明：上述口径中的一部分由 `primitives.py` 侧消费（谱重构、坑槽/裂缝/水泥几何、沉陷标签半径、纹理网格口径、het 场维度）。生成器的装配层按两类通道下发：签名级新增 kwargs（如 `macro_spectrum_mode`）按基元当前签名转发或剔除；`params` 字典内的键始终随字典下发，但装配层会检查基元源码是否已读取该键。基元侧批次尚未合入时，"请求行为 ≠ 基元当前行为"的键每键发一次警告，并写入场景元数据 `pending_primitive_upgrades`（该元数据按场景准确记录，只含本场景实际遇到的键）；请求行为 = 基元当前行为（即全部回退 flag 的 legacy 等价值）的键静默——因此 full-legacy 回退运行的待合入集合为空，与新默认运行在回归门上可区分，不会无声地宣称已切换。基元侧合入后同一装配代码自动生效，待合入集合随之变空。
-
-新默认口径与旧口径数据集（含与真实侧）的对比数字：**待补正**。
+当前没有满足准入要求的真实扫描，因此上述标定与真实评估命令在现有数据上不会产生有效真实域结论；工具应报告 `not_calibrated` 或 `not_evaluated`，缺少证据的量不会按零差距处理。固定协议按道路分组，避免同一路段同时进入标定和独立验收；数据需先核实单位、采样间距、测量精度、质量与来源。README 给出的阈值仅说明工具当前需要的最低道路数，不是数据质量达标的替代证明。
 
 ## 模型训练
 
-### 可观测输入特征
-
-模型只接收推理时能够从点云本身计算的量：
-
-```text
-roadmc.observable_features.v1
-[normalized_intensity, pca_curvature, signed_local_height_residual]
-```
-
-- `normalized_intensity`：归一化 LiDAR 强度。
-- `pca_curvature`：局部协方差矩阵最小特征值与迹之比，即 `lambda_min / trace(C)`。
-- `signed_local_height_residual`：点到局部 PCA 切平面的有符号正交残差，按邻域支持半径归一化。
-
-同一条约定同时用于合成点云、旧 `.npz` 文件与真实点云加载器，并由 `require_observable_checkpoint_schema` 在加载检查点时校验。标签不参与特征计算，已移除旧的 `crack_boundary_dist` 标签派生通道。任何对点云重采样或子集化的代码路径，都必须在交给模型的那一份点云上重算特征，因为邻域集合已经改变。
-
-### 网络与损失
-
-| 模块 | 选择 | 作用 |
-| --- | --- | --- |
-| Backbone | `swin3d` | 窗口化点云 Transformer，多阶段特征提取 |
-| Backbone | `pointmamba` | 门控 EMA 点序列混合（PointMamba-inspired），显存更友好 |
-| 通道混合 | `--mixing {none,dscm,hc2,hc4}` | DSCM 为双随机通道混合（Sinkhorn，旧名 mHC）；`hc2`/`hc4` 是 2 流与 4 流残差混合消融臂。`--use_mhc` / `--no_mhc` 作为旧别名保留 |
-| Head | per-point classifier | 输出每个点的类别 logits |
-| Loss | Focal + Dice + supervised BEV Edge | 处理类别不平衡并增强边界监督 |
-| Optimizer | hybrid Muon + AdamW | 矩阵参数使用 Muon，一维参数使用 AdamW |
-
-验证和测试采用确定性均匀抽样，只有训练集使用病害分层抽样，避免通过改变验证集病害比例人为抬高 mIoU 或校准指标。
-
-### 二分类训练
-
-8 GB 显存上的参考配置：
+训练与合成数据生成是独立流程。训练需要已安装的 PyTorch 及训练依赖；`label_stage` 提供 `binary`、`four`、`eight`、`full38` 训练映射，但这些设置不能证明所有标签都有完整物理生成覆盖。下面是一个短的合成数据 smoke run，不是模型质量评估：
 
 ```powershell
 python roadmc/train.py baseline `
-  --data_dir ./data/credibility_v2 `
-  --label_stage binary `
-  --backbone swin3d `
-  --optimizer muon `
-  --batch_size 4 `
-  --max_points 2048 `
-  --embed_dim 48 `
-  --depths 1 1 2 1 `
-  --num_heads 3 3 6 6 `
-  --window_size 32 `
-  --max_epochs 5 `
-  --num_workers 4 `
-  --precision 16-mixed `
-  --auto_class_weights `
-  --metric_min_support 500
+  --data_dir output/readme-demo/synthetic `
+  --label_stage binary --max_epochs 1 --batch_size 2 `
+  --max_points 2048 --num_workers 0
 ```
 
-两处容易踩的默认值：
+训练参数、骨干网络、优化器、checkpoint 与运行目录选项见 `python roadmc/train.py --help`。小样本 smoke run 不能用来报告泛化性能；正式实验应使用足够数据、固定数据划分、记录配置与随机种子，并在独立数据上评估。
 
-- Muon 的默认学习率是 `1e-2`，AdamW 是 `1e-3`。**跑本文模型必须显式写 `--lr 1e-3`**，否则训练损失会发散为 NaN。
-- 默认 `--embed_dim 96` 对应约 26.9M 参数，上表的 7.3M 模型需要显式 `--embed_dim 48`。
-- 每场景 4096 点时批次 8 会在 8 GB 上溢出；与 `8 × 2048` 等 token 量的写法是 `--batch_size 4 --gradient_checkpointing`，并设 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
+## 目录与验证
 
-如果环境不提供 Muon，改用 `--optimizer adamw`。
+- `roadmc/`：生成器、数据读取、模型、训练与实验脚本。
+- `examples/realism/`：可复用的显式 JSON 计划、纹理设置、观测配置和候选清单。
+- `output/`：本地命令生成的实验产物；通常不纳入版本控制。
 
-### 课程迁移到 38 类
-
-课程标签空间为：
-
-```text
-binary -> four -> eight -> full38
-```
-
-每个阶段复用骨干和通道混合权重，重新初始化任务分类头：
+检查脚本语法和代码风格可在仓库根目录运行：
 
 ```powershell
-python roadmc/train.py baseline `
-  --data_dir ./data/credibility_v2 `
-  --label_stage four `
-  --pretrained_checkpoint ./path/to/binary.ckpt `
-  --backbone swin3d `
-  --optimizer muon `
-  --batch_size 4 `
-  --max_points 2048 `
-  --max_epochs 20 `
-  --num_workers 4 `
-  --precision 16-mixed
+python -m py_compile roadmc/scripts/generate_synthetic.py roadmc/scripts/capture_surface_geometry.py roadmc/scripts/generate_texture_surface.py roadmc/scripts/replay_surface.py roadmc/scripts/diagnose_domain_protocol.py
+python -m ruff check roadmc
 ```
 
-二分类结果不能推断 38 类性能；每个多分类阶段独立报告每类支持度、per-class IoU、macro mIoU 和混淆矩阵。**本仓库尚未发布任何 38 类数字。**
+重放与评估工具仅支持受控程序化实验与一致性检查，不提供实路自然性、病害全类覆盖、传感器校准或真实域性能证据。重放是规则网格样板，不支持完整裂缝拓扑、不规则坑缘、多层坑壁或分段设备观测。
 
-## 评估与证据
+## 许可证
 
-评估脚本支持全局混淆矩阵、阈值扫描、ECE、Brier、NLL 和 scene-block bootstrap：
-
-```powershell
-python roadmc/evaluate.py `
-  --checkpoint ./path/to/binary.ckpt `
-  --data-dir ./data/credibility_v2 `
-  --label-stage binary `
-  --max-points 2048 `
-  --scan-binary-thresholds `
-  --threshold-calibration-scenes 170 `
-  --bootstrap-samples 1000 `
-  --output-json ./output/evaluation.json
-```
-
-报告一个数字时必须同时说明三件事：
-
-1. **检查点规则**。规则 A 用验证集 `argmax@0.5` 的 IoU 选点，规则 B 用验证集前缀 170 场景的标定 IoU 选点。规则 A 隐含"病害概率会跨过 0.5"的前提，弱模型上会退化到选中第一轮检查点。
-2. **阈值来源**。阈值只在验证集前缀场景上扫描选定，之后固定，测试集单次评估。
-3. **训练轮数**。见上一节，15 轮与 30 轮的差是 0.070。
-
-**历史基线（已被取代）**：2026-07 之前的二分类证据——独立测试集病害 IoU `0.7235`、Precision/Recall `0.8874 / 0.7966`、ECE `0.0020`、bootstrap 95% CI `[0.7070, 0.7391]`——产自旧生成器。该版本对每个受控场景强制保留约 `10%` 的目标类别点数，验证集病害比例人为固定，IoU、校准指标和阈值选择都受影响；同时强度通道存在标签泄漏。此配额已移除，改为自然 prevalence 采样加最低存活审计。上述数字保留仅作历史记录，不再作为当前性能声明。基线 v2 已在自然 prevalence 数据与独立测试划分上重建：`0.4781`（15 轮）与 `0.5483`（30 轮），低于旧 `0.7235` 属预期内的纠偏而非退步。
-
-## 真实点云与域差距诊断
-
-真实点云加载器支持 `.npy`、`.ply`、`.pcd`、`.las`、`.laz`，使用与合成侧相同的可观测特征约定。带传感器、坐标单位、强度量程、路段和来源信息的 JSON sidecar 用于记录元数据；`--require-real-metadata` 会在缺少元数据时直接报错，而不是按猜测的强度量程归一化。
-
-```powershell
-python roadmc/scripts/diagnose_domain_gap.py `
-  --source-dir ./data/credibility_v2 `
-  --source-kind synthetic `
-  --source-split val `
-  --target-dir ./data/real/m2s_road_sample `
-  --target-kind real `
-  --target-pattern "*.pcd" `
-  --target-ground-plane `
-  --source-ground-plane `
-  --normal-source pca `
-  --skip-non-ground-frames `
-  --max-points-per-scene 4096 `
-  --k-neighbors 16 `
-  --max-scenes 64 `
-  --output-json ./output/domain_gap.json
-```
-
-参数中有四个决定了结论是否可比，改动其中任何一个都会让历史读数失效：
-
-- `--normal-source`：合成侧与真实侧必须用同一方式求法向。默认 `pca` 表示两侧都由 k 近邻协方差估计；混合两侧来源（例如合成用解析法向、真实用 PCA）会把法向倾角差距放大到不可解释的量级。
-- `--source-ground-plane` / `--target-ground-plane` 与 `--ground-distance-threshold`：主导平面剔除的范围决定统计对象是"路面"还是"路面加路侧地物"，两侧必须用同一阈值。
-- `--skip-non-ground-frames`：剔除主导平面不是地面的帧，否则整帧几何统计来自路侧物体。
-- `--max-points-per-scene` 与 `--k-neighbors`：密度与曲率都是近邻尺度的函数，两侧点数不同则同一描述子含义不同。
-
-诊断脚本输出 6 个描述子的两侧分布、Wasserstein-1 距离、能量距离与 RBF-MMD，以及逐帧合并后的联合 MMD。历史诊断结论是：局部几何残差的差异已经较小，剩余差距在点密度、强度分布和法向倾角，全部属于传感器观测层，因此优先级是校准扫描密度与强度物理模型，而不是引入 GAN 或无监督域适配。
-
-## 数据格式
-
-每个场景保存为压缩 `.npz`：
-
-| 字段 | 形状 | 说明 |
-| --- | --- | --- |
-| `points` | `(N, 3)` | XYZ 坐标（归一化后，可由中心/尺度逆变换回米制） |
-| `labels` | `(N,)` | 38 类标签；课程阶段运行时映射 |
-| `feats` | `(N, 3)` | 可观测特征的三个通道 |
-| `normals` | `(N, 3)` | 局部表面法向 |
-| `pavement_type` | scalar | `asphalt`、`concrete` 或 `mixed` |
-| `roughness_class` | scalar | 该场景实际抽到的 ISO 8608 等级（开启粗糙度混合时逐场景不同） |
-| `target_label` | scalar | 受控场景强制注入的类别，非受控为 `-1` |
-| `feature_schema` | scalar | 必须为 `roadmc.observable_features.v1` |
-| `coordinate_center` / `coordinate_scale` | `(3,)` / scalar | 可逆坐标归一化参数 |
-| `resolution_metadata_json` | scalar | JSON，含三层分辨率、保护采样审计和强度模型描述串（`sensor_output.intensity_model`）；v2 另含观测模型体制（`sensor_output.observation_model`、跳过步骤、遮挡策略）与条带分段计划（`surface_grid.segmentation`） |
-| `surface_grid_spacing_m` 等 | scalar | 表面网格间距/形状/点数、传感器输出点数、模型目标点数 |
-| `observation_model` / `segment_count` / `segment_length_m` / `segment_overlap_m` | scalar | 观测模型体制与条带分段计划（单块路径为 1 段全长、零重叠） |
-
-## 38 类标签
-
-`0` 为背景；`1-20` 为沥青路面病害；`21-37` 为水泥混凝土路面病害。病害形变基元为 9 类，映射到 38 类标签空间后由课程接口按阶段合并。
-
-| ID | 类别 | ID | 类别 |
-| --- | --- | --- | --- |
-| 0 | 背景 | 1-8 | 裂缝类及严重程度 |
-| 9-10 | 坑槽 | 11-12 | 松散 |
-| 13-14 | 沉陷 | 15-16 | 车辙 |
-| 17-18 | 波浪拥包 | 19 | 泛油 |
-| 20 | 沥青修补 | 21-22 | 水泥板破碎 |
-| 23-24 | 水泥裂缝 | 25-26 | 板角断裂 |
-| 27-28 | 错台 | 29 | 唧泥 |
-| 30-31 | 边角剥落 | 32-33 | 接缝损坏 |
-| 34 | 坑洞 | 35 | 拱起 |
-| 36 | 露骨 | 37 | 水泥修补 |
-
-> 注：标签 17-18（波浪拥包）的轻/重分级口径（单侧波高 vs 峰谷差）需人工核对 JTG 5210-2018 原文，当前实现按单侧波高。
-
-## 仓库结构
-
-```text
-roadmc/
-  data/
-    class_balance.py       # 有效类别权重
-    curriculum.py          # binary -> four -> eight -> full38
-    dataloader.py
-    features.py            # 可观测特征定义与校验
-    patches.py             # 米制坐标局部 patch 切分（尚未接入训练）
-    real/                  # 真实点云加载与元数据
-    synthetic/             # 粗糙度、病害基元、标签和生成器
-  models/
-    attention/             # window attention
-    backbone/              # Swin3D / 门控 EMA mixer
-    gan/                   # 实验性生成器和判别器（当前冻结）
-    mhc/                   # DSCM 通道混合与谱分析
-    model_pl.py
-  scripts/                 # 生成与域差距诊断
-  domain_gap.py            # 描述子与距离（合成/真实两侧同法计算）
-  metrics.py
-  train.py
-  evaluate.py
-readmeimage/
-  synthesis_pipeline.png   # 生成端管线
-  training_pipeline.png    # 训练与评测管线
-.github/
-  workflows/ci.yml         # GitHub Actions：ruff lint
-```
-
-## 已完成与路线图
-
-### 已完成
-
-- 移除标签派生输入，统一合成、旧数据和真实点云的可观测特征定义。
-- 修复验证/测试抽样偏置，加入确定性评估、阈值校准和 bootstrap 置信区间。
-- 移除受控场景的固定 10% 目标类别配额，改为自然 prevalence 采样加最低存活保护，保护行为逐场景写入审计字段。
-- 建立三层分辨率定义（表面网格 / 传感器输出 / 模型输入）与生成前内存预算校验，生成脚本拒绝混合采样体制或混合分辨率续跑。
-- 完成米制坐标 patch 切分模块（尚未接入训练）。
-- 在 8 GB 显存上完成带通道混合的二分类 GPU 验证及 4/8/38 类迁移 smoke test。
-- 完成可信二分类基线 v2：15 轮 `0.4781` [0.4435, 0.5105]，同协议 30 轮 `0.5483` [0.5126, 0.5820]。
-- 实现 n 流残差混合消融臂（`--mixing {none,dscm,hc2,hc4}`），并完成 4 变体 × 3 种子，据此把通道混合的增益判定为不显著。
-- 完成 5 个主流点云分割架构的同协议 30 轮对比，并明确检查点两种选择规则在弱模型上的分歧。
-- 修正域差距诊断中三类导致读数不可比的缺陷（法向来源、强度量程、采样窗口），联合 MMD 由 0.458 降到 0.136，并在 441 帧的扩展子集上复现。
-- 在生成器上恢复四项真实性配置（粗糙度混合、纹理沿程不均匀、缘石条带、辐射标定），默认关闭、关闭时输出与 v2 逐位一致；与真实侧的对比数字待补正。
-- 定位并规避 M2S-RoAD 的 `range == 0` 无效回波编码问题。
-- 落地 2026-10 生成器行为修正批（宏观谱 ISO 边际重构、病害伯努利采样、固定 AGC 标定、坑槽/车辙/沉陷/裂缝/水泥病害几何修正、死配置清理），全部旧口径保留为显式回退 flag；新旧行为的对比数字待补正。恢复纹理 MPD 物理回归测试（`tests/test_texture_metrics.py`，固定种子断言 MPD ∈ [0.35, 0.55] mm）。
-
-### 路线图
-
-1. 在新真实性配置的数据集上跑完架构对比与本文模型的完整测试，再决定这套配置是否进入正式协议。当前该批次尚无任何性能数字。
-2. 修复类别权重在大数据量下被中和的问题（β 调整或逆频率截断），并让混合消融在批次对齐后重测。
-3. 接入 patch 管线，执行 `4096 / 8192 / 16384` 输入密度对比，bootstrap 按源场景聚合而不是按 patch。
-4. 继续收敛传感器层：点密度（115 对 156 点/m²）以及匹配取样窗口下偏大的曲率与高度残差。
-5. 把加载器侧的 `range == 0` 过滤正式合入，并重跑全部域差距读数。
-6. 获取带可靠标签、坐标单位和 JTG 映射的真实道路点云，之后再评估域随机化或域适配。
-
-## 引用口径
-
-- 二分类当前可引用的结果：30 轮 `0.5483` [0.5126, 0.5820]，或注明轮数的 15 轮 `0.4781` [0.4435, 0.5105]。
-- `0.7235` 不得作为当前结果引用。
-- 5 个架构的对比中，本文模型与 Point Transformer v1 的置信区间重叠，不得写成显著领先。
-- 通道混合的增益未跨种子复现，不得写成模块有效性证据。
-- 38 类没有任何分割数字。
-- 不同数据网格、点数、批次或训练轮数下的结果不可并列比较。
-
-## License
-
-MIT. See [LICENSE](LICENSE).
-
-<div align="center">
-
-[English](README.en.md)
-
-</div>
+本项目按 [MIT License](LICENSE) 发布。

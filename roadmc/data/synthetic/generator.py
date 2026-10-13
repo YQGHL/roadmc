@@ -40,6 +40,7 @@ try:
         OBSERVABLE_FEATURE_SCHEMA,
         compute_observable_features,
     )
+    from .am_envelope import apply_am_envelope
     from .config import (
         NUM_CLASSES,
         BleedingConfig,
@@ -50,6 +51,7 @@ try:
     )
     from .labels import TargetLabelSpec, target_spec_for_label
     from .primitives import (
+        _compute_normals,
         add_bleeding,
         add_concrete_damage,
         add_corrugation,
@@ -68,6 +70,8 @@ try:
         simulate_lidar_noise,
         synthesize_strip_macro_band,
     )
+    from .surface_geometry import estimate_surface_normals
+    from .surface_tile import SurfaceTile
 except ImportError:
     # Fallback for standalone / -m execution
     import sys as _sys
@@ -77,6 +81,7 @@ except ImportError:
     for _p in (_root, _parent):
         if _p not in _sys.path:
             _sys.path.insert(0, _p)
+    from am_envelope import apply_am_envelope  # type: ignore[no-redef]
     from config import (  # type: ignore[no-redef]
         NUM_CLASSES,
         BleedingConfig,
@@ -87,6 +92,7 @@ except ImportError:
     )
     from labels import TargetLabelSpec, target_spec_for_label  # type: ignore[no-redef]
     from primitives import (  # type: ignore[no-redef]
+        _compute_normals,
         add_bleeding,
         add_concrete_damage,
         add_corrugation,
@@ -105,6 +111,8 @@ except ImportError:
         simulate_lidar_noise,
         synthesize_strip_macro_band,
     )
+    from surface_geometry import estimate_surface_normals  # type: ignore[no-redef]
+    from surface_tile import SurfaceTile  # type: ignore[no-redef]
 
     from roadmc.data.features import (  # type: ignore[no-redef]
         DEFAULT_GEOMETRY_K_NEIGHBORS,
@@ -212,15 +220,47 @@ LABEL_PRIORITY: dict[int, int] = {
 # 路径的 rng 消耗顺序一致）
 # ----------------------------------------------------------------------
 
-def _sample_wheelpath_x(rng: np.random.Generator, width: float) -> float:
-    """轮迹带横向先验：车道中心 ±0.9 m 的双峰高斯混合（σ=0.25 m）。
+def _lane_layout(width: float, wheel_separation: float) -> dict[str, object]:
+    """Shared deterministic center and paired wheel-track coordinates."""
+    center = float(width) / 2.0
+    half = float(wheel_separation) / 2.0
+    return {"center": center, "wheel_tracks": (center - half, center + half)}
 
-    疲劳类病害（龟裂、纵缝、坑槽、车辙）机理上集中在轮迹带；
-    双轮迹间距取 RuttingConfig 的 1.8 m 口径。
+
+def _sample_wheelpath_x(
+    rng: np.random.Generator, width: float,
+    layout: dict[str, object] | None = None,
+) -> float:
+    """从共享的左右轮迹中心抽一个位置，并保留历史 0.25 m 抖动。
+
+    这是沿用的工程位置先验，未在本批作实测标定。
+    调用方布局取 RuttingConfig.wheel_separation；双轮车辙本身直接用布局中心。
     """
-    center = width / 2.0
-    offset = 0.9 if rng.random() < 0.5 else -0.9
-    return float(np.clip(rng.normal(center + offset, 0.25), 0.3, max(width - 0.3, 0.31)))
+    if layout is None:
+        center = width / 2.0
+        tracks = (center - 0.9, center + 0.9)
+    else:
+        tracks = layout["wheel_tracks"]
+    track = tracks[1] if rng.random() < 0.5 else tracks[0]
+    return float(np.clip(rng.normal(float(track), 0.25), 0.3, max(width - 0.3, 0.31)))
+
+
+def _merge_damage_labels(old: np.ndarray, proposed: np.ndarray) -> np.ndarray:
+    """Merge one primitive's labels with shared priority and patch override."""
+    out = proposed.copy()
+    changed = proposed != old
+    if not np.any(changed):
+        return out
+    patch = changed & np.isin(proposed, (20, 37))
+    ordinary = changed & ~patch
+    if np.any(ordinary):
+        lut = np.zeros(max(LABEL_PRIORITY) + 1, dtype=np.int32)
+        for label, priority in LABEL_PRIORITY.items():
+            lut[label] = priority
+        restore = lut[old[ordinary]] > lut[proposed[ordinary]]
+        idx = np.flatnonzero(ordinary)
+        out[idx[restore]] = old[idx[restore]]
+    return out
 
 
 def _sample_pothole_geometry(
@@ -307,6 +347,7 @@ def _bleeding_patch_params(
     width: float,
     length: float,
     salt: int,
+    layout: dict[str, object] | None = None,
 ) -> dict:
     """泛油斑块参数（``geometry_mode='patch'`` 口径）。
 
@@ -319,7 +360,7 @@ def _bleeding_patch_params(
     u = float(rng.uniform(1.5, min(4.0, 0.95 / frac)))
     w_band = min(frac * width * u, width)
     l_band = length / u
-    cx = _sample_wheelpath_x(rng, width)
+    cx = _sample_wheelpath_x(rng, width, layout)
     cy = float(rng.uniform(l_band / 2.0, length - l_band / 2.0))
     return {
         "center": (cx, cy),
@@ -346,6 +387,246 @@ def _bleeding_region_mask(points: np.ndarray, patch: dict) -> np.ndarray:
         p_in = 1.0 / (1.0 + np.exp(signed_dist / tau))
     u01 = _bleeding_hash01(points[:, 0], points[:, 1], patch["salt"])
     return u01 < p_in
+
+
+# ----------------------------------------------------------------------
+# two-segment 谱形装配助手（设计稿 spectrum_design）
+# ----------------------------------------------------------------------
+
+# two-segment 且 mpd_target_m=None 时的内置 MPD 目标区间 (米)：
+# 沥青 MPD 0.8–1.3mm、水泥 0.2–0.8mm——导入而非自校准。
+_DEFAULT_MPD_TARGET_M: dict[str, tuple[float, float]] = {
+    "asphalt": (0.0008, 0.0013),
+    "concrete": (0.0002, 0.0008),
+}
+
+
+def _draw_mpd_target_m(
+    rng: np.random.Generator,
+    micro_cfg,
+    pavement_type: str,
+) -> tuple[float, dict]:
+    """two-segment 路径的逐场景 MPD 抽取与有效纹理 RMS 推导.
+
+    MPD ~ U(mpd_target_m[type])，texture_rms_eff = MPD/mpd_rms_ratio。
+    仅 two-segment 分支调用（iso-marginal/legacy 随机流逐位不变）。
+    返回 (texture_rms_eff, 审计 dict)。
+    """
+    targets = (
+        micro_cfg.mpd_target_m
+        if micro_cfg.mpd_target_m is not None
+        else _DEFAULT_MPD_TARGET_M
+    )
+    key = pavement_type if pavement_type in targets else "asphalt"
+    lo, hi = targets[key]
+    mpd = float(rng.uniform(lo, hi))
+    rms_eff = mpd / float(micro_cfg.mpd_rms_ratio)
+    audit = {
+        "mpd_drawn_m": mpd,
+        "mpd_target_m": {
+            k: [float(v[0]), float(v[1])] for k, v in targets.items()
+        },
+        "mpd_target_m_overridden": micro_cfg.mpd_target_m is not None,
+        "mpd_rms_ratio": float(micro_cfg.mpd_rms_ratio),
+        "texture_rms_effective_m": float(rms_eff),
+    }
+    return rms_eff, audit
+
+
+# ----------------------------------------------------------------------
+# 病害因果链装配助手（设计稿 causality_design；系数全部导入、非自校准）
+# ----------------------------------------------------------------------
+
+def _load_tpm(path: str) -> dict:
+    """加载并校验 Markov 状态转移概率矩阵 JSON.
+
+    要求 states / matrix / provenance / source 四键；矩阵为行随机
+    （行和 = 1 ± 1e-6）、对角占优、sound 行上三角（病害不可逆——
+    无维护时状态只进不退；修补作为维护动作不入链）。
+    """
+    import json
+
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    for key in ("states", "matrix", "provenance", "source"):
+        if key not in data:
+            raise ValueError(f"TPM JSON missing required key {key!r}: {path}")
+    states = list(data["states"])
+    matrix = np.asarray(data["matrix"], dtype=np.float64)
+    n = len(states)
+    if matrix.shape != (n, n):
+        raise ValueError(
+            f"TPM matrix must be {n}x{n} for states {states}, got {matrix.shape}"
+        )
+    row_sums = matrix.sum(axis=1)
+    if not np.allclose(row_sums, 1.0, atol=1e-6):
+        raise ValueError(
+            f"TPM rows must sum to 1 ± 1e-6, got row sums {row_sums.tolist()}"
+        )
+    # 对角占优（严格）：diag(i) >= max 非对角项。行随机的约束下这
+    # 等价于 diag >= (1-diag)，即 diag >= 0.5。
+    off_diag = matrix - np.diag(np.diag(matrix))
+    if not np.all(np.diag(matrix) >= off_diag.max(axis=1)):
+        raise ValueError(
+            "TPM rows must be diagonally dominant "
+            "(diag(i) >= every off-diagonal entry of row i)"
+        )
+    if "sound" not in states:
+        raise ValueError("TPM states must include 'sound'")
+    s_idx = states.index("sound")
+    # 病害不可逆（设计稿：『无维护时状态只进不退；修补作为维护动作
+    # 不入链』）。sound 取第 0 列约定下，不可逆 ⟺ 矩阵第 0 列除
+    # sound 自身（对角）外恒为 0——任何更差状态回到 sound 都是恢复，
+    # 禁止；sound 行内允许停留与退到更差状态（列号更大）。
+    if s_idx != 0:
+        # 非约定布局时退化为逐行检查：行 i（劣于 sound）到 s_idx 的
+        # 转移必须为 0，且 sound 行到列号 < s_idx 的转移必须为 0。
+        if np.any(matrix[:s_idx, s_idx]) or np.any(matrix[s_idx + 1:, s_idx]):
+            raise ValueError(
+                "TPM must be irreversible: no transition back to 'sound' "
+                "from any deteriorated state is allowed"
+            )
+        if s_idx > 0 and np.any(matrix[s_idx, :s_idx]):
+            raise ValueError(
+                "TPM 'sound' row must be upper-triangular (irreversible "
+                "deterioration: no maintenance-driven recovery in the chain)"
+            )
+    elif np.any(matrix[1:, 0]):
+        raise ValueError(
+            "TPM must be irreversible: no transition back to 'sound' "
+            "from any deteriorated state is allowed (no-maintenance "
+            "deterioration only moves forward; repair is not part of "
+            "the chain)"
+        )
+    return {
+        "states": states,
+        "matrix": matrix,
+        "provenance": str(data["provenance"]),
+        "source": str(data["source"]),
+    }
+
+
+def _sample_base_condition(
+    rng: np.random.Generator,
+    base_cfg,
+    tpm_cache: dict | None,
+) -> dict:
+    """因果链场景维度的一次抽取：(SNP, 龄期, YE4) + ICA + π 调制因子.
+
+    ICA = K_cia·{CDS^a0·exp(a1·SNP + a2·YE4/SNP²) + CRT}
+    （HDM-4 Volume Five Table B3-4 系数，经 Malaysian J. Civil Eng.
+    27(1):121-143, 2015 转引核实——**导入系数、非自校准**；
+    K_cia 取 1）。
+
+    tpm_cache 提供 occupancy 分布 π = π0·P^age（sound 起始状态），
+    供 disease_probs 的 bernoulli 概率缩放（封顶 1）。
+    """
+    lo_s, hi_s = base_cfg.snp_range
+    lo_a, hi_a = base_cfg.age_years_range
+    lo_y, hi_y = base_cfg.ye4_msa_range
+    snp = float(rng.uniform(lo_s, hi_s))
+    age = float(rng.uniform(lo_a, hi_a))
+    ye4 = float(rng.uniform(lo_y, hi_y))
+    ica = base_cfg.cds ** base_cfg.hdm4_a0 * np.exp(
+        base_cfg.hdm4_a1 * snp + base_cfg.hdm4_a2 * ye4 / max(snp**2, 1e-9)
+    ) + base_cfg.crt_years
+    ica = float(ica)
+    record = {
+        "snp": snp,
+        "age_years": age,
+        "ye4_msa": ye4,
+        "cds": float(base_cfg.cds),
+        "crt_years": float(base_cfg.crt_years),
+        "ica_years": ica,
+        "coefficients_provenance": "imported_not_self_calibrated",
+        "hdm4_source": (
+            "HDM-4 Vol 5 Table B3-4 via Malaysian J. Civil Eng. "
+            "27(1):121-143, 2015 (utm.txt:677-684); imported, not "
+            "self-calibrated"
+        ),
+    }
+    if tpm_cache is not None:
+        pi0 = np.zeros(len(tpm_cache["states"]))
+        pi0[tpm_cache["states"].index("sound")] = 1.0
+        step = int(round(age))
+        pi = pi0
+        for _ in range(step):
+            pi = pi @ tpm_cache["matrix"]
+        record["tpm_source"] = tpm_cache["source"]
+        record["occupancy_pi"] = {
+            s: float(p) for s, p in zip(tpm_cache["states"], pi, strict=False)
+        }
+    return record
+
+
+def _modulate_disease_probs(
+    disease_probs: dict[str, float],
+    base_record: dict,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """用 TPM occupancy 分布 π 调制 disease_probs（封顶 1）.
+
+    设计稿 causality_design：『占用分布 π=π0·P^age 用于调制
+    disease_probs（bernoulli 概率按 π 缩放并封顶 1）』。映射口径：
+    结构性病害（crack / concrete_damage）按已离开 sound 状态的概率
+    1−π(sound) 缩放（病害出现 = 链已离开完好态）；非结构性病害按
+    发展类状态质量 π(crack_severe)+π(raveled)+π(potholed) 缩放（其
+    他病害跟随路面发展程度）。映射本身是装配层对『按 π 缩放』的
+    具体化（设计稿未逐病害给出系数），此处显式记录：缩放因子逐病
+    害落元数据 disease_prob_scale_factors，映射规则与 π 一并落
+    occupancy_pi 供核对。返回 (调制后概率字典, 逐病害缩放因子字典)。
+    """
+    if "occupancy_pi" not in base_record:
+        return dict(disease_probs), {}
+    pi = base_record["occupancy_pi"]
+    p_sound = pi.get("sound", 1.0)
+    p_developed = (
+        pi.get("crack_severe", 0.0)
+        + pi.get("raveled", 0.0)
+        + pi.get("potholed", 0.0)
+    )
+    scaled: dict[str, float] = {}
+    factors: dict[str, float] = {}
+    for key, prob in disease_probs.items():
+        structural = key in ("crack", "concrete_damage")
+        factor = (1.0 - p_sound) if structural else p_developed
+        factors[key] = float(min(factor, 1.0))
+        scaled[key] = float(min(prob * factors[key], 1.0))
+    return scaled, factors
+
+
+# 结构性开裂链的 concrete_damage 变体（设计稿 causality_design：结构性
+# 裂缝 = 龟裂/纵/横缝与水泥板裂缝/破碎板/板角断裂；其余 concrete 变体
+# ——faulting/pumping/edge_spall/joint_damage/pitting/blowup/
+# exposed_aggregate/patching——为非结构性，不受 ICA 硬规则影响）。
+_STRUCTURAL_CONCRETE_VARIANTS: frozenset = frozenset({
+    "slab_shatter", "slab_crack", "corner_break",
+})
+
+
+def _ica_blocks_structural_crack(
+    base_record: dict | None,
+    disease_type: str,
+    variant: str | None = None,
+) -> bool:
+    """硬规则：age_years < ICA 时结构性裂缝出现概率强制为 0.
+
+    结构性裂缝 = 沥青 crack（龟裂/纵/横缝）与水泥 structural 变体
+    （slab_crack / slab_shatter / corner_break）；concrete_damage 的
+    非结构性变体与其它病害不受影响。``variant`` 为 concrete_damage 的
+    目标变体（受控场景传 target_spec.variant；自然场景由调用点预抽）。
+    受控场景（target_spec 显式物理配方）整体绕过本规则——受控生成
+    路径不调用它。
+    """
+    if base_record is None:
+        return False
+    if disease_type == "crack":
+        pass
+    elif disease_type == "concrete_damage":
+        if variant not in _STRUCTURAL_CONCRETE_VARIANTS:
+            return False
+    else:
+        return False
+    return base_record["age_years"] < base_record["ica_years"]
 
 
 def _lambert_cos_theta(
@@ -384,6 +665,10 @@ _INTRODUCED_PARAMS_KEYS: frozenset = frozenset({
     "perturb_mode", "width_truncation", "area_lambda_mode", "area_label_mode",
     "crack_in_slab", "fault_scope", "edge_spall_mode", "shatter_mode",
     "label_radius_mode", "modulation_epsilon", "removal_ratio", "erosion_depth",
+    # 过渡带批（设计稿 transition_design）：装配层引入、基元侧消费，
+    # 未合入前按既有披露机制记入 pending_primitive_upgrades。
+    "profile_exponent", "edge_band_width_m", "edge_band_depth_ratio",
+    "spall_profile", "edge_profile", "edge_fillet_m", "fault_fillet_m",
 })
 
 # 请求值与基元当前行为等价的取值表：某键尚未被基元消费时，若请求值属于
@@ -410,17 +695,27 @@ _LEGACY_EQUIVALENT_VALUES: dict[str, frozenset] = {
     "modulation_epsilon": frozenset({0.2}),
     "removal_ratio": frozenset({0.05, 0.20}),
     "erosion_depth": frozenset({(0.002, 0.005)}),
+    # 过渡带批：默认值 = 基元当前行为（历史口径），请求值取默认时静默。
+    "profile_exponent": frozenset({2.0}),
+    "edge_band_width_m": frozenset({0.0}),
+    "spall_profile": frozenset({"uniform"}),
+    "edge_profile": frozenset({"smoothstep"}),
+    "fault_fillet_m": frozenset({0.0}),
 }
 
 # 受模式键治理的键：模式键取等价值时被治理键不参与行为（如
 # micropit_mode='legacy' 下旧实现按钳制计数，micropit_rate 不生效），
-# 一并静默。
+# 一并静默。edge_band_depth_ratio 在 edge_band_width_m=0（带关闭）时
+# 行为无关——否则 full-legacy 回退运行（两键都取默认值）会把
+# edge_band_depth_ratio 误报为 pending，违背 README『full-legacy 回退
+# 运行的待合入集合为空』的回归门契约。
 _PARAM_MOOT_UNDER: dict[str, tuple[str, frozenset]] = {
     "micropit_rate": ("micropit_mode", frozenset({"legacy"})),
+    "edge_band_depth_ratio": ("edge_band_width_m", frozenset({0.0})),
 }
 
 
-def _surface_moot_keys(micro_cfg) -> frozenset:
+def _surface_moot_keys(micro_cfg, macro_spectrum_mode: str = "iso-marginal") -> frozenset:
     """当前配置下行为无关（取任何值输出都相同）的表面装配键集合。
 
     het_sigma_ln == 0 时 het 调制整体关闭——primitives.py 单块路径
@@ -432,12 +727,64 @@ def _surface_moot_keys(micro_cfg) -> frozenset:
     het_field 误报为 pending，违背 README『full-legacy 回退运行的
     待合入集合为空』的回归门契约。sigma > 0 时调制实际生效，
     het_field 恢复参与披露（'2d' 未合入 → pending，'1d' → 等价静默）。
+
+    two-segment 谱形键（texture_h_macro/texture_h_micro/
+    texture_break_wavelength_m）在 iso-marginal/legacy 下被设计明确
+    忽略（config.MicroTextureConfig docstring；设计稿 spectrum_design
+    『iso-marginal/legacy 下该字段被忽略，纹理幅值仍取 amplitude
+    标量』）——行为无关键，同样静默；macro_spectrum_mode='two-segment'
+    时恢复参与披露（键未合入 → pending；本批已合入 primitives，正常
+    构建下不再出现）。
     """
+    moot: set[str] = set()
     if float(getattr(micro_cfg, "het_sigma_ln", 0.0)) <= 0.0:
-        return frozenset({"het_field"})
-    return frozenset()
+        moot.add("het_field")
+    if macro_spectrum_mode != "two-segment":
+        moot.update(
+            {"texture_h_macro", "texture_h_micro", "texture_break_wavelength_m"}
+        )
+    return frozenset(moot)
 
 _PARAMS_SOURCE_CACHE: dict[int, str] = {}
+
+
+_MODE_VALUE_SUPPORT_CACHE: dict[tuple[int, str, str], bool] = {}
+
+
+def _primitive_supports_mode_value(callee, param_name: str, value: str) -> bool:
+    """基元是否已支持某模式值（AST 静态检查，带缓存）.
+
+    two-segment 谱形已随本批合入 primitives（generate_road_surface /
+    generate_strip_surface / synthesize_strip_macro_band 的源码含
+    'two-segment' 字面量，本检查自动放行）。本预检保留为安全网：
+    若未来某构建的基元缺失该档，装配层在此给出清晰可操作的报错
+    （含回退 flag 提示），而不是让用户面对基元内部校验的裸
+    ValueError。
+    """
+    key = (id(callee), param_name, value)
+    cached = _MODE_VALUE_SUPPORT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    src = _primitive_source_text(callee)
+    supported = False
+    if src:
+        try:
+            tree = ast.parse(textwrap.dedent(src))
+        except SyntaxError:
+            supported = True  # 无法解析时放行，交由基元运行时校验
+        else:
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and node.value == value
+                ):
+                    supported = True
+                    break
+    else:
+        supported = True  # 源码不可得时放行，交由基元运行时校验
+    _MODE_VALUE_SUPPORT_CACHE[key] = supported
+    return supported
 
 
 def _register_pending(key: str, callee_name: str) -> None:
@@ -655,7 +1002,9 @@ class SyntheticRoadDataset(_DatasetBase):
         # Re-run the preflight here because dataclass instances are mutable and
         # callers may have changed the road geometry after construction.
         self.surface_estimate = config.validate_surface_budget()
-        if self.surface_estimate.segmented and config.observation_model == "on":
+        if self.surface_estimate.segmented and config.observation_model in (
+            "on", "line-profiler",
+        ):
             raise NotImplementedError(
                 "Strip of "
                 f"{self.surface_estimate.point_count:,} points requires the "
@@ -663,7 +1012,8 @@ class SyntheticRoadDataset(_DatasetBase):
                 f"× {self.surface_estimate.segment_length_m:.3f} m), which "
                 "currently supports observation_model='off' only: the sensor "
                 "pipeline (scan resampling, occlusion, noise, NN transfer, "
-                "output sampling) is not segmented in this build. Construct the "
+                "output sampling) is not segmented in this build, and the "
+                "line-profiler pipeline is single-block only. Construct the "
                 "dataset with observation_model='off', or raise "
                 "max_surface_points / max_surface_memory_mib to hold the whole "
                 "strip in one block."
@@ -688,8 +1038,15 @@ class SyntheticRoadDataset(_DatasetBase):
             "roughness_class": scene["roughness_class"],
         }
 
-    def generate_scene(self, idx: int, target_label: int | None = None) -> dict:
+    def generate_scene(
+        self, idx: int, target_label: int | None = None, *, capture_geometry: bool = False
+    ) -> dict:
         """生成一个完整的合成道路场景。
+
+        ``capture_geometry=True`` adds full-scene float64 diagnostic copies of
+        the road-only base and post-ravel surface before downstream sensor
+        noise (after optional scan resampling). This opt-in cache is not included in
+        the surface-budget preflight; reserve it for small diagnostic scenes.
 
         内部流程按以下顺序执行：
 
@@ -712,7 +1069,7 @@ class SyntheticRoadDataset(_DatasetBase):
 
         观测模型体制（``config.observation_model``）：
 
-        - ``"on"``（配置默认）：以上管线全部执行，与历史版本逐位一致。
+        - ``"on"``（配置默认）：以上管线全部执行，使用病害后的表面法向。
         - ``"off"``：观测体制关闭——直接输出全部表面点。跳过 2.5 扫描
           重采样、4 曲率（其唯一消费者是噪声阶段边缘混合）、6.5 几何
           遮挡（传感器可见性现象；``local_depression_depth`` 仍计算并
@@ -741,9 +1098,23 @@ class SyntheticRoadDataset(_DatasetBase):
         grid_res = self.config.road.grid_res
         width = self.config.road.width
         length = self.config.road.length
+        lane_layout = _lane_layout(width, self.config.rutting.wheel_separation)
         surface_estimate = self.config.validate_surface_budget()
         observation_off = self.config.observation_model == "off"
         if surface_estimate.segmented:
+            if self.config.observation_model == "line-profiler":
+                # line-profiler 暂仅单块路径：与 on+segmented 同策略显式
+                # 拒绝，而不是静默走单块路径超预算。
+                raise NotImplementedError(
+                    "Strip of "
+                    f"{surface_estimate.point_count:,} points requires the "
+                    "segmented regime, and observation_model='line-profiler' "
+                    "does not support the segmented strip path in this build "
+                    "(the line-laser profiling pipeline is single-block only). "
+                    "Use observation_model='off' for segmented strips, or "
+                    "raise max_surface_points / max_surface_memory_mib to "
+                    "hold the whole strip in one block."
+                )
             if not observation_off:
                 # on+segmented：观测管线（扫描/遮挡/噪声/最近邻传递/输出
                 # 采样）尚未分段化——显式拒绝而不是无声地走单块路径超
@@ -760,7 +1131,8 @@ class SyntheticRoadDataset(_DatasetBase):
                     "the whole strip in one block."
                 )
             return self._generate_scene_segmented_off(
-                idx, target_spec, target_label, surface_estimate, rng
+                idx, target_spec, target_label, surface_estimate, rng,
+                capture_geometry=capture_geometry,
             )
 
         # 1. 路面类型选择
@@ -783,35 +1155,81 @@ class SyntheticRoadDataset(_DatasetBase):
         else:
             roughness_actual = self.config.road.roughness_class
 
+        # 1.75 基层条件 / 病害因果链（默认关闭；关闭路径零 rng 消耗，
+        # 既有随机流逐位不变）。受控场景（target_spec）是显式物理
+        # 配方，绕过因果约束：不抽取也不施加 ICA/π 规则，否则
+        # generate_class_budget 的受控生成会失效。
+        base_record: dict | None = None
+        disease_probs_effective: dict | None = None
+        if (
+            self.config.base_condition.enable
+            and target_spec is None
+        ):
+            tpm_cache = None
+            if self.config.base_condition.tpm_path:
+                tpm_cache = _load_tpm(self.config.base_condition.tpm_path)
+            base_record = _sample_base_condition(
+                rng, self.config.base_condition, tpm_cache
+            )
+            disease_probs_effective, scale_factors = _modulate_disease_probs(
+                dict(self.config.disease.disease_probs), base_record
+            )
+            base_record["_scale_factors"] = scale_factors
+
         # 2. 路面宏观轮廓 + 纹理谱段 + 设计几何（单次谱合成，法向从
         # 最终高度场统一重算——纹理不再作为独立的逐点位移步骤）。
-        # 诚实化口径：两类路面**共享同一几何宏观谱与纹理谱**；
-        # pavement_type 仅影响病害集合与强度材料先验（基线反照率），
-        # 不建模材料纹理分化。本调用点已停传 pavement_type（fix#17
-        # 调用侧一半；基元签名中残留的形参由基元组批次移除，本组不动
-        # primitives.py）。
-        # macro_spectrum_mode/grid_convention/het_field 为本轮新增装配
-        # 键：基元签名尚未支持时由桥接层跳过转发。请求值等于基元当前
-        # 行为（legacy 等价值）的键静默；其余键记入本场景的
-        # pending_scene，随元数据 pending_primitive_upgrades 披露。
+        # 诚实化口径（two-segment 起**有条件修订**）：iso-marginal/
+        # legacy 下两类路面**共享同一几何宏观谱与纹理谱**，pavement_type
+        # 仅影响病害集合与强度材料先验（fix#17 口径保持）；two-segment
+        # 谱形下按 pavement_type 逐场景抽取 MPD 目标并推导有效纹理幅值
+        # ——材料纹理分化**经 MPD 幅值分档重新进入几何**，这是对
+        # fix#17『两类路面共享同一纹理谱』的有意反转（谱形状仍共享，
+        # 幅值分档；README 边界声明已同步修订）。
+        if (
+            self.config.road.macro_spectrum_mode == "two-segment"
+            and not _primitive_supports_mode_value(
+                generate_road_surface, "macro_spectrum_mode", "two-segment"
+            )
+        ):
+            raise NotImplementedError(
+                "macro_spectrum_mode='two-segment' requires the primitives-side "
+                "two-segment PSD batch (generate_road_surface / "
+                "generate_strip_surface consuming texture_h_macro / "
+                "texture_h_micro / texture_break_wavelength_m), which is not "
+                "merged into primitives.py in this build yet. Roll back with "
+                "--macro-spectrum iso-marginal (or legacy)."
+            )
         pending_scene: set[str] = set()
+        texture_rms_eff = self.config.micro_texture.amplitude
+        mpd_audit: dict | None = None
+        if self.config.road.macro_spectrum_mode == "two-segment":
+            texture_rms_eff, mpd_audit = _draw_mpd_target_m(
+                rng, self.config.micro_texture, pavement_type
+            )
         surface_extra, surface_pending = _filter_unsupported_kwargs(
             generate_road_surface,
             {
                 "macro_spectrum_mode": self.config.road.macro_spectrum_mode,
                 "grid_convention": self.config.micro_texture.grid_convention,
                 "het_field": self.config.micro_texture.het_field,
+                "texture_h_macro": self.config.micro_texture.h_macro,
+                "texture_h_micro": self.config.micro_texture.h_micro,
+                "texture_break_wavelength_m": self.config.micro_texture.break_wavelength_m,
             },
-            moot_keys=_surface_moot_keys(self.config.micro_texture),
+            moot_keys=_surface_moot_keys(
+                self.config.micro_texture, self.config.road.macro_spectrum_mode
+            ),
         )
         pending_scene.update(surface_pending)
-        points, normals = generate_road_surface(
+        surface_seed = int(rng.integers(0, 2 ** 31))
+        surface_tile: SurfaceTile | None = None
+        surface_kwargs = dict(
             width=width,
             length=length,
             grid_res=grid_res,
             roughness_class=roughness_actual,
-            seed=int(rng.integers(0, 2 ** 31)),
-            texture_rms=self.config.micro_texture.amplitude,
+            seed=surface_seed,
+            texture_rms=texture_rms_eff,
             texture_hurst=self.config.micro_texture.hurst,
             crossfall=self.config.road.crossfall,
             crossfall_shape=self.config.road.crossfall_shape,
@@ -820,6 +1238,93 @@ class SyntheticRoadDataset(_DatasetBase):
             texture_het_corr_len_m=self.config.micro_texture.het_corr_len_m,
             **surface_extra,
         )
+        if self.config.surface_layers:
+            points, normals, layer_arrays = generate_road_surface(
+                **surface_kwargs, return_layers=True
+            )
+            nx, ny = surface_estimate.grid_shape
+            macro_ss, texture_ss = np.random.SeedSequence(surface_seed).spawn(2)
+            macro_layer_seed = int(macro_ss.generate_state(1, dtype=np.uint32)[0])
+            texture_layer_seed = int(texture_ss.generate_state(1, dtype=np.uint32)[0])
+            surface_tile = SurfaceTile(
+                points[:nx * ny, 0].reshape(nx, ny)[:, 0].copy(),
+                points[:nx * ny, 1].reshape(nx, ny)[0, :].copy(),
+                layer_arrays["design"], layer_arrays["roughness"],
+                layer_arrays["texture"],
+                {"units": "m", "layout": "x-major", "surface_seed": surface_seed,
+                 "macro_seed": macro_layer_seed, "texture_seed": texture_layer_seed,
+                 "macro_spectrum_mode": self.config.road.macro_spectrum_mode,
+                 "spectral_parameters": {
+                     "roughness_class": roughness_actual,
+                     "texture_rms_m": texture_rms_eff,
+                     "texture_hurst": self.config.micro_texture.hurst,
+                     "texture_h_macro": self.config.micro_texture.h_macro,
+                     "texture_h_micro": self.config.micro_texture.h_micro,
+                     "break_wavelength_m": self.config.micro_texture.break_wavelength_m,
+                     "grid_spacing_m": grid_res,
+                     "taper_policy": "half-octave cosine overlap at ISO band edge",
+                     "legacy_rescaling": "per-component RMS to configured PSD variance",
+                 },
+                 "design_parameters": {
+                     "crossfall": self.config.road.crossfall,
+                     "crossfall_shape": self.config.road.crossfall_shape,
+                     "longitudinal_grade": self.config.road.longitudinal_grade,
+                 },
+                 "texture_heterogeneity": {
+                     "sigma_ln": self.config.micro_texture.het_sigma_ln,
+                     "corr_len_m": self.config.micro_texture.het_corr_len_m,
+                     "field": self.config.micro_texture.het_field,
+                 },
+                 "am_envelope": {
+                     "enabled": self.config.am_envelope.enable,
+                     "wcut_cycles_per_m": self.config.am_envelope.wcut_cycles_per_m,
+                     "gamma_shape": self.config.am_envelope.gamma_shape,
+                     "target_skew": self.config.am_envelope.target_skew,
+                     "target_kurt": self.config.am_envelope.target_kurt,
+                 }},
+            )
+        else:
+            points, normals = generate_road_surface(**surface_kwargs)
+        # 2.1 AM 慢变包络（默认关闭 → 默认输出逐位不变）。**管线位置
+        # 硬约束**：必须在病害施加之前作用于基底高度场（本调用点位于
+        # 步骤 2 与 3 之间）；若放到病害之后，全场 CDF 变换会缩放坑槽
+        # 深度/缝深（JTG 3mm 缝宽 / 25mm 坑深分级判据失真）。顺序由
+        # 步骤 3 的 labels 全零断言守护（am_envelope_labels_guard）。
+        am_audit: dict | None = None
+        am_layer_seed: int | None = None
+        if self.config.am_envelope.enable:
+            if surface_tile is not None:
+                am_layer_seed = int(
+                    np.random.SeedSequence(surface_seed).spawn(3)[2]
+                    .generate_state(1, dtype=np.uint32)[0]
+                )
+                surface_tile.texture, am_audit = apply_am_envelope(
+                    surface_tile.texture,
+                    grid_res=grid_res,
+                    wcut_cycles_per_m=self.config.am_envelope.wcut_cycles_per_m,
+                    gamma_shape=self.config.am_envelope.gamma_shape,
+                    target_skew=self.config.am_envelope.target_skew,
+                    target_kurt=self.config.am_envelope.target_kurt,
+                    seed=am_layer_seed,
+                )
+                surface_tile.metadata["am_seed"] = am_layer_seed
+                surface_tile.metadata["am_envelope"]["audit"] = am_audit
+                h_grid = surface_tile.reconstruct()
+            else:
+                h_grid = points[:, 2].reshape(surface_estimate.grid_shape)
+                h_grid, am_audit = apply_am_envelope(
+                    h_grid,
+                    grid_res=grid_res,
+                    wcut_cycles_per_m=self.config.am_envelope.wcut_cycles_per_m,
+                    gamma_shape=self.config.am_envelope.gamma_shape,
+                    target_skew=self.config.am_envelope.target_skew,
+                    target_kurt=self.config.am_envelope.target_kurt,
+                    seed=int(rng.integers(0, 2 ** 31)),
+                )
+            points[:, 2] = h_grid.ravel()
+            normals = _compute_normals(h_grid, grid_res, grid_res).reshape(
+                -1, 3
+            )
         # 2.4 缘石条带（可选）：行车道横向外侧的抬高顶面条带，几何确定性、
         # 零 rng 消耗。此处只**生成**、暂不并入——第 3 步病害与第 5 步松散
         # 必须在纯路面足迹上进行：否则 add_depression 的影响半径、
@@ -860,7 +1365,21 @@ class SyntheticRoadDataset(_DatasetBase):
         # 开关仍为开启则发 warning 并在元数据记录 override，不报硬错
         # （scan 开关与 observation_model 分属两个配置对象）。
         scan_override: str | None = None
-        if observation_off:
+        line_profiler_audit: dict | None = None
+        if self.config.observation_model == "line-profiler":
+            # line-profiler 档：跳过旋转 LiDAR 扫描重采样（那是扫描式
+            # LiDAR 模型）。线激光剖面在病害之后的步骤 8 位置对最终
+            # 几何采样（见下方步骤 7.5 分发钩子）；此处仅记录跳过。
+            if self.config.lidar_scan.enable:
+                warnings.warn(
+                    "observation_model='line-profiler': skipping rotating "
+                    "LiDAR scan-line resampling; lidar_scan.enable=True is "
+                    "overridden (recorded in metadata).",
+                    stacklevel=2,
+                )
+                scan_override = "skipped_under_line_profiler"
+            scan_pattern_points = int(surface_estimate.point_count)
+        elif observation_off:
             if self.config.lidar_scan.enable:
                 warnings.warn(
                     "observation_model='off': skipping LiDAR scan-line resampling; "
@@ -907,13 +1426,76 @@ class SyntheticRoadDataset(_DatasetBase):
             )
         # 3. 标签初始化 + 病害选择 & 应用
         labels = np.zeros(points.shape[0], dtype=np.int64)
+        geometry_diagnostics = None
+        if capture_geometry:
+            # Curbs are still separate here; this cloud contains only road rows.
+            geometry_diagnostics = {
+                "base_points": points.astype(np.float64, copy=True),
+                "surface_points": None, "surface_labels": None,
+                "surface_normals": None, "metadata": {},
+            }
+            if surface_tile is not None:
+                geometry_diagnostics["surface_tile"] = {
+                    "x": surface_tile.x.copy(), "y": surface_tile.y.copy(),
+                    "design_m": surface_tile.design.copy(),
+                    "roughness_m": surface_tile.roughness.copy(),
+                    "texture_m": surface_tile.texture.copy(),
+                    "metadata": dict(surface_tile.metadata),
+                }
+        # AM 顺序断言：AM 包络若启用，必须在本步（病害施加）之前执行
+        # ——此刻标签恒为全零背景。若未来有人把 AM 挪到病害之后，此
+        # 断言（配合 am_audit 非 None）会在开发期立即失败，防止全场
+        # CDF 变换改写病害几何（坑槽深度/缝深被缩放，JTG 分级失真）。
+        if am_audit is not None:
+            assert not np.any(labels), (
+                "AM envelope ordering violated: labels are non-zero before "
+                "disease application (AM must act on the bare base field, "
+                "step 2.x)."
+            )
 
         if target_spec is None:
-            diseases = self._select_diseases(rng, pavement_type)
+            diseases = self._select_diseases(
+                rng, pavement_type, disease_probs_override=disease_probs_effective
+            )
         else:
             diseases = [(target_spec.disease_type, target_spec.severity)]
         # 按自然顺序排序（大尺度 → 小尺度）
         diseases.sort(key=lambda d: DISEASE_APPLY_ORDER.get(d[0], 99))
+
+        # 因果链硬规则：age_years < ICA 时结构性裂缝（沥青 crack 与
+        # 水泥 slab_shatter/slab_crack/corner_break 变体）出现概率强制
+        # 为 0；非结构性病害不受影响。concrete_damage 变体在过滤时
+        # 预抽（同一次抽取在应用循环里复用，rng 消耗不增）；受控场景
+        # 绕过（上面已显式配方）。重松散硬规则：⇒（有裂缝 ∨ snp ≤
+        # snp_range 下四分位）——设计约束矩阵第三行。
+        concrete_variant_drawn: str | None = None
+        snp_q1: float | None = None
+        if base_record is not None:
+            for d in diseases:
+                if d[0] == "concrete_damage":
+                    concrete_variant_drawn = str(
+                        rng.choice(CONCRETE_DAMAGE_TYPES)
+                    )
+                    break
+            crack_history_early = any(d[0] == "crack" for d in diseases)
+            snp_lo, _snp_hi = self.config.base_condition.snp_range
+            snp_q1 = snp_lo + 0.25 * (_snp_hi - snp_lo)
+            filtered: list[tuple[str, str]] = []
+            for d in diseases:
+                if _ica_blocks_structural_crack(
+                    base_record, d[0], concrete_variant_drawn
+                ):
+                    continue
+                if (
+                    d[0] == "raveling"
+                    and d[1] == "severe"
+                    and not (
+                        crack_history_early or base_record["snp"] <= snp_q1
+                    )
+                ):
+                    continue
+                filtered.append(d)
+            diseases = filtered
 
         # 分离 raveling（最后处理，不参与曲率计算）
         raveling_entry = None
@@ -928,6 +1510,23 @@ class SyntheticRoadDataset(_DatasetBase):
         # 带；坑槽的主要成因链是 龟裂→水侵→剥落→坑槽，故若本场景有
         # 龟裂/块裂 patch，坑槽以 p=0.5 落在该 patch 内。旧实现所有
         # 病害独立均匀撒点，俯视图一眼可辨合成痕迹。
+        # 因果链开启时共现概率改为 p = base·clip(age/ICA−1, 0, 1)
+        # + 0.5·base（函数形式为工程假设，显著标注；disable 时保持
+        # 0.5 字面量不变）。硬规则：坑槽 ⇒（本场景有裂缝 ∨ age ≥ ICA）
+        # ——坑槽出现在无裂缝且未达 ICA 的场景被因果链排除。
+        has_crack_history = any(d[0] == "crack" for d in diseases)
+        if base_record is not None:
+            cooccur_p = (
+                self.config.base_condition.pothole_cooccur_base
+                * float(np.clip(base_record["age_years"] / base_record["ica_years"] - 1.0, 0.0, 1.0))
+                + 0.5 * self.config.base_condition.pothole_cooccur_base
+            )
+            pothole_allowed = has_crack_history or (
+                base_record["age_years"] >= base_record["ica_years"]
+            )
+        else:
+            cooccur_p = 0.5
+            pothole_allowed = True
         planned_crack_type: str | None = None
         if any(d[0] == "crack" for d in non_raveling_diseases):
             planned_crack_type = (
@@ -938,10 +1537,21 @@ class SyntheticRoadDataset(_DatasetBase):
         alligator_region: tuple[float, float] | None = None
         if planned_crack_type in ("alligator", "block"):
             alligator_region = (
-                self._sample_wheelpath_x(rng, width),
+                self._sample_wheelpath_x(rng, width, lane_layout),
                 float(rng.uniform(0.8, max(length - 0.8, 0.9))),
             )
-        pothole_cooccurs = alligator_region is not None and rng.random() < 0.5
+        pothole_cooccurs = (
+            alligator_region is not None
+            and pothole_allowed
+            and rng.random() < cooccur_p
+        )
+        # 因果链硬规则（修补 ⇒ 场景病害史含裂缝标记）：enable 时修补
+        # 只能出现在有裂缝史的场景；受控场景不受此约束。
+        if base_record is not None:
+            non_raveling_diseases = [
+                d for d in non_raveling_diseases
+                if d[0] != "patching" or has_crack_history
+            ]
 
         for disease_type, severity in non_raveling_diseases:
             seed = int(rng.integers(0, 2 ** 31))
@@ -958,11 +1568,17 @@ class SyntheticRoadDataset(_DatasetBase):
                     "width_truncation": self.config.crack.width_truncation,
                     "area_lambda_mode": self.config.crack.area_lambda_mode,
                     "area_label_mode": self.config.crack.area_label_mode,
+                    # 过渡带口径（设计稿 transition_design）：默认值 =
+                    # 基元当前行为，请求值取默认时静默，新值待基元合入
+                    # 前经 pending_primitive_upgrades 披露。
+                    "profile_exponent": self.config.crack.profile_exponent,
+                    "edge_band_width_m": self.config.crack.edge_band_width_m,
+                    "edge_band_depth_ratio": self.config.crack.edge_band_depth_ratio,
                 }
                 pending_scene.update(_pending_params_keys(add_crack, params))
                 if crack_type == "longitudinal":
                     # 纵缝先验：轮迹带边缘（带中心 ±0.3m 摆动）
-                    params["x_center"] = self._sample_wheelpath_x(rng, width) + float(
+                    params["x_center"] = self._sample_wheelpath_x(rng, width, lane_layout) + float(
                         rng.normal(0.0, 0.15)
                     )
                 elif alligator_region is not None:
@@ -982,7 +1598,7 @@ class SyntheticRoadDataset(_DatasetBase):
                         rng.normal(alligator_region[1], 0.6), 0.5, length - 0.5
                     ))
                 else:
-                    cx = self._sample_wheelpath_x(rng, width)
+                    cx = self._sample_wheelpath_x(rng, width, lane_layout)
                     cy = float(rng.uniform(0.5, length - 0.5))
                 # JTG 5210-2018 坑槽轻/重仅按深度 (25mm) 分级；平面半径
                 # 与严重度解耦采样——旧实现按严重度硬切半径区间，使
@@ -1000,6 +1616,9 @@ class SyntheticRoadDataset(_DatasetBase):
                     "micropit_rate": self.config.pothole.micropit_rate,
                     "micropit_mode": self.config.pothole.micropit_mode,
                     "spall_band": tuple(self.config.pothole.spall_band),
+                    # 过渡带口径（spall_profile：'uniform'=现行行为，
+                    # 'linear-decay'=剥落深度沿剥落带线性衰减，工程假设）
+                    "spall_profile": self.config.pothole.spall_profile,
                 }
                 pending_scene.update(_pending_params_keys(add_pothole, pothole_params))
                 points, labels = add_pothole(
@@ -1034,11 +1653,10 @@ class SyntheticRoadDataset(_DatasetBase):
                 )
 
             elif disease_type == "rutting":
-                # 车辙中心走轮迹带先验（与裂缝/坑槽一致；7m 双车道口径
-                # 仅建模内侧轮迹对——外侧两条轮迹不被疲劳病害命中的
-                # 现假设显性化）。'fixed' = 历史恒位于道路中线。
+                # The primitive offsets both wheels from this pair center.
+                # This single-pair layout currently shares the fixed road center.
                 if self.config.rutting.center_mode == "wheelpath":
-                    center_line = self._sample_wheelpath_x(rng, width)
+                    center_line = float(lane_layout["center"])
                 else:
                     center_line = width / 2.0
                 wheel_sep = self.config.rutting.wheel_separation
@@ -1088,7 +1706,8 @@ class SyntheticRoadDataset(_DatasetBase):
                     # 斑块口径：轮迹带中心、有限 y 长度、面积占比随机、
                     # logistic 平滑边界（掩码逐点确定性，云无关）。
                     patch = _bleeding_patch_params(
-                        rng, self.config.bleeding, width, length, salt=seed
+                        rng, self.config.bleeding, width, length, salt=seed,
+                        layout=lane_layout,
                     )
                     region_mask = _bleeding_region_mask(points, patch)
                 else:
@@ -1119,7 +1738,14 @@ class SyntheticRoadDataset(_DatasetBase):
                     target_spec.variant
                     if target_spec is not None
                     and target_spec.disease_type == "concrete_damage"
-                    else str(rng.choice(CONCRETE_DAMAGE_TYPES))
+                    else (
+                        # 因果链 enable 时变体已在 ICA 过滤处预抽（同一
+                        # 抽取复用，rng 消耗不增）；未预抽说明因果链关
+                        # 闭或场景不含 concrete_damage——走常规抽取。
+                        concrete_variant_drawn
+                        if concrete_variant_drawn is not None
+                        else str(rng.choice(CONCRETE_DAMAGE_TYPES))
+                    )
                 )
                 if damage_type == "patching":
                     points, labels = self._apply_patching(
@@ -1146,6 +1772,8 @@ class SyntheticRoadDataset(_DatasetBase):
                         "fault_scope": self.config.concrete_damage.fault_scope,
                         "edge_spall_mode": self.config.concrete_damage.edge_spall_mode,
                         "shatter_mode": self.config.concrete_damage.shatter_mode,
+                        # 过渡带口径：错台阶跃平滑宽度（0=现行纯阶跃）
+                        "fault_fillet_m": self.config.concrete_damage.fault_fillet_m,
                     }
                     pending_scene.update(
                         _pending_params_keys(add_concrete_damage, params)
@@ -1156,18 +1784,7 @@ class SyntheticRoadDataset(_DatasetBase):
                         params=params, seed=seed,
                     )
 
-            # P1-3 + Q3 向量化：仅在优先级更高时保留新标签
-            changed_mask = labels != old_labels
-            if np.any(changed_mask):
-                max_label = max(LABEL_PRIORITY.keys()) + 1
-                priority_lut = np.zeros(max_label, dtype=np.int32)
-                for k, v in LABEL_PRIORITY.items():
-                    priority_lut[k] = v
-                old_prio = priority_lut[old_labels[changed_mask]]
-                new_prio = priority_lut[labels[changed_mask]]
-                restore = old_prio > new_prio
-                changed_indices = np.where(changed_mask)[0]
-                labels[changed_indices[restore]] = old_labels[changed_indices[restore]]
+            labels = _merge_damage_labels(old_labels, labels)
 
         # 3.5 缘石并入：在病害之后、曲率之前。缘石点自带背景标签 0，不占用
         # 任何病害标签。road_mask 标记路面足迹（curb 关闭时全 True），供第 5
@@ -1268,6 +1885,22 @@ class SyntheticRoadDataset(_DatasetBase):
         raveling_labels_mask = (labels == 11) | (labels == 12)
         valid_mask = ~np.any(np.isnan(points), axis=1)
 
+        # Re-estimate final geometric normals on road rows only.  Before
+        # dropout filtering the regular-grid path retains the hole alignment.
+        road_indices = np.flatnonzero(road_mask)
+        road_cloud = points[road_indices]
+        if len(road_cloud) == int(np.prod(surface_estimate.grid_shape)):
+            road_normals = estimate_surface_normals(
+                road_cloud, grid_shape=surface_estimate.grid_shape,
+                grid_spacing_m=grid_res, grid_order="xy",
+            )
+            normal_method = "regular_grid_finite_difference"
+        else:
+            road_normals = estimate_surface_normals(road_cloud)
+            normal_method = "scattered_pca"
+        normals[road_indices] = road_normals
+        del road_cloud, road_normals, road_indices
+
         # 松散标签膨胀：使用网格邻域将松散标签传播到附近的背景点
         # 策略：对每个非 NaN 的松散点，将其周围 grid_res*2 半径内的
         # 背景（label=0）点标记为相同的松散标签
@@ -1303,6 +1936,20 @@ class SyntheticRoadDataset(_DatasetBase):
         if points.shape[0] == 0:
             raise RuntimeError("Empty point cloud after NaN filtering.")
 
+        if capture_geometry:
+            diag_mask = road_mask[valid_mask]
+            geometry_diagnostics.update({
+                "surface_points": points[diag_mask].astype(np.float64, copy=True),
+                "surface_labels": labels[diag_mask].copy(),
+                "surface_normals": normals[diag_mask].astype(np.float64, copy=True),
+                "metadata": {"normal_method": normal_method},
+            })
+            geometry_diagnostics["metadata"].update({
+                "capture_stage": "post_damage_pre_noise_metric_road_only",
+                "base_capture_stage": "after_optional_scan_before_damage",
+                "full_scene_float64_cache": True,
+            })
+
         # 6.5 几何遮挡：深窄凹陷（裂缝槽）内部点按开口半宽/深度/入射角
         # 概率丢弃——真实窄裂缝是"点缺失的线"，不是被完整采样的深沟。
         # 这是传感器可见性现象，观测体制关闭时跳过（元数据
@@ -1313,7 +1960,12 @@ class SyntheticRoadDataset(_DatasetBase):
         # 不应被观测效应删点。
         sensor_origin = self._sensor_pose()
         depression_depth = local_depression_depth(points)
-        if not observation_off:
+        # line-profiler 档同样跳过本步：遮挡模型用的是旋转 LiDAR 车载
+        # 位姿（h≈2m），与线激光头几何（0.35m）不符；线激光的可见性/
+        # 丢点由 line_profiler 模块内部的亮度耦合丢点建模，且
+        # simulate_line_profiler 需要完整网格（遮挡删点会破坏网格
+        # 完整性契约）。
+        if not observation_off and self.config.observation_model != "line-profiler":
             occl_keep = geometric_occlusion_keep_mask(
                 points, sensor_origin, depression_depth, rng
             )
@@ -1336,7 +1988,9 @@ class SyntheticRoadDataset(_DatasetBase):
         # 8. LiDAR 噪声仿真 + 9. 最近邻传递标签/特征/法向量 —— 观测体制
         # 关闭时整体跳过：没有传感器就没有测距噪声/丢点，直出点即最终点
         # （noisy_points := points），标签/特征/法向量保持直出值，不做
-        # 最近邻回传。
+        # 最近邻回传。line-profiler 档跳过 simulate_lidar_noise（那是
+        # 扫描式 LiDAR 的球坐标测距/角度噪声模型），在步骤 7.5 已对
+        # 病害后几何运行线激光剖面仿真；最近邻传递照常执行。
         if observation_off:
             noisy_points = points
             sensor_points_before_output_sampling = int(len(noisy_points))
@@ -1359,20 +2013,116 @@ class SyntheticRoadDataset(_DatasetBase):
             else:
                 sigma_r = None
 
-            noisy_points = simulate_lidar_noise(
-                points,
-                distance_noise_std=self.config.lidar_noise.distance_noise_std,
-                dropout_rate=self.config.lidar_noise.dropout_rate,
-                angular_jitter_deg=self.config.lidar_noise.angular_jitter_deg,
-                seed=int(rng.integers(0, 2 ** 31)),
-                enable_edge_mixing=self.config.lidar_noise.enable_edge_mixing,
-                mixed_pixel_prob=self.config.lidar_noise.mixed_pixel_prob,
-                curvature=pre_curvature,  # P2-3: 仅高曲率边缘点混合
-                curvature_threshold=0.5,
-                sensor_origin=sensor_origin,
-                sigma_r=sigma_r,
-                drop_weight=received_power,
-            )
+            if self.config.observation_model == "line-profiler":
+                # line-profiler 分发钩子（步骤 8 位置，替换扫描式
+                # simulate_lidar_noise）。**设计方裁定（2026-10 修复批
+                # 定稿）**：钩子对病害后的最终几何采样——设计稿早先
+                # "步骤 2.5 位置"与签名携带 labels、元数据含
+                # flyer_ratio 相互矛盾（步骤 2.5 时标签恒全零），
+                # 采样位置以本点为准；标签/强度/法向量经下方步骤 9
+                # 最近邻传递到剖面点。传感器模块
+                # roadmc.data.synthetic.line_profiler 已交付，签名固定为
+                # simulate_line_profiler(points, normals, labels, *,
+                # grid_shape, grid_res, origin_xy, cfg, rng)；存储强度
+                # 沿用 _compute_intensity 单一位姿辐射模型，模块内部的
+                # 逐剖面线激光头亮度代理仅供散斑 σ_z 与丢点（见模块
+                # docstring 裁定说明）。
+                try:
+                    from .line_profiler import (
+                        simulate_line_profiler,
+                    )
+                except ImportError:
+                    raise RuntimeError(
+                        "observation_model='line-profiler' requires the "
+                        "sensor module roadmc/data/synthetic/"
+                        "line_profiler.py (simulate_line_profiler), which "
+                        "is not installed in this build. Use "
+                        "--observation-model on/off, or install the "
+                        "line-profiler sensor module."
+                    ) from None
+                # LineProfilerConfig 唯一真源在 config.py（line_profiler.py
+                # 从 config 导入该类型、不再自带同名定义），配置对象直接
+                # 透传——无 isinstance 判断与逐字段重建桥接。
+                # 设计稿固定签名——无任何设计外 kwargs。
+                lp_result = simulate_line_profiler(
+                    points,
+                    normals,
+                    labels,
+                    grid_shape=surface_estimate.grid_shape,
+                    grid_res=grid_res,
+                    origin_xy=(0.0, 0.0),
+                    cfg=self.config.line_profiler,
+                    rng=rng,
+                )
+                noisy_points = np.asarray(lp_result.points, dtype=np.float64)
+                lp_flyer_mask = np.asarray(
+                    getattr(lp_result, "flyer_mask", np.zeros(0)),
+                    dtype=bool,
+                )
+                lp_dropout = int(getattr(lp_result, "dropout_count", 0) or 0)
+                lp_profile_index = np.asarray(
+                    getattr(lp_result, "profile_index", np.zeros(0)),
+                    dtype=np.int64,
+                )
+                n_lp_points = int(noisy_points.shape[0])
+                n_lp_flyers = int(np.count_nonzero(lp_flyer_mask))
+                n_lp_profiles = (
+                    int(lp_profile_index.max()) + 1
+                    if lp_profile_index.size and lp_profile_index.max() >= 0
+                    else 0
+                )
+                line_profiler_audit = {
+                    "profile_count": n_lp_profiles,
+                    "points_total": n_lp_points,
+                    "points_per_profile_median": (
+                        float(np.median(np.bincount(
+                            lp_profile_index, minlength=n_lp_profiles
+                        )))
+                        if n_lp_profiles and lp_profile_index.size == n_lp_points
+                        else None
+                    ),
+                    "flyer_ratio": (
+                        n_lp_flyers / n_lp_points if n_lp_points else 0.0
+                    ),
+                    "dropped_ratio": (
+                        lp_dropout / max(n_lp_points + lp_dropout, 1)
+                        if lp_dropout
+                        else 0.0
+                    ),
+                    "crack_resolvable": bool(grid_res <= 0.002),
+                }
+                if grid_res > 0.002:
+                    # 轻裂中位缝宽 1.8mm 需要点间距 ≪ 缝宽；点间距-缝宽
+                    # 耦合偏差警告依据 DOI 10.3390/s26082338。
+                    warnings.warn(
+                        f"line-profiler at grid_res={grid_res:g} m cannot "
+                        "resolve light cracks (median width 1.8 mm demands "
+                        "point spacing << crack width; point-spacing/crack-"
+                        "width coupling bias, DOI 10.3390/s26082338); "
+                        "crack_resolvable=false is recorded in the resolution "
+                        "contract.",
+                        stacklevel=2,
+                    )
+                if noisy_points.shape[0] == 0:
+                    raise RuntimeError(
+                        "All points dropped during line-profiler simulation."
+                    )
+                sensor_points_before_output_sampling = int(len(noisy_points))
+            else:
+                noisy_points = simulate_lidar_noise(
+                    points,
+                    distance_noise_std=self.config.lidar_noise.distance_noise_std,
+                    dropout_rate=self.config.lidar_noise.dropout_rate,
+                    angular_jitter_deg=self.config.lidar_noise.angular_jitter_deg,
+                    seed=int(rng.integers(0, 2 ** 31)),
+                    enable_edge_mixing=self.config.lidar_noise.enable_edge_mixing,
+                    mixed_pixel_prob=self.config.lidar_noise.mixed_pixel_prob,
+                    curvature=pre_curvature,  # P2-3: 仅高曲率边缘点混合
+                    curvature_threshold=0.5,
+                    sensor_origin=sensor_origin,
+                    sigma_r=sigma_r,
+                    drop_weight=received_power,
+                )
 
             if noisy_points.shape[0] == 0:
                 raise RuntimeError("All points dropped during LiDAR noise simulation.")
@@ -1426,6 +2176,19 @@ class SyntheticRoadDataset(_DatasetBase):
             intensity_final = intensity
             normals_final = normals
             sensor_output_sampling_method = "none_full_surface"
+            protection_info["protection_available"] = True
+        elif self.config.observation_model == "line-profiler":
+            # line-profiler 档：输出即剖面点云本身——固定点数随机抽稀会
+            # 打断剖面相邻性（横向 1mm 剖面结构是本档位的产出物语义），
+            # 故跳过输出采样、保留全部剖面点（retain-all 语义）；
+            # num_points/target_density 被忽略并以 ignored_under_line_profiler
+            # 记录在元数据（与 observation off 的忽略记录同型）。
+            points_final = noisy_points
+            labels_final = labels
+            intensity_final = intensity
+            curvature_final = curvature
+            normals_final = normals
+            sensor_output_sampling_method = "none_line_profiler_retain"
             protection_info["protection_available"] = True
         elif self.config.retain_all_surface_points:
             # Raw-surface mode: keep every point that survived the sensor
@@ -1505,6 +2268,21 @@ class SyntheticRoadDataset(_DatasetBase):
                 pending_scene
             )
         resolution_metadata["surface_grid"]["curvature_method"] = curvature_method
+        resolution_metadata["surface_grid"].update({
+            "normal_method": normal_method,
+            "lane_layout": lane_layout,
+            "patch_label_policy": "labels_20_37_override_existing; otherwise_label_priority",
+            "surface_layers": {
+                "enabled": bool(self.config.surface_layers),
+                "surface_seed": surface_seed if self.config.surface_layers else None,
+                "macro_seed": surface_tile.metadata["macro_seed"] if surface_tile else None,
+                "texture_seed": surface_tile.metadata["texture_seed"] if surface_tile else None,
+                "am_seed": am_layer_seed,
+                "am_applies_to": "texture" if surface_tile and self.config.am_envelope.enable else (
+                    "whole_surface" if am_audit is not None else None
+                ),
+            },
+        })
         resolution_metadata["sensor_output"].update(
             {
                 "scan_pattern_points": scan_pattern_points,
@@ -1540,6 +2318,21 @@ class SyntheticRoadDataset(_DatasetBase):
             )
             if scan_override is not None:
                 resolution_metadata["sensor_output"]["scan_override"] = scan_override
+        if self.config.observation_model == "line-profiler":
+            resolution_metadata["sensor_output"].update(
+                {
+                    # 剖面点云即产出物：输出采样被跳过，请求的点数/密度
+                    # 规格仍记录在上游字段中，此处标记忽略（与
+                    # observation off 的 ignored_under_observation_off 同型）。
+                    "ignored_under_line_profiler": True,
+                    "pipeline_steps_skipped": [
+                        "scan_resample",
+                        "geometric_occlusion",
+                        "lidar_noise",
+                        "output_sampling",
+                    ],
+                }
+            )
         resolution_metadata["sensor_output"]["sensor_pose_m"] = [
             float(v) for v in sensor_origin
         ]
@@ -1562,6 +2355,52 @@ class SyntheticRoadDataset(_DatasetBase):
                 target_output_points / max(len(labels_final), 1)
             )
         resolution_metadata["sensor_output"]["target_label_protection"] = protection_info
+        # 场景级回填：逐场景实际抽取的 MPD / 有效纹理 RMS / AM 实测
+        # 边际矩 / 因果链维度（config 层已写入规格与 provenance）。
+        if mpd_audit is not None:
+            resolution_metadata["surface_grid"]["texture_spectrum"].update(
+                {
+                    "mpd_drawn_m": mpd_audit["mpd_drawn_m"],
+                    "mpd_target_m": mpd_audit["mpd_target_m"],
+                    "mpd_target_m_overridden": mpd_audit["mpd_target_m_overridden"],
+                    "mpd_rms_ratio": mpd_audit["mpd_rms_ratio"],
+                    "texture_rms_effective_m": mpd_audit[
+                        "texture_rms_effective_m"
+                    ],
+                }
+            )
+        if am_audit is not None:
+            resolution_metadata["surface_grid"]["am_envelope"].update(
+                {
+                    "measured_skew": am_audit["measured_skew"],
+                    "measured_kurt": am_audit["measured_kurt"],
+                }
+            )
+        if line_profiler_audit is not None:
+            lp_block = resolution_metadata["sensor_output"].get("line_profiler")
+            if lp_block is None:
+                lp_block = {}
+                resolution_metadata["sensor_output"]["line_profiler"] = lp_block
+            lp_block.update(line_profiler_audit)
+        if base_record is not None:
+            resolution_metadata["base_condition"].update(
+                {
+                    "snp": base_record["snp"],
+                    "age_years": base_record["age_years"],
+                    "ye4_msa": base_record["ye4_msa"],
+                    "cds": base_record["cds"],
+                    "crt_years": base_record["crt_years"],
+                    "ica_years": base_record["ica_years"],
+                    "tpm_source": base_record.get("tpm_source"),
+                    "hdm4_source": base_record.get("hdm4_source"),
+                    "coefficients_provenance": base_record[
+                        "coefficients_provenance"
+                    ],
+                    "disease_prob_scale_factors": base_record.get(
+                        "_scale_factors", {}
+                    ),
+                }
+            )
         resolution_metadata["physical_coordinates"] = {
             "unit": "m",
             "bounds_min_m": physical_bounds_min_m.tolist(),
@@ -1570,7 +2409,7 @@ class SyntheticRoadDataset(_DatasetBase):
             "normalization_is_reversible": True,
         }
 
-        return {
+        result = {
             "points": points_final,
             "labels": labels_final.astype(np.int64),
             "feats": feats,
@@ -1603,6 +2442,14 @@ class SyntheticRoadDataset(_DatasetBase):
                 else int(self.config.model_target_points)
             ),
         }
+        if capture_geometry:
+            geometry_diagnostics["metadata"] = {
+                **geometry_diagnostics.get("metadata", {}),
+                "lane_layout": lane_layout,
+                "patch_label_policy": "labels_20_37_override_existing; otherwise_label_priority",
+            }
+            result["geometry_diagnostics"] = geometry_diagnostics
+        return result
 
     # ------------------------------------------------------------------
     # 分段条带运行时（observation_model='off'）
@@ -1615,6 +2462,8 @@ class SyntheticRoadDataset(_DatasetBase):
         target_label: int | None,
         surface_estimate,
         rng: np.random.Generator,
+        *,
+        capture_geometry: bool = False,
     ) -> dict:
         """observation_model='off' 的分段条带运行时。
 
@@ -1632,7 +2481,19 @@ class SyntheticRoadDataset(_DatasetBase):
         grid_res = config.road.grid_res
         width = config.road.width
         length = config.road.length
+        lane_layout = _lane_layout(width, config.rutting.wheel_separation)
         nx, ny_total = surface_estimate.grid_shape
+        if config.am_envelope.enable:
+            # 分段+AM：整条带一次施加需要改造分段装配（AM 的保秩 CDF
+            # 变换必须在整条带上做，逐段施加会缝不一致），本批未实现
+            # ——显式拒绝而不是静默走单块路径（与分段/观测管线同策略）。
+            raise NotImplementedError(
+                "am_envelope.enable=True is not supported on the segmented "
+                "strip path in this build (the rank-preserving CDF transform "
+                "must run over the whole strip; per-segment application would "
+                "be seam-inconsistent). Disable the AM envelope or use the "
+                "single-block path."
+            )
 
         # 1. 路面类型（与单块路径同一 rng 消耗顺序）
         pavement_type = (
@@ -1650,16 +2511,68 @@ class SyntheticRoadDataset(_DatasetBase):
         else:
             roughness_actual = config.road.roughness_class
 
+        # 1.75 因果链抽取（与单块路径同一 rng 消耗顺序；受控场景绕过）。
+        base_record: dict | None = None
+        disease_probs_effective: dict | None = None
+        if config.base_condition.enable and target_spec is None:
+            tpm_cache = None
+            if config.base_condition.tpm_path:
+                tpm_cache = _load_tpm(config.base_condition.tpm_path)
+            base_record = _sample_base_condition(
+                rng, config.base_condition, tpm_cache
+            )
+            disease_probs_effective, scale_factors = _modulate_disease_probs(
+                dict(config.disease.disease_probs), base_record
+            )
+            base_record["_scale_factors"] = scale_factors
+
+        # 1.9 two-segment MPD 抽取（与单块路径同一 rng 消耗顺序）。
+        texture_rms_eff = config.micro_texture.amplitude
+        mpd_audit: dict | None = None
+        if config.road.macro_spectrum_mode == "two-segment":
+            texture_rms_eff, mpd_audit = _draw_mpd_target_m(
+                rng, config.micro_texture, pavement_type
+            )
+
         # 2. 表面种子（位置与单块路径一致；宏观/纹理随机流从它派生，
         #    不消耗主 rng）
         surface_seed = int(rng.integers(0, 2 ** 31))
 
-        # 3. 病害选择（与单块路径一致）
+        # 3. 病害选择（与单块路径一致；因果链调制/硬规则同口径——
+        # 受控场景绕过）
         if target_spec is None:
-            diseases = self._select_diseases(rng, pavement_type)
+            diseases = self._select_diseases(
+                rng, pavement_type, disease_probs_override=disease_probs_effective
+            )
         else:
             diseases = [(target_spec.disease_type, target_spec.severity)]
         diseases.sort(key=lambda d: DISEASE_APPLY_ORDER.get(d[0], 99))
+        # 因果链硬规则（与单块路径同口径）：ICA 结构性过滤（变体预抽）
+        # + 重松散 ⇒（有裂缝 ∨ snp ≤ 下四分位）。
+        concrete_variant_drawn: str | None = None
+        if base_record is not None:
+            for d in diseases:
+                if d[0] == "concrete_damage":
+                    concrete_variant_drawn = str(
+                        rng.choice(CONCRETE_DAMAGE_TYPES)
+                    )
+                    break
+            crack_history_early = any(d[0] == "crack" for d in diseases)
+            snp_lo, _snp_hi = config.base_condition.snp_range
+            snp_q1 = snp_lo + 0.25 * (_snp_hi - snp_lo)
+            diseases = [
+                d for d in diseases
+                if not _ica_blocks_structural_crack(
+                    base_record, d[0], concrete_variant_drawn
+                )
+                and not (
+                    d[0] == "raveling"
+                    and d[1] == "severe"
+                    and not (
+                        crack_history_early or base_record["snp"] <= snp_q1
+                    )
+                )
+            ]
 
         raveling_entry = None
         non_raveling_diseases = []
@@ -1668,6 +2581,24 @@ class SyntheticRoadDataset(_DatasetBase):
                 raveling_entry = d
             else:
                 non_raveling_diseases.append(d)
+
+        has_crack_history = any(d[0] == "crack" for d in diseases)
+        if base_record is not None:
+            cooccur_p = (
+                config.base_condition.pothole_cooccur_base
+                * float(np.clip(base_record["age_years"] / base_record["ica_years"] - 1.0, 0.0, 1.0))
+                + 0.5 * config.base_condition.pothole_cooccur_base
+            )
+            pothole_allowed = has_crack_history or (
+                base_record["age_years"] >= base_record["ica_years"]
+            )
+            non_raveling_diseases = [
+                d for d in non_raveling_diseases
+                if d[0] != "patching" or has_crack_history
+            ]
+        else:
+            cooccur_p = 0.5
+            pothole_allowed = True
 
         planned_crack_type: str | None = None
         if any(d[0] == "crack" for d in non_raveling_diseases):
@@ -1679,10 +2610,14 @@ class SyntheticRoadDataset(_DatasetBase):
         alligator_region: tuple[float, float] | None = None
         if planned_crack_type in ("alligator", "block"):
             alligator_region = (
-                self._sample_wheelpath_x(rng, width),
+                self._sample_wheelpath_x(rng, width, lane_layout),
                 float(rng.uniform(0.8, max(length - 0.8, 0.9))),
             )
-        pothole_cooccurs = alligator_region is not None and rng.random() < 0.5
+        pothole_cooccurs = (
+            alligator_region is not None
+            and pothole_allowed
+            and rng.random() < cooccur_p
+        )
 
         # 4. 病害计划：主 rng 消耗顺序与单块循环一致；需要跨段一致的
         #    内部抽取用 default_rng(seed) 在计划里预抽并经 params 传入
@@ -1722,11 +2657,15 @@ class SyntheticRoadDataset(_DatasetBase):
                         "width_truncation": config.crack.width_truncation,
                         "area_lambda_mode": config.crack.area_lambda_mode,
                         "area_label_mode": config.crack.area_label_mode,
+                        # 过渡带口径（与单块路径同键）
+                        "profile_exponent": config.crack.profile_exponent,
+                        "edge_band_width_m": config.crack.edge_band_width_m,
+                        "edge_band_depth_ratio": config.crack.edge_band_depth_ratio,
                     }
                 )
                 pending_scene.update(_pending_params_keys(add_crack, params))
                 if crack_type == "longitudinal":
-                    x_center = self._sample_wheelpath_x(rng, width) + float(
+                    x_center = self._sample_wheelpath_x(rng, width, lane_layout) + float(
                         rng.normal(0.0, 0.15)
                     )
                     params["x_center"] = x_center
@@ -1809,7 +2748,7 @@ class SyntheticRoadDataset(_DatasetBase):
                         rng.normal(alligator_region[1], 0.6), 0.5, length - 0.5
                     ))
                 else:
-                    cx = self._sample_wheelpath_x(rng, width)
+                    cx = self._sample_wheelpath_x(rng, width, lane_layout)
                     cy = float(rng.uniform(0.5, length - 0.5))
                 radius, depth = _sample_pothole_geometry(rng, config.pothole, severity)
                 edge_quality = float(rng.uniform(0.5, 1.0))
@@ -1831,6 +2770,8 @@ class SyntheticRoadDataset(_DatasetBase):
                 params["micropit_rate"] = config.pothole.micropit_rate
                 params["micropit_mode"] = config.pothole.micropit_mode
                 params["spall_band"] = tuple(config.pothole.spall_band)
+                # 过渡带口径（与单块路径同键）
+                params["spall_profile"] = config.pothole.spall_profile
                 pending_scene.update(_pending_params_keys(add_pothole, params))
 
             elif disease_type == "depression":
@@ -1849,10 +2790,9 @@ class SyntheticRoadDataset(_DatasetBase):
                 entry["label_radius_mode"] = config.depression.label_radius_mode
 
             elif disease_type == "rutting":
-                # 车辙中心走轮迹带先验（与单块路径同口径、同 rng 消耗
-                # 顺序：先中心后深度）；'fixed' = 历史恒位于道路中线。
+                # Same deterministic pair center as the single-block path.
                 if config.rutting.center_mode == "wheelpath":
-                    center_line = self._sample_wheelpath_x(rng, width)
+                    center_line = float(lane_layout["center"])
                 else:
                     center_line = width / 2.0
                 if severity == "light":
@@ -1902,7 +2842,8 @@ class SyntheticRoadDataset(_DatasetBase):
                     # 斑块口径：与单块路径同 helper、同 rng 消耗顺序；
                     # 掩码在施加阶段按坐标确定性散列构建（云无关）。
                     entry["patch"] = _bleeding_patch_params(
-                        rng, config.bleeding, width, length, salt=seed
+                        rng, config.bleeding, width, length, salt=seed,
+                        layout=lane_layout,
                     )
                 else:
                     # legacy-strip：恒定 40% 面积、贯穿全路长的竖直条带。
@@ -1921,7 +2862,13 @@ class SyntheticRoadDataset(_DatasetBase):
                     target_spec.variant
                     if target_spec is not None
                     and target_spec.disease_type == "concrete_damage"
-                    else str(rng.choice(CONCRETE_DAMAGE_TYPES))
+                    else (
+                        # 因果链 enable 时变体已在 ICA 过滤处预抽（同一
+                        # 抽取复用，rng 消耗不增）。
+                        concrete_variant_drawn
+                        if concrete_variant_drawn is not None
+                        else str(rng.choice(CONCRETE_DAMAGE_TYPES))
+                    )
                 )
                 entry["damage_type"] = damage_type_c
                 if damage_type_c == "patching":
@@ -1949,6 +2896,8 @@ class SyntheticRoadDataset(_DatasetBase):
                             "fault_scope": config.concrete_damage.fault_scope,
                             "edge_spall_mode": config.concrete_damage.edge_spall_mode,
                             "shatter_mode": config.concrete_damage.shatter_mode,
+                            # 过渡带口径（与单块路径同键）
+                            "fault_fillet_m": config.concrete_damage.fault_fillet_m,
                         }
                     )
                     pending_scene.update(
@@ -2088,17 +3037,36 @@ class SyntheticRoadDataset(_DatasetBase):
             )
 
         # 6. 宏观粗网格（全局一次）+ 修补参考面回填
+        if (
+            config.road.macro_spectrum_mode == "two-segment"
+            and not _primitive_supports_mode_value(
+                synthesize_strip_macro_band, "macro_spectrum_mode", "two-segment"
+            )
+        ):
+            raise NotImplementedError(
+                "macro_spectrum_mode='two-segment' requires the primitives-side "
+                "two-segment PSD batch, which is not merged into primitives.py "
+                "in this build yet. Roll back with --macro-spectrum iso-marginal "
+                "(or legacy)."
+            )
         macro_extra, macro_pending = _filter_unsupported_kwargs(
             synthesize_strip_macro_band,
             {"macro_spectrum_mode": config.road.macro_spectrum_mode},
         )
         pending_scene.update(macro_pending)
+        macro_layer_seed = texture_layer_seed = None
+        if config.surface_layers:
+            macro_ss, texture_ss = np.random.SeedSequence(surface_seed).spawn(2)
+            macro_layer_seed = int(macro_ss.generate_state(1, dtype=np.uint32)[0])
+            texture_layer_seed = int(texture_ss.generate_state(1, dtype=np.uint32)[0])
         macro_band = synthesize_strip_macro_band(
             width,
             length,
             grid_res,
             roughness_actual,
-            np.random.default_rng(surface_seed),
+            np.random.default_rng(
+                macro_layer_seed if macro_layer_seed is not None else surface_seed
+            ),
             macro_grid_factor=config.strip.macro_grid_factor,
             **macro_extra,
         )
@@ -2192,8 +3160,13 @@ class SyntheticRoadDataset(_DatasetBase):
                 "macro_spectrum_mode": config.road.macro_spectrum_mode,
                 "grid_convention": config.micro_texture.grid_convention,
                 "het_field": config.micro_texture.het_field,
+                "texture_h_macro": config.micro_texture.h_macro,
+                "texture_h_micro": config.micro_texture.h_micro,
+                "texture_break_wavelength_m": config.micro_texture.break_wavelength_m,
             },
-            moot_keys=_surface_moot_keys(config.micro_texture),
+            moot_keys=_surface_moot_keys(
+                config.micro_texture, config.road.macro_spectrum_mode
+            ),
         )
         pending_scene.update(strip_pending)
         strip_gen = generate_strip_surface(
@@ -2204,7 +3177,7 @@ class SyntheticRoadDataset(_DatasetBase):
             surface_seed,
             segment_bounds=segment_bounds,
             blend_band_rows=m_rows,
-            texture_rms=config.micro_texture.amplitude,
+            texture_rms=texture_rms_eff,
             texture_hurst=config.micro_texture.hurst,
             crossfall=config.road.crossfall,
             crossfall_shape=config.road.crossfall_shape,
@@ -2213,6 +3186,9 @@ class SyntheticRoadDataset(_DatasetBase):
             texture_het_corr_len_m=config.micro_texture.het_corr_len_m,
             macro_grid_factor=config.strip.macro_grid_factor,
             macro_band=macro_band,
+            return_layers=config.surface_layers,
+            macro_seed=macro_layer_seed,
+            texture_seed=texture_layer_seed,
             **strip_extra,
         )
         speckle_rng = np.random.default_rng(speckle_seed)
@@ -2220,6 +3196,13 @@ class SyntheticRoadDataset(_DatasetBase):
 
         offset = 0
         seg_layout = []
+        captured_base: list[np.ndarray] = []
+        captured_surface: list[np.ndarray] = []
+        captured_surface_labels: list[np.ndarray] = []
+        captured_surface_normals: list[np.ndarray] = []
+        captured_tile_design: list[np.ndarray] = []
+        captured_tile_roughness: list[np.ndarray] = []
+        captured_tile_texture: list[np.ndarray] = []
         if config.lidar_scan.enable:
             warnings.warn(
                 "observation_model='off': skipping LiDAR scan-line resampling; "
@@ -2227,10 +3210,12 @@ class SyntheticRoadDataset(_DatasetBase):
                 stacklevel=2,
             )
         for _k, (y0o, y1o, y0e, y1e) in enumerate(segment_bounds):
+            strip_result = next(strip_gen)
             (
                 _sk, _y0e, _y1e, _y0o, _y1o,
                 xg, ye, z_ext, nrm_ext,
-            ) = next(strip_gen)
+            ) = strip_result[:9]
+            layer_map = strip_result[9] if config.surface_layers else None
             # y-major 布局（y 行在外、x 列在内）：row_idx = repeat 语义、
             # 装配块按 y 升序（特征 halo 的 searchsorted 依赖）都以它为准。
             Ym, Xm = np.meshgrid(ye, xg, indexing="ij")
@@ -2240,6 +3225,14 @@ class SyntheticRoadDataset(_DatasetBase):
             nrm = nrm_ext.transpose(1, 0, 2).reshape(-1, 3)
             labels = np.zeros(pts.shape[0], dtype=np.int64)
             row_idx = np.repeat(np.arange(y0e, y1e, dtype=np.int64), nx)
+            if capture_geometry:
+                owned_slice = (row_idx >= y0o) & (row_idx < y1o)
+                captured_base.append(pts[owned_slice].astype(np.float64, copy=True))
+                if layer_map is not None:
+                    own_y = slice(y0o - y0e, y1o - y0e)
+                    captured_tile_design.append(layer_map["design"][:, own_y].copy())
+                    captured_tile_roughness.append(layer_map["roughness"][:, own_y].copy())
+                    captured_tile_texture.append(layer_map["texture"][:, own_y].copy())
 
             # 病害施加（计划顺序）+ 标签优先级合并（与单块路径同逻辑；
             # 计划参数保证云无关 ⇒ 缝两侧逐位一致）
@@ -2312,17 +3305,7 @@ class SyntheticRoadDataset(_DatasetBase):
                         **entry["args"],
                     )
 
-                changed_mask = labels != old_labels
-                if np.any(changed_mask):
-                    max_label = max(LABEL_PRIORITY.keys()) + 1
-                    priority_lut = np.zeros(max_label, dtype=np.int32)
-                    for kk, vv in LABEL_PRIORITY.items():
-                        priority_lut[kk] = vv
-                    old_prio = priority_lut[old_labels[changed_mask]]
-                    new_prio = priority_lut[labels[changed_mask]]
-                    restore = old_prio > new_prio
-                    changed_indices = np.where(changed_mask)[0]
-                    labels[changed_indices[restore]] = old_labels[changed_indices[restore]]
+                labels = _merge_damage_labels(old_labels, labels)
 
             # 缘石并入（拥有行；几何确定性零 rng）
             if config.curb.width_m > 0:
@@ -2374,6 +3357,13 @@ class SyntheticRoadDataset(_DatasetBase):
                     params=raveling_plan["params"],
                 )
 
+            # Final road geometry after raveling, before dropout filtering.
+            n_road_current = int(np.count_nonzero(road_mask))
+            nrm[:n_road_current] = estimate_surface_normals(
+                pts[:n_road_current], grid_shape=(nx, len(ye)),
+                grid_spacing_m=grid_res, grid_order="yx",
+            )
+
             # 松散标签膨胀 + NaN 过滤（与单块路径同逻辑，halo 供 KDTree）
             raveling_labels_mask = (labels == 11) | (labels == 12)
             valid_mask = ~np.any(np.isnan(pts), axis=1)
@@ -2418,6 +3408,10 @@ class SyntheticRoadDataset(_DatasetBase):
             owned_curb = ~road_mask_v
             n_own = int(np.count_nonzero(owned_road))
             n_curb = int(np.count_nonzero(owned_curb))
+            if capture_geometry and n_own:
+                captured_surface.append(pts_v[owned_road].astype(np.float64, copy=True))
+                captured_surface_labels.append(labels_v[owned_road].copy())
+                captured_surface_normals.append(nrm_v[owned_road].astype(np.float64, copy=True))
             road_start = offset
             asm_points[road_start:road_start + n_own] = pts_v[owned_road].astype(np.float32)
             asm_normals[road_start:road_start + n_own] = nrm_v[owned_road].astype(np.float32)
@@ -2582,7 +3576,53 @@ class SyntheticRoadDataset(_DatasetBase):
             resolution_metadata["pending_primitive_upgrades"] = sorted(
                 pending_scene
             )
+        # 场景级回填（与单块路径同键同值语义）：MPD / AM 实测矩 /
+        # 因果链维度。
+        if mpd_audit is not None:
+            resolution_metadata["surface_grid"]["texture_spectrum"].update(
+                {
+                    "mpd_drawn_m": mpd_audit["mpd_drawn_m"],
+                    "mpd_target_m": mpd_audit["mpd_target_m"],
+                    "mpd_target_m_overridden": mpd_audit["mpd_target_m_overridden"],
+                    "mpd_rms_ratio": mpd_audit["mpd_rms_ratio"],
+                    "texture_rms_effective_m": mpd_audit[
+                        "texture_rms_effective_m"
+                    ],
+                }
+            )
+        if base_record is not None:
+            resolution_metadata["base_condition"].update(
+                {
+                    "snp": base_record["snp"],
+                    "age_years": base_record["age_years"],
+                    "ye4_msa": base_record["ye4_msa"],
+                    "cds": base_record["cds"],
+                    "crt_years": base_record["crt_years"],
+                    "ica_years": base_record["ica_years"],
+                    "tpm_source": base_record.get("tpm_source"),
+                    "hdm4_source": base_record.get("hdm4_source"),
+                    "coefficients_provenance": base_record[
+                        "coefficients_provenance"
+                    ],
+                    "disease_prob_scale_factors": base_record.get(
+                        "_scale_factors", {}
+                    ),
+                }
+            )
         resolution_metadata["surface_grid"]["curvature_method"] = "skipped_observation_off"
+        resolution_metadata["surface_grid"].update({
+            "normal_method": "regular_grid_finite_difference",
+            "lane_layout": lane_layout,
+            "patch_label_policy": "labels_20_37_override_existing; otherwise_label_priority",
+            "surface_layers": {
+                "enabled": bool(config.surface_layers),
+                "surface_seed": surface_seed if config.surface_layers else None,
+                "macro_seed": macro_layer_seed,
+                "texture_seed": texture_layer_seed,
+                "am_seed": None,
+                "am_applies_to": None,
+            },
+        })
         resolution_metadata["sensor_output"].update(
             {
                 "mode": "full_surface_observation_off",
@@ -2638,7 +3678,7 @@ class SyntheticRoadDataset(_DatasetBase):
             "normalization_is_reversible": True,
         }
 
-        return {
+        result = {
             "points": asm_points,
             "labels": asm_labels.astype(np.int64),
             "feats": asm_feats,
@@ -2668,6 +3708,73 @@ class SyntheticRoadDataset(_DatasetBase):
                 else int(config.model_target_points)
             ),
         }
+        if capture_geometry:
+            result["geometry_diagnostics"] = {
+                "base_points": np.concatenate(captured_base, axis=0).astype(np.float64, copy=False) if captured_base else np.empty((0, 3), dtype=np.float64),
+                "surface_points": np.concatenate(captured_surface, axis=0).astype(np.float64, copy=False) if captured_surface else np.empty((0, 3), dtype=np.float64),
+                "surface_labels": np.concatenate(captured_surface_labels) if captured_surface_labels else np.empty(0, dtype=np.int64),
+                "surface_normals": np.concatenate(captured_surface_normals, axis=0).astype(np.float64, copy=False) if captured_surface_normals else np.empty((0, 3), dtype=np.float64),
+                "metadata": {
+                    "normal_method": "regular_grid_finite_difference",
+                    "capture_stage": "post_damage_pre_noise_metric_road_only",
+                    "base_capture_stage": "before_damage_observation_off",
+                    "full_scene_float64_cache": True,
+                    "lane_layout": lane_layout,
+                    "patch_label_policy": "labels_20_37_override_existing; otherwise_label_priority",
+                },
+            }
+            if config.surface_layers and captured_tile_design:
+                geometry = result["geometry_diagnostics"]
+                frozen_tile = SurfaceTile(
+                    np.arange(nx, dtype=np.float64) * grid_res,
+                    np.arange(ny_total, dtype=np.float64) * grid_res,
+                    np.concatenate(captured_tile_design, axis=1),
+                    np.concatenate(captured_tile_roughness, axis=1),
+                    np.concatenate(captured_tile_texture, axis=1),
+                    {
+                        "units": "m", "layout": "x-major",
+                        "surface_seed": surface_seed,
+                        "macro_seed": macro_layer_seed,
+                        "texture_seed": texture_layer_seed,
+                        "macro_spectrum_mode": config.road.macro_spectrum_mode,
+                        "segment_count": len(segment_bounds),
+                        "owned_rows_only": True,
+                        "texture_blend": "existing RRC overlap, applied before layer capture",
+                        "spectral_parameters": {
+                            "roughness_class": roughness_actual,
+                            "texture_rms_m": texture_rms_eff,
+                            "texture_hurst": config.micro_texture.hurst,
+                            "texture_h_macro": config.micro_texture.h_macro,
+                            "texture_h_micro": config.micro_texture.h_micro,
+                            "break_wavelength_m": config.micro_texture.break_wavelength_m,
+                            "grid_spacing_m": grid_res,
+                            "taper_policy": "half-octave cosine overlap at ISO band edge",
+                            "legacy_rescaling": "per-strip texture RMS; macro cross-grid RMS normalization",
+                        },
+                        "design_parameters": {
+                            "crossfall": config.road.crossfall,
+                            "crossfall_shape": config.road.crossfall_shape,
+                            "longitudinal_grade": config.road.longitudinal_grade,
+                        },
+                        "texture_heterogeneity": {
+                            "sigma_ln": config.micro_texture.het_sigma_ln,
+                            "corr_len_m": config.micro_texture.het_corr_len_m,
+                            "field": config.micro_texture.het_field,
+                        },
+                        "am_envelope": {
+                            "enabled": False,
+                            "reason": "segmented path continues to reject AM",
+                        },
+                    },
+                )
+                geometry["surface_tile"] = {
+                    "x": frozen_tile.x, "y": frozen_tile.y,
+                    "design_m": frozen_tile.design,
+                    "roughness_m": frozen_tile.roughness,
+                    "texture_m": frozen_tile.texture,
+                    "metadata": frozen_tile.metadata,
+                }
+        return result
 
     @staticmethod
     def _strip_received_power(
@@ -2734,8 +3841,14 @@ class SyntheticRoadDataset(_DatasetBase):
         self,
         rng: np.random.Generator,
         pavement_type: str,
+        disease_probs_override: dict[str, float] | None = None,
     ) -> list[tuple[str, str]]:
         """根据路面类型和配置概率随机选择病害组合。
+
+        ``disease_probs_override``（因果链 π 调制概率）非 None 时取
+        代 ``disease.disease_probs`` 的字面值——enable 时出现概率被
+        TPM occupancy 分布调制，缩放因子落元数据（见
+        _modulate_disease_probs）。
 
         ``sampling_mode='bernoulli'``（默认）：按 ``disease_probs`` 逐
         病害独立伯努利抽样——概率即文档声明的『出现概率』语义，期望
@@ -2747,7 +3860,11 @@ class SyntheticRoadDataset(_DatasetBase):
         ``use_stratified=False`` 仍强制伯努利（旧 --no-stratified 语义，
         已弃用）。
         """
-        disease_probs = self.config.disease.disease_probs
+        disease_probs = (
+            disease_probs_override
+            if disease_probs_override is not None
+            else self.config.disease.disease_probs
+        )
         max_diseases = self.config.disease.max_diseases_per_scene
         severity_ratio = self.config.disease.severity_ratio
         sampling_mode = self.config.disease.sampling_mode
@@ -2856,6 +3973,13 @@ class SyntheticRoadDataset(_DatasetBase):
             "angle_rad": angle_rad,
             "elevation": elevation,
             "edge_width": cfg.edge_width,
+            # 过渡带口径（设计稿 transition_design）：'smoothstep' =
+            # 现行行为（静默），'step-fillet' = 尖锐阶跃 + 小圆角
+            # （导入错台实测口径，DOI 10.3390/s18010044）。
+            "params": {
+                "edge_profile": cfg.edge_profile,
+                "edge_fillet_m": cfg.edge_fillet_m,
+            },
         }
 
     # 委托到模块级实现：病害几何采样助手（_bleeding_patch_params 等）

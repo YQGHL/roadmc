@@ -8,7 +8,7 @@ when comparing a real scan with a physics-generated RoadMC scene.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -28,6 +28,9 @@ class RoadPointCloudMetadata:
     coordinate_units: str = "m"
     intensity_scale: str = "normalized_0_1"
     road_segment_id: str | None = None
+    material_id: str | None = None
+    coordinate_origin: tuple[float, float, float] | None = None
+    sensor_metadata: dict[str, Any] = field(default_factory=dict)
     capture_date: str | None = None
     source_dataset: str | None = None
     coordinate_reference_system: str | None = None
