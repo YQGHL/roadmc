@@ -2446,7 +2446,7 @@ def add_raveling(
 
     轻 (标签 11)：移除比例 ~5%，侵蚀 ~N(0.5d, 0.3d) 截断 [0, 1.5d]，d=2mm
     重 (标签 12)：移除比例 ~20%，侵蚀 ~N(0.5d, 0.3d) 截断 [0, 1.5d]，d=5mm
-    （实测重度侵蚀均值 ≈2.5mm；d 与移除比例由
+    （上述数值均为未标定工程假设，2.5mm只是参数0.5d；d 与移除比例由
     ``RavelingConfig`` 经 params 覆盖键下发，默认值 = 历史硬编码）
 
     可改进点#1: 增加 ``remove_nan`` 参数，为 True 时在返回前自动过滤 NaN
@@ -2713,9 +2713,8 @@ def add_rutting(
 
     pts[:, 2] -= rut_depth
 
-    # 标签边界必须几何可观测：绝对阈值 ≥2mm（5% 相对阈值在浅车辙处会低于
-    # 传感器噪声）。40mm 上限处 max(2mm, 5%·d)=2mm=5%·d —— 与旧相对阈值
-    # 在该点等价；标注带宽随深度变化是物理事实（浅车辙标注带更宽）。
+    # 工程标签阈值 max(2mm, 5%·d)，不代表设备实测可辨识极限。
+    # 固定绝对阈值下，较浅车辙的标注支撑通常较窄；须另做采样/噪声诊断。
     affected = rut_depth > max(0.002, depth * 0.05)
     lbl[affected] = label_val
 
@@ -2882,8 +2881,9 @@ def add_patching(
     # 修补边缘过渡剖面（设计稿 transition_design）：
     # 'smoothstep'（默认，现行行为——edge_width 内三次 smoothstep 混合）；
     # 'step-fillet'——尖锐阶跃 + 小圆角（transition width = edge_fillet_m），
-    # 贴近实测接缝错台 1–5.1mm 局部阶跃口径（DOI 10.3390/s18010044、
-    # DOI 10.1061/9780784413586.048，导入而非自校准）。
+    # 两种剖面均是工程假设；接缝错台研究不能直接标定沥青修补边缘形状。
+    # 历史引用DOI 10.3390/s18010044、10.1061/9780784413586.048
+    # 本轮未核验全文，不能据此声称圆角剖面或参数已获得实测支持。
     edge_profile = (
         "smoothstep" if params is None else params.get("edge_profile", "smoothstep")
     )
@@ -2936,8 +2936,7 @@ def add_patching(
 
     if edge_profile == "step-fillet":
         # 尖锐阶跃 + 小圆角：过渡宽度 = edge_fillet_m，剖面为四分之一圆弧
-        # （外侧与路面相切，内侧在阶跃顶竖直相切）——比 smoothstep 更贴近
-        # 实测局部错台阶跃。
+        # （外侧与路面相切，内侧在阶跃顶竖直相切），形状适用性待实测检验。
         trans_width = edge_fillet_m
         support = signed_distance <= trans_width
         t = np.clip(

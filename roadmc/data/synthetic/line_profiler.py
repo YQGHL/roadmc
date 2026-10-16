@@ -1,73 +1,28 @@
-"""线激光剖面仪（line profiler）传感器仿真 —— ``--observation-model line-profiler``。
+"""Height-field line-profiler resampling with an uncalibrated noise model.
 
-**设计方裁定（2026-10 修复批，取代设计稿两处字面表述）**：
+The implementation bilinearly resamples a single-valued road grid at fixed
+transverse/longitudinal spacing. Missing nearest source cells remain missing;
+labels use nearest XY support and normals interpolate the latent surface.
+This is not calibrated laser/camera ray tracing: there is no beam footprint,
+self-occlusion calculation, optical triangulation or motion reconstruction.
+``laser_incidence_deg`` affects the heuristic noise multiplier, not sample XY.
 
-1. **采样位置**：本模块在生成管线**步骤 8 位置**被调用（替换扫描式
-   ``simulate_lidar_noise``），对**病害施加后**的最终几何采样——设计稿
-   sensor_contract 早先写"在步骤 2.5 位置跑"与同一合同要求的
-   ``labels`` 入参 / ``flyer_ratio`` 元数据自相矛盾（步骤 2.5 时标签恒为
-   全零），按"对病害后几何采样"裁定并在此定稿。步骤 2.5 的旋转 LiDAR
-   扫描重采样在本档位下被显式跳过（元数据记
-   ``scan_override='skipped_under_line_profiler'``）。
-2. **配置单一真源**：``LineProfilerConfig`` 唯一定义在
-   ``roadmc.data.synthetic.config``（本模块 ``from .config import`` 引用，
-   **不再自带同名 dataclass**）——消除双份定义的字段漂移风险。
-3. **存储强度通道**：场景存储的 ``intensity`` 沿用管线统一辐射模型
-   ``_compute_intensity``（单一位姿 σ_r/丢点/强度三用一致性的前提；
-   生成器步骤 9 的最近邻传递会把强度带到本模块输出的点上）。本模块
-   内部另算**逐剖面线激光头几何亮度代理**（cos θ_laser / R²，无标签、
-   无材料先验）仅供散斑 σ_z 与低亮度丢点使用——设计稿"强度走线激光
-   头位姿逐剖面重算"一句据此作废，避免与步骤 9 的 NN 覆盖冲突。
+The stored production intensity still comes from the generator's radiometric
+proxy; the per-profile brightness here drives speckle, noise and dropout only.
+The Gamma brightness factor, angular scaling, height-noise standard deviation,
+flyers and dropout probabilities are explicit engineering hypotheses. Published
+instrument precision cannot by itself be interpreted as a Gaussian sigma.
+Csencsics et al. (2022), DOI 10.1109/I2MTC48687.2022.9806610, motivates treating
+speckle as a measurement uncertainty; the formula here is not their validated
+optical simulation. ISO 13473-3:2002 concerns instrument classification, not
+calibration of these defaults.
 
-**几何链**（参照 laser-scanner-toolkit 的标定-重建链：光平面标定
-（交比不变）→ 运动轴步进 → 射线-平面求交重建；本地镜像 README 见
-调研材料 tk.md，其 MIT 许可声明本次未核验）：纵向步进
-``y_k = k·step_m``；每条剖面取光平面（横向 x–竖向 z，自竖直倾角
-``laser_incidence_deg``）与合成网格表面的求交——**规则网格上退化为
-相邻两行网格高度场的线性插值**（ray-plane 链在网格面上的文档化简化），
-再按 ``lateral_res_m`` 横向线性重采样得到一条剖面 (x_m, y_k, z)。
-
-**高程噪声（Csencsics 2022 散斑参数化，DOI
-10.1109/I2MTC48687.2022.9806610，已核；"Csencsics 2023" 期刊扩展本次
-未检索到，需人工核对）**：
-
-.. math::
-
-    \\sigma_z(\\theta, b) = \\sigma_{z0}\\,
-    \\frac{1 + \\tan^2\\theta_{\\mathrm{inc}}}{\\sqrt{b_{\\mathrm{rel}}}}
-
-其中 ``θ_inc = laser_incidence_deg`` 取**光平面公称入射角**（设计稿
-"入射角 30° 为工程设定"的字面口径：被倾斜的是光平面本身，故平坦面上
-沿整条剖面线的入射角恒等于该公称值，不随沿线位置变化），``b_rel`` 为
-逐剖面几何亮度代理（``cos θ_laser / R²``，线激光头位姿见下）乘
-**Gamma(shape=speckle_shape, scale=1/shape) 散斑实现**后相对该剖面中
-位数的比值——Gamma 因子均值 1、变异系数 ``1/√speckle_shape``，是
-``LineProfilerConfig.speckle_shape`` 唯一的消费点（早期版本把它申报进
-元数据却完全不使用，属配置静默失效，本版修正）。σ_z0 = 0.25 mm 与
-横向分辨率 1 mm 为 LSP 实测规格（DOI
-10.1109/ACCESS.2019.2956758——**导入而非自校准**）。
-
-**飞点启发式**：逐点以 ``flyer_prob`` 概率加 ±flyer_sigma_mult·σ_z 的
-离群位移（保留在输出云中，``flyer_mask`` 记录；± 两侧等概，"外向"按
-"偏离表面"理解，不限定单一符号）；低亮度点按
-``brightness_dropout_ref`` 归一化亮度反比概率丢点（与
-``simulate_lidar_noise`` 的辐射耦合丢点同型）。
-
-**输入云契约的放松（必要偏差，见模块注释）**：设计稿写"网格规则点云
-(N, 3)，行优先展平"，但钩子位于病害之后——松散（raveling）的 NaN 过滤
-会按点删行、缘石（curb）并入会在云尾追加非路面点，两者都使严格
-reshape 契约不可满足（实测 5 mm 网格、默认病害配置下约 8% 场景直接
-抛 ``ValueError``）。本版改为**按格网坐标反查重建表面格网**：点云中
-落在路面格网 ``(i, j)`` 上的点按 ``round((x-x0)/grid_res)`` 回填到
-``(nx, ny)`` 索引阵，格网外的点（缘石）不参与采样，**空格网单元**
-（松散移除的点）在该横向/纵向样本上产生丢点而非伪造高程——这与管线
-其余部分对松散的口径一致（LiDAR 档同样让松散点从输出中消失），也避免
-在信息缺失区编造几何。缘石条带因此在本档位下不被采样（位于路面足迹
-之外），这是单块网格路径的既定限制，已在此显式记录。
-
-特征契约：本模块不产出任何标签派生通道；下游 feats 只由最终点与强度
-计算（features.py 口径）。返回的 ``labels`` 仅为接口完整性保留——生成
-器步骤 9 的最近邻传递是最终生效口径。
+Off-grid points such as curbs are excluded from the regular road lattice.
+Output labels/normals are authoritative at sampled XY in the production
+line-profiler path. They are synthetic support/latent-normal annotations,
+not normals estimated from a noisy real point cloud. The returned audit records
+sampling bandwidth and the unmodelled optical effects without implying that
+sampling intervals prove sensor accuracy.
 """
 
 from __future__ import annotations
@@ -94,11 +49,9 @@ class LineProfilerResult:
 
     Attributes:
         points: 输出点云 (M, 3) = [x, y, z_meas]。
-        normals: 采样点法向量 (M, 3)（同一网格插值口径，已重归一；
-            生成器步骤 9 仍会按最近邻传递覆盖，此处为接口完整性保留）。
+        normals: 采样点的潜在表面法向量 (M, 3)，按四角插值并归一。
         labels: 采样点标签 (M,)（剖面内最近格网标签，距离阈值
-            ``2·lateral_res_m`` 之外或无格网标签时为 -1 = 未知；生成器
-            步骤 9 的最近邻传递为最终生效口径）。
+            ``2·lateral_res_m`` 之外或无格网标签时为 -1 = 未知）。
         profile_index: 每点所属剖面序号 (M,)。
         flyer_mask: 飞点标记 (M,) bool。
         dropout_count: 丢点计数（低亮度丢点 + 源格网空洞导致的不可测
@@ -111,6 +64,7 @@ class LineProfilerResult:
     profile_index: np.ndarray
     flyer_mask: np.ndarray
     dropout_count: int
+    sampling_audit: dict | None = None
 
 
 def _rebuild_surface_lattice(
@@ -213,6 +167,18 @@ def _gather_labels(values: np.ndarray, col: np.ndarray) -> np.ndarray:
     return np.where(col >= 0, values[pos], -1)
 
 
+def _corner_weights(tx: np.ndarray, ty: float) -> np.ndarray:
+    """Four-corner weights, ordered left/a, right/a, left/b, right/b."""
+    return np.stack(
+        [(1.0 - tx) * (1.0 - ty), tx * (1.0 - ty),
+         (1.0 - tx) * ty, tx * ty], axis=1
+    )
+
+
+def _corner_values(a: np.ndarray, b: np.ndarray, i0: np.ndarray) -> np.ndarray:
+    return np.stack([a[i0], a[i0 + 1], b[i0], b[i0 + 1]], axis=1)
+
+
 def _bilinear(
     z_a: np.ndarray,
     z_b: np.ndarray,
@@ -220,38 +186,17 @@ def _bilinear(
     tx: np.ndarray,
     ty: float,
 ) -> np.ndarray:
-    """相邻两行 × 相邻两列的双线性高程插值，权重在可用单元上重归一。
+    """四角双线性高程插值；仅有限、正权重支撑参与重归一。
 
-    ``z_a`` / ``z_b`` 是相邻两条整列（长度 nx），空洞单元为 NaN。对每个
-    横向样本参与插值的四个单元中，只有**自身支持该样本的单元**（按其
-    i_near 列）缺失时才产生 NaN；邻位缺失时其权重被重新分配给可用邻
-    位，因此单个松散空洞不会连带污染相邻横向样本。纵向权重 ``ty``
-    在自身单元缺失时同样重归一（全空 → NaN，由调用方按空洞丢点）。
-
-    Args:
-        z_a: 近行整列 (nx,)，值为 NaN 处对该列所有样本不可用。
-        z_b: 远行整列 (nx,)。
-        i0: 每样本左列索引 (n_lat,)。
-        tx: 每样专栏内比例 (n_lat,)。
-        ty: 行间比例 (0..1)。
-
-    Returns:
-        (n_lat,) 插值高程，自身无可用支撑时为 NaN。
+    零权重 NaN 不传播。最近源格网缺失的丢点策略由调用方单独应用，
+    因而邻角缺失不会扩大空洞范围。无有效正权重支撑时返回 NaN。
     """
-    # 自身列（i_near）：i0 或 i0+1 中较近者。
-    use_left = tx < 0.5
-    i_self = np.where(use_left, i0, i0 + 1)
-    z_self_row_a = z_a[i_self]
-    z_self_row_b = z_b[i_self]
-    ok_a = np.isfinite(z_self_row_a)
-    ok_b = np.isfinite(z_self_row_b)
-
-    wa = (1.0 - ty) * ok_a.astype(np.float64)
-    wb = ty * ok_b.astype(np.float64)
-    wsum = wa + wb
-    num = wa * np.where(ok_a, z_self_row_a, 0.0) + wb * np.where(
-        ok_b, z_self_row_b, 0.0
-    )
+    values = _corner_values(z_a, z_b, i0)
+    weights = _corner_weights(tx, ty)
+    valid = np.isfinite(values) & (weights > 0.0)
+    weights = np.where(valid, weights, 0.0)
+    wsum = weights.sum(axis=1)
+    num = np.sum(weights * np.where(valid, values, 0.0), axis=1)
     return np.where(wsum > 0.0, num / np.maximum(wsum, 1e-300), np.nan)
 
 
@@ -262,25 +207,42 @@ def _bilinear_vec(
     tx: np.ndarray,
     ty: float,
 ) -> np.ndarray:
-    """:func:`_bilinear` 的向量版本（法向量 (N, 3)），同一重归一口径。
+    """四角法向先逐个单位化，再加权并单位化；不翻转输入方向。
 
-    任一分量为 NaN 即视为该单元对该样本不可用（法向量要求三个分量同时
-    有效），权重在可用行间重归一。
+    有限非零且权重为正的法向才参与。退化和回退至最近有效支撑，距离
+    相同优先较大 x，再优先较大 y（与最近源格网的半格取上侧一致）。
+    无有效支撑返回 NaN，由调用方只对可测样本报错。
     """
-    use_left = tx < 0.5
-    i_self = np.where(use_left, i0, i0 + 1)
-    v_a = vec_a[i_self]
-    v_b = vec_b[i_self]
-    ok_a = np.isfinite(v_a).all(axis=1)
-    ok_b = np.isfinite(v_b).all(axis=1)
+    values = _corner_values(vec_a, vec_b, i0)
+    weights = _corner_weights(tx, ty)
+    finite = np.isfinite(values).all(axis=2)
+    clean = np.where(finite[:, :, None], values, 0.0)
+    # Scale first so finite extreme magnitudes neither overflow nor underflow.
+    scale = np.max(np.abs(clean), axis=2)
+    valid = finite & (scale > 0.0) & (weights > 0.0)
+    scaled = clean / np.where(scale > 0.0, scale, 1.0)[:, :, None]
+    lengths = np.linalg.norm(scaled, axis=2)
+    unit = scaled / np.where(lengths > 0.0, lengths, 1.0)[:, :, None]
+    weights = np.where(valid, weights, 0.0)
+    total = np.sum(weights[:, :, None] * unit, axis=1)
+    total_length = np.linalg.norm(total, axis=1)
+    good = total_length > 1e-12 * weights.sum(axis=1)
+    out = np.full((len(tx), 3), np.nan)
+    out[good] = total[good] / total_length[good, None]
 
-    wa = (1.0 - ty) * ok_a.astype(np.float64)
-    wb = ty * ok_b.astype(np.float64)
-    wsum = wa + wb
-    num = wa[:, None] * np.where(ok_a[:, None], v_a, 0.0) + wb[:, None] * (
-        np.where(ok_b[:, None], v_b, 0.0)
-    )
-    return np.where(wsum[:, None] > 0.0, num / np.maximum(wsum, 1e-300)[:, None], np.nan)
+    fallback = ~good & valid.any(axis=1)
+    if bool(np.any(fallback)):
+        distances = np.stack(
+            [tx**2 + ty**2, (1.0-tx)**2 + ty**2,
+             tx**2 + (1.0-ty)**2, (1.0-tx)**2 + (1.0-ty)**2], axis=1
+        )
+        # argmin's first-match rule gives deterministic ties in this order.
+        order = np.array([3, 1, 2, 0])
+        ranked = np.where(valid, distances, np.inf)[:, order]
+        nearest = order[np.argmin(ranked, axis=1)]
+        rows = np.flatnonzero(fallback)
+        out[rows] = unit[rows, nearest[rows]]
+    return out
 
 
 def simulate_line_profiler(
@@ -293,6 +255,7 @@ def simulate_line_profiler(
     origin_xy: tuple[float, float],
     cfg: LineProfilerConfig,
     rng: np.random.Generator,
+    noise_enabled: bool = True,
 ) -> LineProfilerResult:
     """Simulate a line-laser profiler scan over a grid-ordered surface cloud.
 
@@ -324,7 +287,7 @@ def simulate_line_profiler(
 
     Raises:
         ValueError: 点云与网格不兼容（无格网点、格网单元重复占用、
-            网格 < 2×2）。
+            网格 < 2×2），或可测样本无有限非零的正权重法向支撑。
     """
     nx, ny = int(grid_shape[0]), int(grid_shape[1])
     x0, y0 = float(origin_xy[0]), float(origin_xy[1])
@@ -340,6 +303,7 @@ def simulate_line_profiler(
 
     # 源格网全空洞时的线激光头参考高程回退值（逐剖面 nanmax 失效时用）。
     finite_z = z_all[idx_grid[idx_grid >= 0]]
+    finite_z = finite_z[np.isfinite(finite_z)]
     z_ref_fallback = (
         float(np.median(finite_z)) if finite_z.size else 0.0
     )
@@ -392,9 +356,6 @@ def simulate_line_profiler(
         n_a = _gather_axis0(n_all, col_a)
         n_b = _gather_axis0(n_all, col_b)
         n_prof_row = _bilinear_vec(n_a, n_b, i0, tx, ty)
-        # 法向重归一。
-        nlen = np.linalg.norm(n_prof_row, axis=1, keepdims=True)
-        n_prof_row = n_prof_row / np.maximum(nlen, 1e-12)
 
         # 标签：剖面内最近格网单元，距离阈值 2·lateral_res_m。
         i_near = np.where(tx < 0.5, i0, i0 + 1)
@@ -406,6 +367,17 @@ def simulate_line_profiler(
         # 污染相邻样本，把局部稀疏放大约 2 倍；自身口径下每个空缺单元
         # 只损失它自己支撑的样本，与源点云稀疏一致（不夸大、不编造）。
         hole_mask = idx_grid[i_near, j_near] < 0
+        finite_mask = ~hole_mask & np.isfinite(z_prof)
+        invalid_normal = finite_mask & ~np.isfinite(n_prof_row).all(axis=1)
+        if bool(np.any(invalid_normal)):
+            first = int(np.flatnonzero(invalid_normal)[0])
+            raise ValueError(
+                "line-profiler measurable sample has no finite nonzero "
+                "positive-weight normal support "
+                f"(profile={k}, lateral_index={first})"
+            )
+        # 空洞点不进入输出或亮度中位数，但也必须保持其亮度代理有限。
+        n_prof_row[~finite_mask] = np.array([0.0, 0.0, 1.0])
 
         lbl_prof = _gather_labels(lbl_all, idx_grid[i_near, j_near])
         nn_dist = np.sqrt(dx_nn * dx_nn + dy_nn * dy_nn)
@@ -414,7 +386,6 @@ def simulate_line_profiler(
         # 逐剖面几何亮度代理（无标签/材料先验）：cos θ_laser / R²，
         # 激光头位于 (x_mid, y_k, z_head)，z_head 取该剖面最大高程 +
         # sensor_height_m（全空洞剖面回退到全场中位高程）。
-        finite_mask = ~hole_mask
         if bool(np.any(finite_mask)):
             z_head = float(np.max(z_prof[finite_mask])) + cfg.sensor_height_m
         else:
@@ -435,9 +406,12 @@ def simulate_line_profiler(
         brightness_geom = cos_l / R2
         # 散斑实现：Gamma(shape=k, scale=1/k)，均值 1、CV=1/√k。这是
         # cfg.speckle_shape 的唯一消费点，同时耦合进 σ_z 与低亮度丢点。
-        speckle = rng.gamma(
-            shape=cfg.speckle_shape, scale=1.0 / cfg.speckle_shape, size=n_lat
-        )
+        if noise_enabled:
+            speckle = rng.gamma(
+                shape=cfg.speckle_shape, scale=1.0 / cfg.speckle_shape, size=n_lat
+            )
+        else:
+            speckle = np.ones(n_lat, dtype=np.float64)
         brightness = brightness_geom * speckle
         # 中位数同样只在可测样本上统计（空洞样本的代理值不参与归一）。
         b_med = (
@@ -449,10 +423,14 @@ def simulate_line_profiler(
 
         # Csencsics 2022 散斑参数化高程噪声（θ_inc = 光平面公称入射角）。
         sigma_z = cfg.sigma_z0_m * ang_factor / np.sqrt(np.maximum(b_rel, 1e-6))
-        z_meas = z_prof + rng.normal(0.0, 1.0, n_lat) * sigma_z
+        z_meas = (
+            z_prof + rng.normal(0.0, 1.0, n_lat) * sigma_z
+            if noise_enabled
+            else z_prof.copy()
+        )
 
         # 飞点启发式（± 两侧等概，幅度 flyer_sigma_mult·σ_z）。
-        fly = rng.random(n_lat) < cfg.flyer_prob
+        fly = (rng.random(n_lat) < cfg.flyer_prob) if noise_enabled else np.zeros(n_lat, dtype=bool)
         if bool(np.any(fly)):
             sign = np.where(rng.random(n_lat) < 0.5, -1.0, 1.0)
             z_meas = z_meas.copy()
@@ -460,12 +438,15 @@ def simulate_line_profiler(
 
         # 丢点：低亮度（辐射耦合，与 simulate_lidar_noise 同型）+
         # 源格网空洞（松散移除 → 该样本无表面可测）。
-        p_drop = np.clip(
-            cfg.brightness_dropout_ref * b_med / np.maximum(brightness, 1e-12),
-            0.0,
-            0.95,
-        )
-        keep = (rng.random(n_lat) >= p_drop) & finite_mask
+        if noise_enabled:
+            p_drop = np.clip(
+                cfg.brightness_dropout_ref * b_med / np.maximum(brightness, 1e-12),
+                0.0,
+                0.95,
+            )
+            keep = (rng.random(n_lat) >= p_drop) & finite_mask
+        else:
+            keep = finite_mask.copy()
         dropout_count += int(np.count_nonzero(~keep))
 
         pts_k = np.stack(
@@ -498,4 +479,19 @@ def simulate_line_profiler(
         profile_index=prof_out,
         flyer_mask=fly_out,
         dropout_count=dropout_count,
+        sampling_audit={
+            "geometry_sampler": "bilinear_valid_positive_weight_corners",
+            "source_spacing_m": float(grid_res),
+            "source_axis_nyquist_cycles_m": 0.5 / float(grid_res),
+            "output_spacing_m": {"x": float(cfg.lateral_res_m), "y": float(cfg.step_m)},
+            "output_axis_nyquist_cycles_m": {"x": 0.5 / cfg.lateral_res_m, "y": 0.5 / cfg.step_m},
+            "label_support": "nearest_source_grid_cell_at_xy; unknown beyond 2*lateral_res_m",
+            "normal_semantics": "latent_surface_normal_interpolated_at_xy",
+            "geometric_occlusion": "not_modelled; source holes remain missing",
+            "beam_footprint": "point_sample; not_calibrated",
+            "anti_alias_filter": "none; finer output cannot recover missing source bandwidth",
+            "noise_enabled": bool(noise_enabled),
+            "noise_parameters": "engineering_hypotheses; not calibrated from precision specifications",
+            "real_sensor_validated": False,
+        },
     )

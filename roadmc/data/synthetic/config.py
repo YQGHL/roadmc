@@ -698,7 +698,8 @@ class RavelingConfig:
     """松散生成参数。
 
     轻度移除 ~5% 点、重度 ~20%；侵蚀深度 ~N(0.5d, 0.3d) 截断到
-    [0, 1.5d]，轻 d=2mm、重 d=5mm（重度实测均值 ≈2.5mm）。历史版
+    [0, 1.5d]，轻 d=2mm、重 d=5mm，均为未标定工程假设；2.5mm只是
+    重度参数0.5d，不是实测结论。历史版
     本这三个字段从未被读取（primitives 内硬编码同值）——现已接线
     为 add_raveling params 覆盖键 'removal_ratio'/'erosion_depth'。
 
@@ -777,10 +778,9 @@ class PatchingConfig:
             需人工核对，未据此改值）。
         edge_profile: 修补边缘过渡剖面。'smoothstep'（默认，现行
             行为——三次 smoothstep 混合）；'step-fillet' —— 尖锐
-            阶跃 + 小圆角，贴近实测接缝错台口径（1–5.1mm 局部阶
-            跃、1mm 分辨率按 AASHTO R36-04 量测，DOI
-            10.3390/s18010044 与 DOI 10.1061/9780784413586.048——
-            导入而非自校准）。
+            阶跃 + 小圆角。两种剖面均属工程假设；接缝错台研究不能
+            直接标定沥青修补边缘形状。历史引用DOI 10.3390/s18010044、
+            10.1061/9780784413586.048本轮未核验全文，不据此主张实测支持。
         edge_fillet_m: 'step-fillet' 剖面的圆角宽度 (米)，仅
             edge_profile='step-fillet' 时生效；工程假设。
     """
@@ -992,14 +992,13 @@ class BaseConditionConfig:
 class LineProfilerConfig:
     """线激光剖面仪（line profiler）传感器配置。
 
-    传感器几何与噪声参数为 LSP 实测规格的导入值（DOI
-    10.1109/ACCESS.2019.2956758：1mm 横向分辨率、0.25mm 高程精度——
-    **导入而非自校准**）；散斑参数化出自 Csencsics 2022（DOI
-    10.1109/I2MTC48687.2022.9806610，已核）；传感器高度/入射角为
-    工程设定。仅在 ``observation_model='line-profiler'`` 时消费；
-    仿真本体 ``roadmc.data.synthetic.line_profiler`` 由传感组按固定
-    签名提供，已随 2026-10 修复批交付；若某构建缺失该模块，该档位
-    报"未安装"类清晰错误（on/off 档位不受影响）。
+    采样步距及噪声默认值是未标定工程设置。已发表仪器的精度指标
+    不能直接等同为高程噪声的高斯标准差；sigma_z0_m 的数值仍需设备
+    实测残差标定。Csencsics et al. (2022), DOI
+    10.1109/I2MTC48687.2022.9806610 仅作为散斑误差背景，当前模型没有
+    复现该文的光学传播仿真。入射角作用于噪声缩放，不改变采样XY；
+    当前未模拟光斑足迹和几何自遮挡。只有 line-profiler 观测路径消费
+    此配置，不能以采样间距代替精度验收。
 
     Attributes:
         lateral_res_m: 横向重采样分辨率 (米)，默认 0.001。
@@ -1464,7 +1463,7 @@ class GeneratorConfig:
       （元数据记录 override），不报硬错。
     - ``"line-profiler"``：线激光剖面仪观测模型——跳过旋转 LiDAR
       扫描重采样（步骤 2.5）与 ``simulate_lidar_noise`` 球坐标噪声
-      （步骤 8，扫描式 LiDAR 模型），在步骤 2.5 位置运行
+      （步骤 8，扫描式 LiDAR 模型），在病害后的步骤 8 位置运行
       ``simulate_line_profiler``（模块
       ``roadmc.data.synthetic.line_profiler``，固定签名
       提供；模块未就绪时报"未安装"类清晰错误）。暂仅支持单块路径，
