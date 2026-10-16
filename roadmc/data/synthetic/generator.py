@@ -2091,17 +2091,18 @@ class SyntheticRoadDataset(_DatasetBase):
                         else 0.0
                     ),
                     "crack_resolvable": bool(grid_res <= 0.002),
+                    # Compatibility flag: source-grid condition, not sensor capability.
+                    "crack_resolvable_basis": "surface_grid_only",
+                    "observed_crack_resolvable": None,
                 }
                 if grid_res > 0.002:
                     # 轻裂中位缝宽 1.8mm 需要点间距 ≪ 缝宽；点间距-缝宽
                     # 耦合偏差警告依据 DOI 10.3390/s26082338。
                     warnings.warn(
-                        f"line-profiler at grid_res={grid_res:g} m cannot "
-                        "resolve light cracks (median width 1.8 mm demands "
-                        "point spacing << crack width; point-spacing/crack-"
-                        "width coupling bias, DOI 10.3390/s26082338); "
-                        "crack_resolvable=false is recorded in the resolution "
-                        "contract.",
+                        f"line-profiler source grid_res={grid_res:g} m fails "
+                        "the surface-grid-only crack criterion; "
+                        "crack_resolvable=false describes the source grid, "
+                        "while observed_crack_resolvable remains unknown.",
                         stacklevel=2,
                     )
                 if noisy_points.shape[0] == 0:

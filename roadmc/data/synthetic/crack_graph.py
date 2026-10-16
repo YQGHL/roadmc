@@ -183,9 +183,8 @@ def render_graph(
     owner = np.full(shape, -1, dtype=np.int32)
     for ei, edge in enumerate(parsed["edges"]):
         _, _, _, points, left, right, depths = edge
-        closest = np.full(shape, np.inf)
-        chosen_u = np.zeros(shape, dtype=float)
-        chosen_depth = np.zeros(shape, dtype=float)
+        edge_mask = np.zeros(shape, dtype=bool)
+        edge_loss = np.zeros(shape, dtype=float)
         for k, (a, b) in enumerate(zip(points[:-1], points[1:], strict=True)):
             vx, vy = b - a
             denom = vx * vx + vy * vy
@@ -199,17 +198,16 @@ def render_graph(
             half_width = np.where(cross >= 0, left_k, right_k)
             u = dist / half_width
             d = depths[k] + t * (depths[k + 1] - depths[k])
-            nearer = dist < closest  # stable segment order resolves equal-distance ties
-            closest[nearer] = dist[nearer]
-            chosen_u[nearer] = u[nearer]
-            chosen_depth[nearer] = d[nearer]
-        edge_mask = chosen_u <= 1.0
-        if profile == "legacy_v1_gaussian":
-            edge_loss = np.where(edge_mask, chosen_depth * np.exp(-(chosen_u**2)), 0.0)
-        else:
-            edge_loss = np.where(
-                edge_mask, chosen_depth * np.maximum(0.0, 1.0 - chosen_u**2) ** 2, 0.0
-            )
+            segment_mask = u <= 1.0
+            if profile == "legacy_v1_gaussian":
+                segment_loss = np.where(segment_mask, d * np.exp(-(u**2)), 0.0)
+            else:
+                segment_loss = np.where(
+                    segment_mask, d * np.maximum(0.0, 1.0 - u**2) ** 2, 0.0
+                )
+            # Every segment contributes support, even if a narrower segment is nearer.
+            edge_mask |= segment_mask
+            np.maximum(edge_loss, segment_loss, out=edge_loss)
         wins = edge_loss > loss  # stable earlier edge wins ties
         loss[wins] = edge_loss[wins]
         owner[wins] = ei

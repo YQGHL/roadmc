@@ -8,6 +8,7 @@ seen-file comparisons never become fresh independent-road validation.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import shutil
@@ -37,7 +38,12 @@ DEFAULT_STAGES = (
 # Frozen-result diagnostics are opt-in, so old commands keep their workload.
 STAGES = DEFAULT_STAGES + ("pothole_outline_fairness",)
 DEPENDENCIES = {"texture_benchmark": ("texture_fit",)}
-COMMON = ["roadmc/scripts/run_realism_study.py", "roadmc/data/synthetic/study_protocol.py"]
+COMMON = [
+    "roadmc/scripts/run_realism_study.py",
+    "roadmc/data/synthetic/study_protocol.py",
+    "pyproject.toml",
+    "uv.lock",
+]
 TEXTURE = [
     "roadmc/data/synthetic/joint_texture_calibration.py",
     "roadmc/data/synthetic/procedural_texture.py",
@@ -76,6 +82,32 @@ def source_hashes(stage):
     return {name: file_hash(REPO / name) for name in SOURCES[stage]}
 
 
+def execution_environment(stage):
+    """Describe this interpreter and loaded versions used by the stage worker."""
+    # Admission uses only the standard library. Numerical stages also import
+    # plotting/image readers, so capture their versions without importing torch.
+    libraries = () if stage == "admission" else ("numpy", "scipy", "matplotlib", "PIL")
+    return {
+        "python": {
+            "implementation": sys.implementation.name,
+            "version": sys.version,
+            "executable": str(Path(sys.executable).resolve()),
+        },
+        "libraries": {name: importlib.import_module(name).__version__ for name in libraries},
+    }
+
+
+def stage_fingerprint(input_hash, sources, environment, dependencies):
+    return canonical_hash(
+        {
+            "inputs": input_hash,
+            "sources": sources,
+            "execution_environment": environment,
+            "dependencies": dependencies,
+        }
+    )
+
+
 def artifact_hashes(directory):
     return {
         str(path.relative_to(directory)).replace("\\", "/"): file_hash(path)
@@ -93,14 +125,14 @@ def verified_stage(state, stage, output, input_hash):
     if not all(verified_stage(state, dep, output, input_hash) for dep in dependencies):
         return False
     try:
-        fingerprint = canonical_hash(
-            {
-                "inputs": input_hash,
-                "sources": source_hashes(stage),
-                "dependencies": {
-                    dep: state["stages"][dep]["result_sha256"] for dep in dependencies
-                },
-            }
+        environment = execution_environment(stage)
+        if row.get("execution_environment") != environment:
+            return False  # Legacy rows without environment evidence are stale.
+        fingerprint = stage_fingerprint(
+            input_hash,
+            source_hashes(stage),
+            environment,
+            {dep: state["stages"][dep]["result_sha256"] for dep in dependencies},
         )
         directory = output / row["artifact_dir"]
         return (
@@ -109,7 +141,7 @@ def verified_stage(state, stage, output, input_hash):
             and artifact_hashes(directory) == row.get("artifact_hashes")
             and file_hash(output / row["result_path"]) == row.get("result_sha256")
         )
-    except (KeyError, FileNotFoundError):
+    except (KeyError, FileNotFoundError, ImportError):
         return False
 
 
@@ -168,6 +200,7 @@ def _worker(stage, manifest_path, protocol_path, directory, fit_result=None):
         )
     else:
         raise ValueError(f"unknown stage: {stage}")
+    write_json(directory / "execution_environment.json", execution_environment(stage))
     write_json(directory / "stage_result.json", result)
 
 
@@ -274,7 +307,8 @@ def run_study(
             state, stage, output, input_hash
         ):
             row.update(
-                status="stale", reason="input, source, dependency or artifact hashes changed"
+                status="stale",
+                reason="input, source, execution environment, dependency or artifact hashes changed",
             )
     for stage in selected:
         old = state["stages"].get(stage, {})
@@ -287,14 +321,15 @@ def run_study(
             write_json(output / "run_state.json", state)
             continue
         sources = source_hashes(stage)
+        environment_info = execution_environment(stage)
         dependency_hashes = {dep: state["stages"][dep]["result_sha256"] for dep in dependencies}
-        fingerprint = canonical_hash(
-            {"inputs": input_hash, "sources": sources, "dependencies": dependency_hashes}
+        fingerprint = stage_fingerprint(
+            input_hash, sources, environment_info, dependency_hashes
         )
         if verified_stage(state, stage, output, input_hash):
             old["cache_verified"] = True
             write_json(output / "run_state.json", state)
-            print(f"REUSE {stage}: sources, inputs and artifact hashes verified", flush=True)
+            print(f"REUSE {stage}: sources, inputs, environment and artifact hashes verified", flush=True)
             continue
         attempt = 1 + sum(item["stage"] == stage for item in state["history"])
         relative = Path("artifacts") / stage / f"attempt-{attempt:02d}"
@@ -310,6 +345,7 @@ def run_study(
             "attempt": attempt,
             "fingerprint": fingerprint,
             "source_hashes": sources,
+            "execution_environment": environment_info,
             "artifact_dir": relative.as_posix(),
             "log": log.relative_to(output).as_posix(),
         }
@@ -349,6 +385,11 @@ def run_study(
                 raise RuntimeError(f"stage exited {process.returncode}; see {log}")
             if source_hashes(stage) != sources:
                 raise RuntimeError("executing source changed during stage; result is not accepted")
+            if (
+                execution_environment(stage) != environment_info
+                or read_json(directory / "execution_environment.json") != environment_info
+            ):
+                raise RuntimeError("execution environment changed during stage; result is not accepted")
             result_path = directory / "stage_result.json"
             read_json(result_path)
             row.update(
