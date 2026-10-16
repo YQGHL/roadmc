@@ -50,6 +50,8 @@ def main() -> None:
     parser.add_argument("--plan", type=Path, help="explicit replay plan JSON")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--observation", choices=("off", "line-profiler"), default="off")
+    parser.add_argument("--observation-noise", choices=("on", "off"), default="on",
+                        help="v2 line-profiler noise model; source-grid holes remain missing")
     parser.add_argument("--observation-seed", type=int)
     parser.add_argument("--observation-config", type=Path,
                         help="JSON object of LineProfilerConfig overrides")
@@ -75,7 +77,8 @@ def main() -> None:
             plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
             result = replay_surface(tile, plan, observation=args.observation,
                                     observation_seed=args.observation_seed,
-                                    line_profiler_config=cfg)
+                                    line_profiler_config=cfg,
+                                    observation_noise_enabled=args.observation_noise == "on")
             save_replay(folder / "replay.npz", tile, plan, result)
             print(f"{material}: plan_hash={result.metadata['plan_hash']} output={folder}")
         return
@@ -83,9 +86,12 @@ def main() -> None:
         parser.error("--base, --plan and --output are required unless --demo is used")
     tile = SurfaceTile.load(args.base)
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
+    if plan.get("schema_version") == 1 and args.observation_noise == "off":
+        parser.error("--observation-noise off is only supported for schema_version=2 plans")
     result = replay_surface(tile, plan, observation=args.observation,
                             observation_seed=args.observation_seed,
-                            line_profiler_config=cfg)
+                            line_profiler_config=cfg,
+                            observation_noise_enabled=args.observation_noise == "on")
     save_replay(args.output, tile, plan, result)
     print(f"plan_hash={result.metadata['plan_hash']} output={args.output}")
 

@@ -26,7 +26,7 @@ _REQUIRED_KEYS = {
     "distribution",
     "material_id",
 }
-_ALLOWED_KEYS = _REQUIRED_KEYS | {"shape"}
+_ALLOWED_KEYS = _REQUIRED_KEYS | {"shape", "spectrum_profile", "spectral_matching"}
 
 
 def _reject_constant(value: str) -> None:
@@ -71,12 +71,16 @@ def _canonical_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     if any(not isinstance(key, str) for key in settings):
         raise ValueError("settings keys must be strings")
     keys = set(settings)
-    missing = _REQUIRED_KEYS - keys
+    profile_mode = "spectrum_profile" in settings
+    required = _REQUIRED_KEYS - {"hurst"} if profile_mode else _REQUIRED_KEYS
+    missing = required - keys
     extra = keys - _ALLOWED_KEYS
     if missing:
         raise ValueError(f"settings missing required keys: {', '.join(sorted(missing))}")
     if extra:
         raise ValueError(f"unsupported settings keys: {', '.join(sorted(extra))}")
+    if profile_mode and "hurst" in settings:
+        raise ValueError("hurst and spectrum_profile are mutually exclusive")
 
     values = {
         key: _finite_number(settings, key)
@@ -88,10 +92,11 @@ def _canonical_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             "band_lo_cycles_m",
             "band_hi_cycles_m",
         )
+        if key != "hurst" or not profile_mode
     }
     if values["rms_m"] < 0.0:
         raise ValueError("rms_m must be >= 0")
-    if values["hurst"] <= 0.0:
+    if not profile_mode and values["hurst"] <= 0.0:
         raise ValueError("hurst must be > 0")
     if values["anisotropy_ratio"] <= 0.0:
         raise ValueError("anisotropy_ratio must be > 0")
@@ -117,6 +122,35 @@ def _canonical_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         "distribution": distribution,
         "material_id": material_id,
     }
+    if profile_mode:
+        profile = settings["spectrum_profile"]
+        if not isinstance(profile, Mapping) or set(profile) != {
+            "frequency_cycles_m",
+            "relative_psd",
+        }:
+            raise ValueError("spectrum_profile requires frequency_cycles_m and relative_psd only")
+        frequency, psd = profile["frequency_cycles_m"], profile["relative_psd"]
+        if (
+            not isinstance(frequency, list)
+            or not isinstance(psd, list)
+            or not 2 <= len(frequency) == len(psd) <= 4096
+        ):
+            raise ValueError("spectral profile arrays must have equal lengths in 2..4096")
+        for value in frequency + psd:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not np.isfinite(value)
+            ):
+                raise ValueError("spectral profile values must be finite JSON numbers")
+        f, p = np.asarray(frequency, dtype=float), np.asarray(psd, dtype=float)
+        if f[0] < 0 or np.any(np.diff(f) <= 0) or np.any(p < 0) or not np.any(p > 0):
+            raise ValueError(
+                "profile frequencies must increase; PSD must be nonnegative and nonzero"
+            )
+        if values["band_lo_cycles_m"] < f[0] or values["band_hi_cycles_m"] > f[-1]:
+            raise ValueError("requested band must stay within explicit spectral-profile support")
+        result["spectrum_profile"] = {"frequency_cycles_m": f.tolist(), "relative_psd": p.tolist()}
     if has_shape:
         shape = settings["shape"]
         if not isinstance(shape, Mapping) or set(shape) != {"skew", "kurt"}:
@@ -126,6 +160,26 @@ def _canonical_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         if kurt < 1.0:
             raise ValueError("shape.kurt must be >= 1 (Pearson kurtosis)")
         result["shape"] = {"skew": skew, "kurt": kurt}
+    if "spectral_matching" in settings:
+        match = settings["spectral_matching"]
+        if (
+            distribution != "non_gaussian"
+            or not isinstance(match, Mapping)
+            or set(match) != {"iterations", "tolerance"}
+        ):
+            raise ValueError(
+                "spectral_matching requires non_gaussian and explicit iterations/tolerance"
+            )
+        iterations = match["iterations"]
+        tolerance = _finite_number(match, "tolerance")
+        if (
+            isinstance(iterations, bool)
+            or not isinstance(iterations, int)
+            or not 1 <= iterations <= 500
+            or tolerance <= 0
+        ):
+            raise ValueError("matching iterations must be 1..500; tolerance must be positive")
+        result["spectral_matching"] = {"iterations": iterations, "tolerance": tolerance}
     return result
 
 
@@ -206,8 +260,7 @@ def generate_texture(
         try:
             with np.errstate(over="raise", invalid="raise", divide="raise"):
                 q = np.sqrt(
-                    (frequency_u / np.sqrt(ratio)) ** 2
-                    + (frequency_v * np.sqrt(ratio)) ** 2
+                    (frequency_u / np.sqrt(ratio)) ** 2 + (frequency_v * np.sqrt(ratio)) ** 2
                 )
         except FloatingPointError as exc:
             raise ValueError("anisotropy_ratio is outside the numerically supported range") from exc
@@ -228,9 +281,19 @@ def generate_texture(
         amplitude = np.zeros_like(radial)
         try:
             with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
-                amplitude[band] = q[band] ** (-(cfg["hurst"] + 1.0))
+                if "spectrum_profile" in cfg:
+                    profile = cfg["spectrum_profile"]
+                    relative = np.asarray(profile["relative_psd"])
+                    relative = relative / relative.max()
+                    amplitude[band] = np.sqrt(
+                        np.interp(q[band], profile["frequency_cycles_m"], relative, left=0, right=0)
+                    )
+                else:
+                    amplitude[band] = q[band] ** (-(cfg["hurst"] + 1.0))
         except FloatingPointError as exc:
-            raise ValueError("hurst produced numerically unsupported spectral weights") from exc
+            raise ValueError("settings produced numerically unsupported spectral weights") from exc
+        if not np.any(amplitude > 0):
+            raise ValueError("spectral profile has no positive weights on the requested grid/band")
         shaped = spectrum * amplitude
         shaped[0, 0] = 0.0
         gaussian_field = np.fft.ifft2(shaped).real
@@ -256,11 +319,15 @@ def generate_texture(
             projected_spectrum[0, 0] = 0.0
             after_power = float(np.sum(np.abs(projected_spectrum) ** 2))
             projection_ratio = (
-                max(before_power - after_power, 0.0) / before_power
-                if before_power > 0.0
-                else 0.0
+                max(before_power - after_power, 0.0) / before_power if before_power > 0.0 else 0.0
             )
             field = np.fft.ifft2(projected_spectrum).real
+            if "spectral_matching" in cfg:
+                from .spectral_synthesis import match_marginal_spectrum
+
+                field, matching_metadata = match_marginal_spectrum(
+                    gaussian_field, transformed, **cfg["spectral_matching"]
+                )
 
         field -= float(np.mean(field))
         current_rms = float(np.sqrt(np.mean(field * field)))
@@ -272,7 +339,9 @@ def generate_texture(
     total_power = float(np.sum(np.abs(spectrum_out) ** 2))
     outside_power = float(np.sum(np.abs(spectrum_out[~band]) ** 2))
     metadata: dict[str, Any] = {
-        "algorithm": "anisotropic_powerlaw_fft_v1",
+        "algorithm": "radial_profile_fft_v1"
+        if "spectrum_profile" in cfg
+        else "anisotropic_powerlaw_fft_v1",
         "algorithm_sha256": _module_sha256(),
         "seed": int(seed),
         "actual_settings": cfg,
@@ -286,7 +355,11 @@ def generate_texture(
             "conservative_axis_limit": axis_nyquist,
         },
         "spectrum": {
-            "power_law": "PSD proportional to q^(-(2H+2)); amplitude proportional to q^(-(H+1))",
+            "power_law": (
+                None
+                if "spectrum_profile" in cfg
+                else "PSD proportional to q^(-(2H+2)); amplitude proportional to q^(-(H+1))"
+            ),
             "rotated_frequency": "u=fx*cos(theta)+fy*sin(theta), v=-fx*sin(theta)+fy*cos(theta)",
             "anisotropic_radius": "q=sqrt((fu/sqrt(ratio))^2+(fv*sqrt(ratio))^2)",
             "radial_band_mask_cycles_m": [
@@ -302,4 +375,12 @@ def generate_texture(
         "statistics_of_synthetic_output": _moment_statistics(field),
         "rms_definition": "demeaned spatial standard deviation; field is centered and rescaled to requested rms_m",
     }
+    if "spectrum_profile" in cfg:
+        metadata["spectrum"]["profile_interpolation"] = (
+            "linear frequency / relative PSD; zero outside knot support"
+        )
+    if "spectral_matching" in cfg:
+        metadata["spectral_matching"] = (
+            matching_metadata if cfg["rms_m"] > 0 else {"status": "not_run_zero_rms"}
+        )
     return field, metadata

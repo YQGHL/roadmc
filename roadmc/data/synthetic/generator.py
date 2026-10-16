@@ -1,7 +1,8 @@
 """RoadMC 合成数据集生成器 —— SyntheticRoadDataset.
 
 组合 config.py 的配置参数和 primitives.py 的基元函数，
-生成符合 JTG 5210-2018 标准的合成道路点云数据集。
+生成带项目病害标签的合成道路点云数据集。标签参考 JTG 分类，
+尚未完成条文逐项核对、实测参数标定或标准符合性验证。
 
 数据流 (Data Pipeline)：
   1. 确定路面类型 (asphalt / concrete)
@@ -10,7 +11,7 @@
   4. 病害随机选择与组合应用
   5. 特征计算 (强度反射率 + 曲率)
   6. LiDAR 噪声仿真
-  7. 标签/特征最近邻传递
+  7. 按观测模式的空间支持传递标签与特征
   8. 定点数重采样 & 归一化
 """
 
@@ -1062,7 +1063,7 @@ class SyntheticRoadDataset(_DatasetBase):
         6. 松散标签膨胀 + NaN 过滤 (P0-3)
         7. 强度反射率计算 (P0-2)
         8. LiDAR 噪声仿真 (P2-3: 仅高曲率边缘混合)
-        9. 最近邻传递标签/特征/法向量 (P0-4: 带距离阈值)
+        9. 按观测支持传递属性（旋转LiDAR为三维近邻；线激光保留XY标签/插值法线）
         10. 传感器输出密度体素化或固定点数重采样
         11. 坐标归一化
         12. 特征拼接与三层分辨率元数据
@@ -1989,8 +1990,8 @@ class SyntheticRoadDataset(_DatasetBase):
         # 关闭时整体跳过：没有传感器就没有测距噪声/丢点，直出点即最终点
         # （noisy_points := points），标签/特征/法向量保持直出值，不做
         # 最近邻回传。line-profiler 档跳过 simulate_lidar_noise（那是
-        # 扫描式 LiDAR 的球坐标测距/角度噪声模型），在步骤 7.5 已对
-        # 病害后几何运行线激光剖面仿真；最近邻传递照常执行。
+        # 扫描式 LiDAR 的球坐标测距/角度噪声模型），在此步骤对病害后
+        # 几何重采样，保留其XY支持标签和插值潜在法线。
         if observation_off:
             noisy_points = points
             sensor_points_before_output_sampling = int(len(noisy_points))
@@ -2019,8 +2020,8 @@ class SyntheticRoadDataset(_DatasetBase):
                 # 定稿）**：钩子对病害后的最终几何采样——设计稿早先
                 # "步骤 2.5 位置"与签名携带 labels、元数据含
                 # flyer_ratio 相互矛盾（步骤 2.5 时标签恒全零），
-                # 采样位置以本点为准；标签/强度/法向量经下方步骤 9
-                # 最近邻传递到剖面点。传感器模块
+                # 采样位置以本点为准；步骤9保留采样器标签/潜在法线，
+                # 强度与曲率按XY近邻传递到剖面点。传感器模块
                 # roadmc.data.synthetic.line_profiler 已交付，签名固定为
                 # simulate_line_profiler(points, normals, labels, *,
                 # grid_shape, grid_res, origin_xy, cfg, rng)；存储强度
@@ -2128,34 +2129,47 @@ class SyntheticRoadDataset(_DatasetBase):
                 raise RuntimeError("All points dropped during LiDAR noise simulation.")
             sensor_points_before_output_sampling = int(len(noisy_points))
 
-            # 9. 最近邻传递标签/特征/法向量（带距离阈值保护）
-            # P0-4: 增加距离阈值，防止标签溢出/侵蚀
+            # 9. Transfer attributes using the observation model's support.
+            # Line-profiler moves Z only: its labels and interpolated latent
+            # surface normals already belong to the sampled XY. A 3D nearest
+            # neighbor query would relabel a noisy pit point as its rim.
             from scipy.spatial import KDTree
-            tree = KDTree(pre_points)
-            nn_dist, nn_idx = tree.query(noisy_points, k=1)
 
-            labels = pre_labels[nn_idx]
-            intensity = pre_intensity[nn_idx]
-            curvature = pre_curvature[nn_idx]
-            normals = pre_normals[nn_idx]
-
-            # P0-4 距离阈值保护：超过 3σ 距离的点回退到背景标签
-            # 防止裂缝边缘噪声点携带错误标签到远处（σ 取逐点噪声均值）
-            if sigma_r is not None:
-                max_transfer_dist = float(np.mean(sigma_r)) * 3.0
+            if self.config.observation_model == "line-profiler":
+                labels = np.asarray(lp_result.labels, dtype=np.int64).copy()
+                normals = np.asarray(lp_result.normals, dtype=np.float64).copy()
+                if labels.shape != (len(noisy_points),) or normals.shape != noisy_points.shape:
+                    raise RuntimeError("line-profiler labels/normals do not align with output points")
+                tree = KDTree(pre_points[:, :2])
+                _, nn_idx = tree.query(noisy_points[:, :2], k=1)
+                intensity = pre_intensity[nn_idx]
+                curvature = pre_curvature[nn_idx]
+                line_profiler_audit["attribute_transfer"] = {
+                    "labels": "line_profiler_source_grid_support_at_xy",
+                    "normals": "interpolated_latent_surface_normals_at_xy",
+                    "intensity_and_curvature": "nearest_pre_observation_xy",
+                    "spherical_lidar_distance_threshold_applied": False,
+                }
+                line_profiler_audit["sampling_audit"] = lp_result.sampling_audit
             else:
-                max_transfer_dist = self.config.lidar_noise.distance_noise_std * 3.0
-            if max_transfer_dist > 0.0:
-                uncertain_mask = nn_dist > max_transfer_dist
-            else:
-                # The spherical-coordinate round trip has machine-scale error even
-                # when all requested noise terms are zero. It is not uncertainty.
-                uncertain_mask = np.zeros_like(nn_dist, dtype=bool)
-            # 对不确定点：仅保留非裂缝标签（标签 > 0 且 <= 8 的裂缝标签降为背景）
-            # 但保留松散、车辙、沉陷等大面积病害标签
-            crack_mask = (labels >= 1) & (labels <= 8)  # Q1: 布尔掩码替代 set + for
-            restore_mask = uncertain_mask & crack_mask
-            labels[restore_mask] = 0
+                # Preserve the rotating-LiDAR transfer and its existing threshold.
+                tree = KDTree(pre_points)
+                nn_dist, nn_idx = tree.query(noisy_points, k=1)
+                labels = pre_labels[nn_idx]
+                intensity = pre_intensity[nn_idx]
+                curvature = pre_curvature[nn_idx]
+                normals = pre_normals[nn_idx]
+                if sigma_r is not None:
+                    max_transfer_dist = float(np.mean(sigma_r)) * 3.0
+                else:
+                    max_transfer_dist = self.config.lidar_noise.distance_noise_std * 3.0
+                if max_transfer_dist > 0.0:
+                    uncertain_mask = nn_dist > max_transfer_dist
+                else:
+                    uncertain_mask = np.zeros_like(nn_dist, dtype=bool)
+                crack_mask = (labels >= 1) & (labels <= 8)
+                restore_mask = uncertain_mask & crack_mask
+                labels[restore_mask] = 0
 
         # 10. Sensor/output sampling.  This is separate from the downstream
         # model target point count, which is recorded but never applied here.
