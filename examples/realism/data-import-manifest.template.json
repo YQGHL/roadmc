@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "study_id": "replace-with-study-id",
+  "sources": [
+    {
+      "source_id": "royal_train_example",
+      "format": "royal_csv_zip",
+      "path": "REPLACE_WITH_ARCHIVE_PATH",
+      "sha256": "REPLACE_WITH_ARCHIVE_SHA256",
+      "member": "REPLACE_WITH_EXPLICIT_TRAIN_MEMBER.csv",
+      "member_sha256": "REPLACE_WITH_MEMBER_SHA256",
+      "material_id": "asphalt",
+      "group_status": "unknown",
+      "group_id": null,
+      "role": "fit",
+      "exposure": "seen",
+      "units": {"xy": "mm", "z": "unknown"},
+      "unit_evidence": {
+        "xy_verified": true,
+        "xy_basis": "paper reports 0.5 mm grid spacing",
+        "z_verified": false,
+        "z_basis": "released CSV scale and processing stage unresolved"
+      },
+      "processing_chain": {
+        "author_reports_height_normalization": true,
+        "released_csv_stage": "unresolved",
+        "operations_applied_by_importer": []
+      },
+      "allowed_metrics": ["normalized_acf", "standardized_height_w1"]
+    },
+    {
+      "source_id": "lab_sur_example",
+      "format": "sur_zip",
+      "path": "REPLACE_WITH_LAB_ARCHIVE_PATH",
+      "sha256": "REPLACE_WITH_ARCHIVE_SHA256",
+      "member": "REPLACE_WITH_EXPLICIT_SUR_MEMBER",
+      "member_sha256": "REPLACE_WITH_SUR_MEMBER_SHA256",
+      "material_id": "asphalt",
+      "group_status": "unknown",
+      "group_id": null,
+      "role": "diagnostic",
+      "exposure": "seen",
+      "units": {"xy": "mm", "z": "um"},
+      "unit_evidence": {
+        "xy_verified": true,
+        "xy_basis": "SUR header step/unit fields",
+        "z_verified": true,
+        "z_basis": "SUR header code unit and step; not instrument accuracy"
+      },
+      "processing_chain": {
+        "input_representation": "signed 16-bit raw code",
+        "zero_and_upper_code_semantics": "unknown",
+        "txt_mapping": "unresolved"
+      },
+      "allowed_metrics": ["raw_code_frequencies", "explicit_mask_sensitivity"]
+    },
+    {
+      "source_id": "field_txt_example",
+      "format": "field_txt",
+      "path": "REPLACE_WITH_FIELD_TXT_PATH",
+      "sha256": "REPLACE_WITH_TXT_SHA256",
+      "column_schema": "xyz_unknown_aux",
+      "delimiter": "whitespace",
+      "max_rows": 1000,
+      "material_id": "asphalt",
+      "group_status": "unknown",
+      "group_id": null,
+      "role": "diagnostic",
+      "exposure": "seen",
+      "units": {"xy": "native", "z": "native"},
+      "unit_evidence": {
+        "xy_verified": false,
+        "xy_basis": "official description says raw XYZ; physical units not stated",
+        "z_verified": false,
+        "z_basis": "official description says raw XYZ; physical units not stated"
+      },
+      "processing_chain": {
+        "source_description": "raw/unprocessed XYZ",
+        "fourth_column_semantics": "unknown",
+        "operations_applied_by_importer": []
+      },
+      "allowed_metrics": ["native_coordinate_continuity"]
+    }
+  ],
+  "template_note": "Replace every placeholder with verified local paths and hashes. This template is intentionally not executable."
+}

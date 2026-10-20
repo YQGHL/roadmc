@@ -148,12 +148,12 @@ def _raw_code_group_metrics(xyz: np.ndarray, intensity: np.ndarray) -> dict:
 
 
 def _implementation_hashes() -> dict[str, str]:
+    # Record executing source only; a source checkout need not ship the test suite.
     return {
         "roadmc/data/real/sud_road.py": sha256_file(
             ROOT / "roadmc" / "data" / "real" / "sud_road.py"
         ),
         "roadmc/scripts/diagnose_sud_road.py": sha256_file(Path(__file__).resolve()),
-        "tests/test_sud_road.py": sha256_file(ROOT / "tests" / "test_sud_road.py"),
     }
 
 

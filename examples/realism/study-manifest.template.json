@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "study_id": "roadmc-realism-2026-10-15",
+  "datasets": [
+    {
+      "source_id": "royalsoc_texture",
+      "material_id": "asphalt",
+      "units": {
+        "xy": "mm",
+        "z": "unknown"
+      },
+      "unit_evidence": {
+        "xy_verified": true,
+        "z_verified": false,
+        "xy_source": "https://doi.org/10.1098/rsta.2022.0166; 0.5 mm spacing"
+      },
+      "allowed_metrics": [
+        "psd_cycles_m",
+        "normalized_acf",
+        "standardized_height_w1"
+      ],
+      "reference_kind": "matrix_unknown_z",
+      "group_identity": "unknown",
+      "role": "fit",
+      "exposure": "seen",
+      "split_evidence": "20 original TRAIN for fitting; 100 seen TEST for benchmark, 8 excluded; no road IDs",
+      "processing_limit": "released Z unit/processing chain unresolved; standardized shape only"
+    },
+    {
+      "source_id": "ruifan_dataset3",
+      "material_id": "unknown",
+      "units": {
+        "xy": "native",
+        "z": "native"
+      },
+      "unit_evidence": {
+        "xy_verified": false,
+        "z_verified": false
+      },
+      "allowed_metrics": [
+        "native_outline_relative_residual",
+        "train_q90_normalized_depth"
+      ],
+      "reference_kind": "stereo_reconstruction",
+      "group_identity": "possibly_related",
+      "role": "diagnostic",
+      "exposure": "seen",
+      "group_note": "three frames may show same pothole; not three independent roads"
+    }
+  ],
+  "assets": {
+    "texture_archive": {
+      "path": "REPLACE_LOCAL_PATH_texture_archive",
+      "sha256": "REPLACE_WITH_VERIFIED_SHA256",
+      "source_id": "royalsoc_texture"
+    },
+    "texture_split": {
+      "path": "REPLACE_LOCAL_PATH_texture_split",
+      "sha256": "REPLACE_WITH_VERIFIED_SHA256",
+      "source_id": "royalsoc_texture"
+    },
+    "texture_prior": {
+      "path": "REPLACE_LOCAL_PATH_texture_prior",
+      "sha256": "REPLACE_WITH_VERIFIED_SHA256",
+      "source_id": "royalsoc_texture"
+    },
+    "pothole_frame_01": {
+      "path": "REPLACE_LOCAL_PATH_pothole_frame_01",
+      "sha256": "REPLACE_WITH_VERIFIED_SHA256",
+      "source_id": "ruifan_dataset3"
+    },
+    "pothole_label_01": {
+      "path": "REPLACE_LOCAL_PATH_pothole_label_01",
+      "sha256": "REPLACE_WITH_VERIFIED_SHA256",
+      "source_id": "ruifan_dataset3"
+    },
+    "pothole_frame_02": {
+      "path": "REPLACE_LOCAL_PATH_pothole_frame_02",
+      "sha256": "REPLACE_WITH_VERIFIED_SHA256",
+      "source_id": "ruifan_dataset3"
+    },
+    "pothole_label_02": {
+      "path": "REPLACE_LOCAL_PATH_pothole_label_02",
+      "sha256": "REPLACE_WITH_VERIFIED_SHA256",
+      "source_id": "ruifan_dataset3"
+    },
+    "pothole_frame_03": {
+      "path": "REPLACE_LOCAL_PATH_pothole_frame_03",
+      "sha256": "REPLACE_WITH_VERIFIED_SHA256",
+      "source_id": "ruifan_dataset3"
+    },
+    "pothole_label_03": {
+      "path": "REPLACE_LOCAL_PATH_pothole_label_03",
+      "sha256": "REPLACE_WITH_VERIFIED_SHA256",
+      "source_id": "ruifan_dataset3"
+    }
+  },
+  "template_note": "Replace every path and SHA256 with verified local assets; this template is intentionally not executable."
+}

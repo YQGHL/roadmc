@@ -1,0 +1,68 @@
+{
+  "schema_version": 2,
+  "material": "asphalt",
+  "road_id": "synthetic-wall-floor-mechanism-example",
+  "provenance": {
+    "source": "explicit replay-v2 engineering example; no measured material fit",
+    "calibration": "none"
+  },
+  "hypothesis": {
+    "status": "all dimensions, transition radii and texture settings are synthetic hypotheses",
+    "material_partition": "continuous wall/floor texture experiment only; real material identity and distributions are unverified",
+    "measurement_gap": "no verified measured wall/floor texture statistics; pending verification"
+  },
+  "events": [
+    {
+      "instance_id": "partition-pothole",
+      "type": "pothole",
+      "seed": 20261015,
+      "label": null,
+      "parameters": {
+        "center_x_m": 0.0,
+        "center_y_m": 0.0,
+        "contour": {
+          "shape": "ellipse",
+          "semi_major_m": 0.3,
+          "semi_minor_m": 0.2,
+          "orientation_deg": 25.0,
+          "radial_harmonics": {
+            "cos": [0.1, -0.03, 0.01],
+            "sin": [0.02, 0.0, -0.01]
+          }
+        },
+        "depth_m": 0.04,
+        "material_partition": {
+          "mode": "wall_floor",
+          "floor_rho_start": 0.45,
+          "floor_rho_end": 0.8,
+          "floor_texture": {
+            "mode": "procedural",
+            "settings": {
+              "rms_m": 0.0004,
+              "hurst": 0.7,
+              "anisotropy_ratio": 1.0,
+              "orientation_deg": 0.0,
+              "band_lo_cycles_m": 1.0,
+              "band_hi_cycles_m": 15.0,
+              "distribution": "gaussian",
+              "material_id": "asphalt"
+            }
+          },
+          "wall_texture": {
+            "mode": "procedural",
+            "settings": {
+              "rms_m": 0.0008,
+              "hurst": 0.7,
+              "anisotropy_ratio": 1.0,
+              "orientation_deg": 0.0,
+              "band_lo_cycles_m": 1.0,
+              "band_hi_cycles_m": 15.0,
+              "distribution": "gaussian",
+              "material_id": "asphalt"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

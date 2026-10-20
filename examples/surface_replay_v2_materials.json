@@ -1,0 +1,75 @@
+{
+  "schema_version": 2,
+  "material": "asphalt",
+  "road_id": "synthetic-v2-shared-material-demo",
+  "provenance": {
+    "source": "minimal reproducible API example",
+    "calibration": "uncalibrated hypothesis"
+  },
+  "hypothesis": {
+    "status": "synthetic demonstration only",
+    "note": "Explicit geometry and material settings; no empirical calibration implied."
+  },
+  "events": [
+    {
+      "instance_id": "elliptical-pothole",
+      "type": "pothole",
+      "seed": 101,
+      "label": null,
+      "parameters": {
+        "center_x_m": 0.0,
+        "center_y_m": 0.0,
+        "contour": {
+          "shape": "ellipse",
+          "semi_major_m": 0.28,
+          "semi_minor_m": 0.18,
+          "orientation_deg": 25.0
+        },
+        "depth_m": 0.035,
+        "texture": {"mode": "retain"}
+      }
+    },
+    {
+      "instance_id": "raveling-iid",
+      "type": "raveling",
+      "seed": 202,
+      "label": null,
+      "parameters": {
+        "center_x_m": 0.15,
+        "center_y_m": -0.05,
+        "radius_x_m": 0.34,
+        "radius_y_m": 0.23,
+        "corrlen_m": 0.025,
+        "depth_m": 0.006,
+        "threshold": 0.15,
+        "texture": {"mode": "iid", "rms_m": 0.00025}
+      }
+    },
+    {
+      "instance_id": "patch-procedural",
+      "type": "patch",
+      "seed": 303,
+      "label": null,
+      "parameters": {
+        "center_x_m": -0.12,
+        "center_y_m": 0.04,
+        "radius_x_m": 0.16,
+        "radius_y_m": 0.11,
+        "thickness_m": 0.002,
+        "texture": {
+          "mode": "procedural",
+          "settings": {
+            "rms_m": 0.00035,
+            "hurst": 0.7,
+            "anisotropy_ratio": 1.0,
+            "orientation_deg": 20.0,
+            "band_lo_cycles_m": 1.0,
+            "band_hi_cycles_m": 40.0,
+            "distribution": "gaussian",
+            "material_id": "asphalt"
+          }
+        }
+      }
+    }
+  ]
+}

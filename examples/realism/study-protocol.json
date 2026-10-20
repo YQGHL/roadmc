@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "study_id": "roadmc-realism-2026-10-15",
+  "promote_production_defaults": false,
+  "scope": "asphalt-first finite internal research iteration; no independent road validation",
+  "texture": {
+    "selection": "train_only_loocv_pareto_noninferior",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "multipliers": [
+      0.75,
+      1.0,
+      1.25
+    ],
+    "iterations": 50,
+    "tolerance": 1e-05,
+    "main_metrics": [
+      "windowed_radial_psd_tv",
+      "acf_rmse",
+      "height_w1_standardized"
+    ],
+    "preprocessing": "plane detrend; 400-500 cycles/m cosine lowpass; unit RMS; radial Hann PSD",
+    "fold_scope": "leave one original TRAIN file out among five/class; internal file CV only",
+    "test_scope": "100 previously analyzed TEST members; one frozen benchmark, no retuning",
+    "baseline_limit": "historical H/band already selected with all five TRAIN files; fold moments refitted from remaining four"
+  },
+  "geometry": {
+    "spacing_m": 0.001,
+    "x_bounds_m": [
+      -0.3,
+      0.3
+    ],
+    "y_bounds_m": [
+      -0.25,
+      0.25
+    ],
+    "geometry_seed": 73,
+    "observation_seed": 11,
+    "nominal_depth_m": 0.04,
+    "ellipse_axes_m": [
+      0.2,
+      0.13
+    ],
+    "ellipse_orientation_deg": 20.0,
+    "harmonics": {
+      "cos": [
+        0.08,
+        -0.04,
+        0.03
+      ],
+      "sin": [
+        -0.03,
+        0.02,
+        0.01
+      ]
+    },
+    "bowl": {
+      "kind": "tilted_power_bowl",
+      "edge_power": 0.7,
+      "tilt_major": 1.6,
+      "tilt_minor": -0.8
+    },
+    "texture_rms_m": 0.0004,
+    "texture_hurst": 0.05,
+    "texture_band_cycles_m": [
+      0.0,
+      400.0
+    ]
+  },
+  "pothole_native": {
+    "frames": [
+      "01",
+      "02",
+      "03"
+    ]
+  },
+  "assumptions": [
+    "all synthetic dimensions, texture RMS/H/band, seeds and coefficient searches are engineering hypotheses, not measured population distributions",
+    "native pothole outline uses known whole-frame labels and TLS support; angular sectors and depth blocks are transductive within-frame diagnostics",
+    "geometry and sensor factors are separated; engineering noise is not sensor calibration"
+  ]
+}
