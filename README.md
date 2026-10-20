@@ -11,7 +11,7 @@ RoadMC 是一个用于道路表面点云研究的实验性代码库，重点是�
 - 基于冻结 `SurfaceTile` 和显式 JSON 计划的确定性重放，提供裂缝、坑槽、松散和修补的受控原型。
 - PyTorch 训练入口，以及读取真实点云、按道路划分、从真实标定样本拟合并冻结评估协议的工具。
 
-标签定义见 [`labels.py`](roadmc/data/synthetic/labels.py)，共 38 类（含背景），不等于所有病害类别都已有完整、经验证的物理生成模型。冻结重放当前仅支持：沥青线裂缝 5–8、坑槽 9–10、松散 11–12、修补 20；水泥板裂缝 23–24、点状坑洞 34、修补 37。它不模拟沥青龟裂/块裂，也不覆盖 taxonomy 中所有病害。新纹理和重放参数仍是工程假设，尚未由达到毫米精度的真实表面数据标定。当前没有可用于真实域标定或独立验收的合格真实样本，因此项目没有可报告的真实域差距或“极小域差距”结论。
+标签定义见 [`labels.py`](roadmc/data/synthetic/labels.py)，共 38 类（含背景），不等于所有病害类别都已有完整、经验证的物理生成模型。冻结重放 v1 支持沥青线裂缝、坑槽、松散、修补，以及水泥板裂缝、点状坑洞和修补；v2 是沥青专用原型，支持显式线裂缝、龟裂/块裂图结构及材料覆盖顺序，并未覆盖全部 taxonomy。新纹理和重放参数仍需实测标定。目前已有公开纹理矩阵和立体重建点云可用于受限形态对照，但其单位、设备信息或道路独立性尚不满足真实域标定和独立验收要求，因此项目没有可报告的“极小域差距”结论。
 
 ## 安装
 
@@ -19,8 +19,9 @@ RoadMC 是一个用于道路表面点云研究的实验性代码库，重点是�
 
 ```powershell
 py -3.11 -m venv .venv
-.venv\Scripts\python.exe -m pip install numpy scipy matplotlib
+.venv\Scripts\python.exe -m pip install numpy scipy matplotlib pillow
 $env:PATH = "$PWD\.venv\Scripts;$env:PATH"
+$env:PYTHONIOENCODING = 'utf-8'
 $env:ROADMC_GENERATOR_NO_TORCH = '1'
 .venv\Scripts\python.exe -m roadmc.scripts.generate_synthetic --help
 ```
@@ -95,6 +96,60 @@ python -m roadmc.scripts.replay_surface `
 
 当前没有分段采样及跨段 profile 去重实现。`off` 模式保留米制网格坐标，不限制横纵间距相等。
 
+当前 line-profiler 是高度场插值与工程噪声模型，没有实现光斑积分、光学三角测量或几何自遮挡。采样间距不等于设备精度，入射角参数只影响噪声代理。输出审计明确记录这些限制；生产路径保留采样器的 XY 支持标签和插值潜在法线，强度与曲率按 XY 近邻传递，避免 Z 噪声改变点的表面归属。
+
+## 可选的采样与纹理形态实验
+
+以下入口用于受控诊断，不修改生产默认配置。网格实验保存同一 0.5 mm 母场，比较 5、2、1、0.5 mm 源网格及两种观测步距；粗网格不做隐式几何平滑，保留混叠反例：
+
+```powershell
+python -m roadmc.scripts.diagnose_sampling_resolution --output-dir output/resolution-check
+python -m roadmc.scripts.calibrate_texture_shape `
+  --archive path/to/rsta20220166_si_001.zip --output-dir output/texture-shape-check
+```
+
+网格实验目录须为空或不存在，纹理实验目录须不存在。1 m 网格实验约有 400 万个源格点，额外诊断数组还会占用内存。采样点高度误差为零不等于连续纹理没有混叠；应同时检查横纵频率、源网格频带和输出步距。
+
+纹理实验针对 Royal Society 发布的 DAC、MS、OGFC、SMA 四类沥青表面矩阵，冻结训练/文件留出划分，排除已探索文件及内容重复项。只用训练集选择频谱和非高斯目标矩，再报告留出文件的 PSD、自相关、标准化 W1 和实际输出矩。XY 使用论文报告的 0.5 mm 间距；CSV 的 Z 单位和处理阶段仍未确认，因此这些结果属于归一化形态比较，不能用于绝对高度或独立道路真实性验收。
+
+冻结重放 v2 的[病害材料样例](examples/surface_replay_v2_materials.json)增加可选椭圆坑槽，以及坑槽、松散、修补的 `retain`、`iid`、`procedural` 纹理模式。椭圆 `contour` 与旧 `radius_m` 二选一，`texture` 与旧 `exposed_rms_m` 二选一。样例基底需覆盖 x=[-0.6, 0.6] m、y=[-0.45, 0.45] m；`retain` 是保留当前纹理的对照选项。v2 暂限沥青，参数仍须显式声明为未标定假设。v1 有效旧计划的几何与随机序列保持兼容；线激光插值修正会改变观测结果。
+
+纹理还可显式使用 `spectrum_profile` 的 `frequency_cycles_m` / `relative_psd` 数组代替 `hurst`，以统计谱包络生成全新随机表面；不会读取实测相位或拼接实测纹理。非高斯设置可选 `spectral_matching={"iterations":50,"tolerance":1e-5}`，迭代约束频谱与高度分布，保存实际迭代次数及分布残差。次数和容差是数值设置。最终优先保持程序场频谱，边际分布不保证精确匹配。现有文件对比中，谱包络降低了频谱和自相关误差，但 W1 未优于此前非高斯候选，因此没有自动替换默认方法。
+
+v2 坑槽可选 `profile={"kind":"tilted_power_bowl","edge_power":1.0,"tilt_major":0.5,"tilt_minor":0.0}`，在相同足迹内调整坑壁及最深点位置；示例数值属于假设。深度按连续解析峰值归一，不按采样格点最大值重新缩放。v2 元数据还记录当前材料损失场的面积、体积和最终事件归属积分；修补清除的旧损失不计入最终体积，纹理起伏和隐藏层不计入该量。这些是合成器内部量，不是实测材料损失。
+
+以下命令要求显式输入路径，输出目录须不存在。纹理对照复用既有冻结清单，已分析过的测试文件必须称为“已见文件基准”；坑槽对照只检验同视图的空间块插值，不能解释为独立坑槽泛化。
+
+```powershell
+python -m roadmc.scripts.benchmark_texture_envelopes `
+  --archive path/to/rsta20220166_si_001.zip `
+  --split-manifest output/texture-shape-check/split_manifest.json `
+  --prior-config output/texture-shape-check/fitted_configurations.json `
+  --output-dir output/texture-envelope-check
+
+python -m roadmc.scripts.diagnose_pothole_profiles `
+  --dataset-root path/to/dataset3 --output-dir output/pothole-profile-check
+```
+
+## 可复现的真实性研究
+
+统一入口按清单核对数据用途、单位、文件哈希和已暴露状态，再执行训练内部纹理选择、冻结基准、病害材料对照与原生单位坑槽诊断。它保存实际执行源码、随机种子、分阶段日志和产物哈希。准备方法见[研究工作流](examples/realism/study-workflow.md)，数值协议见[示例配置](examples/realism/study-protocol.json)。原始数据和实验大文件放在仓库外。
+
+```powershell
+python -m roadmc.scripts.run_realism_study `
+  --manifest path/to/verified-manifest.json `
+  --protocol examples/realism/study-protocol.json `
+  --output-dir path/to/new-study
+```
+
+续跑时在同一命令后加 `--resume`；输入、代码、依赖阶段或产物改变时，不复用过期结果。用 `--stages admission` 可只核查清单，其他阶段名见 `--help`。纹理选择只使用原 TRAIN 文件，在三个主要指标均不劣于旧候选时才推荐新候选，否则回退；已见 TEST 只做冻结后的对照。推荐配置不会自动替换生产默认。
+
+v2 椭圆 `contour` 可加 `radial_harmonics={"cos":[0.08,-0.04,0.03],"sin":[-0.03,0.02,0.01]}`，以3、4、5阶径向项表达不规则坑缘，并在连续域保持椭圆面积。几何损失、足迹、材料更新使用同一轮廓。系数是工程假设，不能称为实测分布；省略或全零时保留旧轮廓。
+
+新增的显式选项包括：不重新拟合的 `pothole_outline_fairness` 阶段、v2 坑壁/坑底 `material_partition`，以及保留未知单位和辅助列的研究数据导入。用法与组合检查见[工程扩展说明](examples/realism/engineering-extensions.md)。导入束只用于原生/归一诊断，不自动成为米制训练输入或独立真实验收数据。
+
+KIT 正常混凝土、SUD 原生 LAS 字段和 SHREC 视频已有专用读取与受限对照工具，见[新增数据研究说明](examples/realism/new-data-study.md)。ELA 圆环单位明确；PLY 尺度推断、SUD 未知语义码和 SHREC 压缩视差分别保留门槛，不自动成为米制病害真值或独立道路验收输入。混凝土统计谱候选可显式复用，生产默认保持原设置。
+
 ## 固定真实域评估
 
 评估入口为 `roadmc.scripts.diagnose_domain_protocol`。协议先按 `road_segment_id` 划分道路，再仅用真实 calibration 样本拟合并保存标准化和核带宽，最后用冻结协议评估候选合成数据与独立真实道路。评估样本清单是 JSON 对象，顶层包含 `samples` 数组；每项提供文件 `path`、`domain`、`role`、`road_segment_id` 和 `material_id`。真实输入还必须有可核验的坐标单位、质量、采样间距、测量精度和来源等元数据。不得将同一路段拆到不同组。
@@ -149,7 +204,27 @@ python -m py_compile roadmc/scripts/generate_synthetic.py roadmc/scripts/capture
 python -m ruff check roadmc
 ```
 
-重放与评估工具仅支持受控程序化实验与一致性检查，不提供实路自然性、病害全类覆盖、传感器校准或真实域性能证据。重放是规则网格样板，不支持完整裂缝拓扑、不规则坑缘、多层坑壁或分段设备观测。
+重放与评估工具支持受控程序化实验、显式裂缝图结构和一致性检查；公开数据的受限形态比较不构成独立真实域验收。v2 已有可选不规则坑缘原型，但规则高度场尚不能表示多层坑壁、悬垂或裂缝内部体积结构，也未实现分段设备观测、材料状态和传感器标定。
+
+## 研发数据来源与引用声明
+
+感谢公开数据集的作者和维护者。RoadMC 研发阶段曾使用下列数据的有限子集进行纹理描述、原生字段检查、轮廓或观测敏感性诊断；这不表示已经用这些数据完成训练、现场标定或独立真实域验收。
+
+| 数据来源 | 研发中的实际用途与限制 |
+|---|---|
+| [Pan 等：沥青纹理补充矩阵](https://doi.org/10.1098/rsta.2022.0166) | 归一化纹理形态与频谱比较；Z 单位/处理链未闭合，已暴露 TEST 不称盲测 |
+| [Fan 等：立体坑槽数据](https://github.com/ruirangerfan/stereo_pothole_datasets) | dataset3 有限视图的边界、缺测和坐标诊断；不作为独立激光真值 |
+| [KIT 混凝土路面测量](https://doi.org/10.35097/ku8qs1jt347zxyeq) | 正常路面 ELA/PLY 和同片重测比较；不是病害标签真值 |
+| [SUT-Crack](https://doi.org/10.17632/gsbmknrhkv.1) | 本地 130 张 mask 与 3 张原图的二维探索；不是 130 对完整分割样本 |
+| [SUD-ROAD](https://github.com/msqiu/SUD-Road) | LAS 原码与局部几何检查；本地字节码映射和物理单位仍未核实 |
+| [Pothole Mix / SHREC 2022 V2](https://doi.org/10.17632/kfth5g2xk3.2) | RGB/视差/自动视频 mask 的受限轮廓分析；不是米制三维人工真值 |
+| [实验室纹理/摩擦数据](https://doi.org/10.17632/kkcztnxzph.1)、[现场沥青扫描](https://doi.org/10.5281/zenodo.20606458)、[成对 MLS 扫描](https://doi.org/10.5281/zenodo.19267189) | 选定样本的描述、格式和观察支持诊断；不宣称全库使用或损伤材料机理标定 |
+
+其他选定表面、M2S-RoAD 副样本及未完全追溯来源见 [数据来源明细](docs/DATASETS.md)，可导入的引用在 [datasets.bib](docs/datasets.bib)。使用数据或发表派生结果时，请引用对应原始数据记录及作者要求的论文，保留版本、许可、处理与划分记录。项目 MIT 许可证仅覆盖本项目代码，不替代第三方数据许可；本仓库不随此声明重新分发原始数据。
+
+## 当前代码与研究状态
+
+生产生成/重放代码与研究用原型分开维护。核心病害与原生数据诊断代码位于本分支；主干是否已包含这些改动应以 PR [#15](https://github.com/YQGHL/roadmc/pull/15) 的实际合并状态为准。H1 材料历史、占据域空腔和 A/B/C 系统对照仍是仓库外隔离研究组件，不是当前默认生成器或 replay schema 的原生功能。详见 [研究状态与集成边界](docs/RESEARCH_STATUS.md)。
 
 ## 许可证
 
