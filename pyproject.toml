@@ -16,6 +16,7 @@ dependencies = [
     "pytorch-lightning>=2.0",
     "torchmetrics>=1.0",
     "matplotlib>=3.7",
+    "pillow",
     "ipykernel>=7.2.0",
 ]
 
@@ -26,6 +27,9 @@ real = [
 ]
 pcd = [
     "open3d>=0.19",
+]
+video = [
+    "av",
 ]
 
 [tool.uv.sources]
